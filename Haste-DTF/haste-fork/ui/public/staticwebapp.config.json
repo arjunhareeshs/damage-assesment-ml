@@ -1,0 +1,37 @@
+{
+  "globalHeaders": {
+    "Content-Security-Policy": "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; script-src 'self' https://atlas.microsoft.com; style-src 'self' 'unsafe-inline' https://atlas.microsoft.com; font-src 'self' data: https://atlas.microsoft.com https://c.s-microsoft.com https://*.cdn.office.net; img-src 'self' data: blob: https://atlas.microsoft.com https://*.atlas.microsoft.com https://*.tile.openstreetmap.org; connect-src 'self' https://atlas.microsoft.com https://*.atlas.microsoft.com https://*.tile.openstreetmap.org https://*.blob.core.windows.net; worker-src 'self' blob:; child-src blob:",
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "strict-origin-when-cross-origin"
+  },
+  "routes": [
+    {
+      "route": "/login",
+      "headers": {
+      "cache-control": "no-store, must-revalidate",
+      "set-cookie": "session=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0"
+      },      
+      "redirect": "/.auth/login/aad"
+    },
+    {
+      "route": "/logout",
+      "redirect": "/.auth/logout"
+    },
+    {
+      "route": "/*",
+      "allowedRoles": ["administrators", "contributors"]
+    }
+  ],
+  "responseOverrides": {
+    "401": {
+      "statusCode": 302,
+      "redirect": "/login"
+    }
+  },
+  "navigationFallback": {
+    "rewrite": "index.html",
+    "exclude": ["*.{svg,png,jpg,gif}", "*.{css,scss}", "*.js", "*.jsx"]
+  }
+}

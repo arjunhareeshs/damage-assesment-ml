@@ -1,0 +1,40 @@
+api/hastefuncapi/logs_azurerite.txt
+api/hastefuncapi/logs_func_api.txt
+api/hastefuncapi/log.txt
+api/hastefuncapi/requirements.txt.bak
+.DS_Store
+node_modules/
+node_modules/.bin/uuid
+node_modules/.bin/azurite
+azurite/
+data/
+.venv/
+local.settings.json
+docker/.env
+localtmp/
+binaries/
+.claude/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+docs/_build
+
+# Any local wheels
+*.whl
+
+# Local-only scratchpad; not part of the repo
+LESSONS_LEARNED.md
+HANDOFF.md
+
+# Local infra what-if / deployment scratch (may contain internal names/IPs)
+infra/.whatif*
+
+
+# azd environment (contains subscription-scoped values)
+.azure/
+
+# Local-only debug pages + sandbox (not part of the repo)
+debug/
