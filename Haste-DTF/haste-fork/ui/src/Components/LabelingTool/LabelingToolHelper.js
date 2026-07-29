@@ -4,6 +4,16 @@ import { apiPut } from "../../util/api";
 import settings from "../../assets/json/settings.json";
 import { getAzureMapsAuthOptions } from "../../util/azureMapsAuth";
 
+// AOI-scoped DamageTriageFormer (Option B, AOI-scoped —
+// docs/OptionB_AOI_Integration_Plan.md Module 5). "draw-rectangle" is not
+// used by any other DrawingToolbar button, so it's free to repurpose
+// exclusively for area-of-interest capture: an AOI is a spatial filter,
+// not a damage label, so it must never enter the labeling shape source
+// that createShape()/saveLabels() operate on. Shared between
+// LabelingTool.jsx (which diverts the drawingcomplete handler for this
+// mode) and DrawingToolbar.jsx (which offers the toolbar button) so the
+// two never drift out of sync.
+export const AOI_DRAWING_MODE = "draw-rectangle";
 
 export function createShape(drawingManager, selectedPrimaryClass, setDrawingCount) {
   const source = drawingManager.getSource();

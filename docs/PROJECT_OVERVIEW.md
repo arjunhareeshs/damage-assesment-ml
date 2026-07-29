@@ -403,8 +403,9 @@ Start here: Do you want results in hours or weeks?
 
 ## 12. Project artifacts
 
-Two companion implementation guides:
+Three companion implementation guides:
 - **OptionA_Quick_Start.md** — Step-by-step, ready-to-run HASTE setup (no code changes needed)
 - **OptionB_Quick_Start.md** — Fork + integrate guide with full code samples for processor, API, frontend hooks, and the full annotation→infer→render loop
+- **OptionB_AOI_Integration_Plan.md** — The AOI-drawn, PostGIS-backed, per-building-crop variant of Option B (analyst draws an AOI → `ST_Intersects` query → one crop per building → per-building attribute update → Accept/Reject review), mapped file-by-file onto the actual `Haste-DTF/haste-fork` source tree. Supersedes the whole-layer "12a fully automated" flow (already implemented as `modelType="dtf"`) for interactive, human-reviewed use.
 
-Both assume Docker is already installed. Both include troubleshooting checklists.
+All three assume Docker is already installed. All three include troubleshooting checklists.

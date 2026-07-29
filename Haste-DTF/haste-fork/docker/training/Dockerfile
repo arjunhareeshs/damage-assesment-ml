@@ -57,6 +57,11 @@ RUN printf '#!/bin/bash\nexec python -m hastegeo.workflows.embed_buildings "$@"\
 RUN printf '#!/bin/bash\nexec python -m hastegeo.workflows.damage_triage_infer "$@"\n' > /usr/local/bin/damage-triage-infer \
 	&& chmod +x /usr/local/bin/damage-triage-infer
 
+# CLI shim for the AOI-scoped DamageTriageFormer inference workflow
+# (Option B, per-building-crop path — docs/OptionB_AOI_Integration_Plan.md).
+RUN printf '#!/bin/bash\nexec python -m hastegeo.workflows.damage_triage_aoi_infer "$@"\n' > /usr/local/bin/damage-triage-aoi-infer \
+	&& chmod +x /usr/local/bin/damage-triage-aoi-infer
+
 # Prepare conda env directory owned by the target user, then extract the packed env
 # as that user — non-root tar uses the running user's UID/GID, so no chown -R needed.
 RUN mkdir -p /opt/conda/envs/bda && chown dockeruser:dockeruser /opt/conda/envs/bda

@@ -75,6 +75,32 @@ services:
     depends_on:
       - azurite
 
+  # PostGIS-backed hg_buildings table for the AOI-scoped DamageTriageFormer
+  # path (modelType="dtf-aoi" — docs/OptionB_AOI_Integration_Plan.md).
+  # hastegeo.core.utils.postgis_connect reads POSTGRES_HOST/PORT/DATABASE/
+  # USER/PASSWORD (below, wired into hastefuncapi/hastefuncqueues) to
+  # connect here with plain password auth for local dev; production uses
+  # a real Azure Database for PostgreSQL with DefaultAzureCredential
+  # instead (no POSTGRES_PASSWORD set).
+  postgis:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: haste
+      POSTGRES_PASSWORD: haste-dev-only  # pragma: allowlist secret # gitleaks:allow
+      POSTGRES_DB: haste
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgis-data:/var/lib/postgresql/data
+      # Runs every .sql file here, in filename order, on first container
+      # start: 0000_enable_postgis.sql then 0001_hg_buildings.sql.
+      - ../db/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U haste -d haste"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   # ==============================================================================
   # API SERVICES
   # ==============================================================================
@@ -107,12 +133,18 @@ services:
       INFERENCE_QUEUE_NAME: "local-inference-queue"
       EMBEDDING_QUEUE_NAME: "local-embedding-queue"
       DTF_QUEUE_NAME: "local-dtf-queue"
+      DTF_AOI_QUEUE_NAME: "local-dtf-aoi-queue"
       BLOB_CONTAINER: "data"
       METADATA_STORAGE_TYPE: "blob"
       IMAGERY_STORAGE_TYPE: "blob"
       ARTIFACT_STORAGE_TYPE: "blob"
       TITILER_ENDPOINT: "http://titiler:8000/"
       TITILER_PUBLIC_ENDPOINT: "http://${HOST_IP:-localhost}:7071/api/titiler/"
+      POSTGRES_HOST: "postgis"
+      POSTGRES_PORT: "5432"
+      POSTGRES_DATABASE: "haste"
+      POSTGRES_USER: "haste"
+      POSTGRES_PASSWORD: "haste-dev-only"  # pragma: allowlist secret # gitleaks:allow
     volumes:
       - ../data:/app/data
       - /var/run/docker.sock:/var/run/docker.sock
@@ -122,6 +154,7 @@ services:
       - azurite
       - data-init
       - titiler
+      - postgis
 
   hastefuncqueues:
     build:
@@ -152,11 +185,17 @@ services:
       INFERENCE_QUEUE_NAME: "local-inference-queue"
       EMBEDDING_QUEUE_NAME: "local-embedding-queue"
       DTF_QUEUE_NAME: "local-dtf-queue"
+      DTF_AOI_QUEUE_NAME: "local-dtf-aoi-queue"
       BLOB_CONTAINER: "data"
       METADATA_STORAGE_TYPE: "blob"
       IMAGERY_STORAGE_TYPE: "blob"
       ARTIFACT_STORAGE_TYPE: "blob"
       RUNNER_TYPE: "local"
+      POSTGRES_HOST: "postgis"
+      POSTGRES_PORT: "5432"
+      POSTGRES_DATABASE: "haste"
+      POSTGRES_USER: "haste"
+      POSTGRES_PASSWORD: "haste-dev-only"  # pragma: allowlist secret # gitleaks:allow
       AZURE_STORAGE_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;QueueEndpoint=http://azurite:10001/devstoreaccount1;"  # pragma: allowlist secret # gitleaks:allow
       AZURE_STORAGE_USE_EMULATOR: "true"
       AZURE_STORAGE_EMULATOR_HOST: "azurite:10000"
@@ -188,6 +227,7 @@ services:
       - training_image
       - imageryprep_image
       - titiler
+      - postgis
 
   # ==============================================================================
   # UI SERVICE
@@ -254,4 +294,6 @@ services:
 
 volumes:
   azurite-data:
+    driver: local
+  postgis-data:
     driver: local

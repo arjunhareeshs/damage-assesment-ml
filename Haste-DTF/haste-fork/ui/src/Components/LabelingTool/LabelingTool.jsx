@@ -9,6 +9,7 @@ import {
   createShape,
   loadStudyArea,
   centrateMap,
+  AOI_DRAWING_MODE,
 } from "./LabelingToolHelper.js";
 import { getAzureMapsAuthOptions, isAzureMapsPlaceholder } from "../../util/azureMapsAuth";
 import { useParams } from "react-router-dom";
@@ -19,6 +20,7 @@ import PropType from "prop-types";
 import { AppContext } from "../../AppContext.jsx";
 import { useDrawingUndoRedo } from "./UndoRedo.jsx";
 import { splitShape } from "./SplitShape.jsx";
+import BuildingSelectTool from "./BuildingSelectTool.jsx";
 
 const LabelingTool = ({ setModalComponent }) => {
   LabelingTool.propTypes = {
@@ -47,6 +49,17 @@ const LabelingTool = ({ setModalComponent }) => {
   const [isMapReady, setIsMapReady] = useState(false);
   const [selectedShape, setSelectedShape] = useState(null);
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
+  // AOI polygon captured for the AOI-scoped DamageTriageFormer run — a
+  // GeoJSON geometry (EPSG:4326) or null when nothing is drawn yet. Kept
+  // separate from the labeling shape source (drawingManager.source) so it
+  // never gets saved/trained as a damage label.
+  const [aoiGeoJson, setAoiGeoJson] = useState(null);
+  // Explicit "click a building" selection for the AOI-scoped
+  // DamageTriageFormer run ("Method 2 style" per plan.pdf Module 6.1) —
+  // an alternative to drawing an AOI polygon. buildingSelectActive toggles
+  // whether the footprints layer is loaded/clickable.
+  const [buildingSelectActive, setBuildingSelectActive] = useState(false);
+  const [selectedBuildingIds, setSelectedBuildingIds] = useState([]);
   const { undo, redo } = useDrawingUndoRedo(drawingManager, mapRef);
 
   useEffect(() => {
@@ -118,16 +131,29 @@ const LabelingTool = ({ setModalComponent }) => {
 
     // Handler: drawingcomplete
     const handleDrawingComplete = (e) => {
+      const mode = drawingManager.getOptions().mode;
 
-      if (drawingManager.getOptions().mode === "draw-line") {
+      if (mode === "draw-line") {
         splitShape(drawingManager, e);
+        return;
+      }
+
+      if (mode === AOI_DRAWING_MODE) {
+        // AOI is a spatial filter, not a damage label (plan.pdf Module 5):
+        // capture its geometry for the AOI-scoped DamageTriageFormer run
+        // and remove it from the labeling shape source immediately so it
+        // never gets saved/trained as a label, then hand the pointer back.
+        setAoiGeoJson(e.toJson().geometry);
+        drawingManager.source.remove(e);
+        drawingManager.setOptions({ mode: "none" });
+        return;
       }
 
       const properties = e.getProperties();
       if (!properties.primaryClass) {
         drawingManager.source.remove(e);
       }
-      
+
     };
 
     // Add all the handlers
@@ -308,6 +334,19 @@ const LabelingTool = ({ setModalComponent }) => {
               imageLayerId={imageLayerId}
               undo={undo}
               redo={redo}
+              aoiGeoJson={aoiGeoJson}
+              setAoiGeoJson={setAoiGeoJson}
+              buildingSelectActive={buildingSelectActive}
+              setBuildingSelectActive={setBuildingSelectActive}
+              selectedBuildingIds={selectedBuildingIds}
+              setSelectedBuildingIds={setSelectedBuildingIds}
+            />
+            <BuildingSelectTool
+              mapRef={mapRef}
+              projectId={projectId}
+              imageLayerId={imageLayerId}
+              active={buildingSelectActive}
+              setSelectedBuildingIds={setSelectedBuildingIds}
             />
           </>
         ) : null}

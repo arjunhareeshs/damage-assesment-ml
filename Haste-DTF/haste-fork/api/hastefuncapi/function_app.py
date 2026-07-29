@@ -33,6 +33,9 @@ from hastegeo.core.models.users import User
 from hastegeo.core.models.visualizer import Imagery, Visualizer
 from hastegeo.core.processors.artifacts import ArtifactProcessor
 from hastegeo.core.processors.damage_triage import DTFInferencePreprocessor
+from hastegeo.core.processors.damage_triage_aoi import (
+    DTFAoiInferencePreprocessor,
+)
 from hastegeo.core.processors.embedding import EmbeddingPreprocessor
 from hastegeo.core.processors.imagery import ImageryPreProcessor
 from hastegeo.core.processors.inference import InferencePreprocessor
@@ -40,6 +43,7 @@ from hastegeo.core.processors.metadata import MetadataProcessor
 from hastegeo.core.processors.stats import StatsPreProcessor
 from hastegeo.core.processors.train import TrainPreprocessor
 from hastegeo.core.processors.uploader import FileUploader
+from hastegeo.core.utils import postgis_query
 from hastegeo.core.utils.blob import (
     download_blob_to_tempfile,
     parse_byte_range,
@@ -2434,6 +2438,148 @@ async def PutRunDTFInferenceQueueMessage(
 
 
 @app.route(
+    route="PutRunDTFAoiInferenceQueueMessage",
+    auth_level=AUTH_LEVEL,
+    methods=["PUT"],
+)
+async def PutRunDTFAoiInferenceQueueMessage(
+    req: func.HttpRequest,
+) -> func.HttpResponse:
+    """Queue an AOI-scoped DamageTriageFormer inference job (Option B,
+    AOI-scoped — docs/OptionB_AOI_Integration_Plan.md).
+
+    Unlike PutRunDTFInferenceQueueMessage (which classifies every building
+    in the layer), this is scoped to an analyst-drawn AOI polygon and/or an
+    explicit building-id selection, resolved against the hg_buildings
+    PostGIS table by DTFAoiInferencePostprocessor. Predictions land on the
+    matched hg_buildings rows only (review_status="pending_review"); every
+    other building's row, and any earlier whole-layer dtf model's raster
+    output, are left untouched.
+
+    Body: { projectId, imageLayerId, name?, aoi?, buildingIds? }
+    Either aoi (a GeoJSON Polygon/MultiPolygon, EPSG:4326) or buildingIds
+    (a list of building_id strings) is required.
+    """
+    logger.info(
+        "PutRunDTFAoiInferenceQueueMessage HTTP trigger function processed "
+        "a request."
+    )
+    try:
+        req_body = req.get_json()
+        aoi = req_body.get("aoi")
+        building_ids = req_body.get("buildingIds")
+
+        output = Model(**req_body)
+        output.modelType = "dtf-aoi"
+        output.dtfAoi = aoi
+        output.dtfBuildingIds = building_ids
+
+        if not output.projectId or not output.imageLayerId:
+            return func.HttpResponse(
+                "projectId and imageLayerId are required.", status_code=400
+            )
+        if not aoi and not building_ids:
+            return func.HttpResponse(
+                "Either aoi or buildingIds is required for dtf-aoi.",
+                status_code=400,
+            )
+
+        if output.modelId is None:
+            output.modelId = MetadataUtils.generate_short_int_id()
+        if output.creationDate is None:
+            output.creationDate = MetadataUtils.get_timestamp()
+        if output.name:
+            output.name = output.name.replace(" ", "-")
+
+        output = await asyncio.to_thread(
+            DTFAoiInferencePreprocessor(output).send_to_queue
+        )
+
+        await asyncio.to_thread(
+            MetadataProcessor(
+                data_type=config.get_metadata_types().MODEL.value,
+                partition_key=output.projectId,
+            ).save,
+            output.modelId,
+            output.dict(),
+        )
+
+        request = StatsPreProcessor(
+            request=StatsRequest(
+                action="add",
+                projectId=output.projectId,
+                modelIds=[output.modelId],
+            )
+        ).send_to_queue()
+        logger.info(
+            f"Message sent to update stats for project id "
+            f"{output.projectId} with request {request.dict()}"
+        )
+
+        return func.HttpResponse(json.dumps(output.dict()), status_code=200)
+
+    except ValidationError as e:
+        logger.error(f"Validation error: {e}\n{traceback.format_exc()}")
+        return func.HttpResponse("Validation error.", status_code=400)
+    except ValueError as e:
+        logger.error(f"Invalid JSON: {e}\n{traceback.format_exc()}")
+        return func.HttpResponse(
+            "Invalid JSON in request body.", status_code=400
+        )
+
+
+@app.route(
+    route="GetBuildingsInAoi",
+    auth_level=AUTH_LEVEL,
+    methods=["POST"],
+)
+async def GetBuildingsInAoi(req: func.HttpRequest) -> func.HttpResponse:
+    """POST /api/GetBuildingsInAoi — count buildings inside a drawn AOI.
+
+    Backs a pre-submit "this AOI contains N buildings" preview in the
+    frontend (RunDtfAoiButton.jsx) so an analyst can be warned before
+    queuing a very large per-building-crop run — see
+    docs/OptionB_AOI_Integration_Plan.md "Biggest pitfalls" #5.
+
+    Body: { imageLayerId, aoi?, buildingIds? }
+    """
+    try:
+        req_body = req.get_json()
+        image_layer_id = req_body.get("imageLayerId")
+        aoi = req_body.get("aoi")
+        building_ids = req_body.get("buildingIds")
+
+        if not image_layer_id:
+            return func.HttpResponse(
+                "imageLayerId is required.", status_code=400
+            )
+        if not aoi and not building_ids:
+            return func.HttpResponse(
+                "Either aoi or buildingIds is required.", status_code=400
+            )
+
+        count = await asyncio.to_thread(
+            postgis_query.count_buildings_in_aoi,
+            image_layer_id,
+            aoi,
+            building_ids,
+        )
+        return func.HttpResponse(
+            json.dumps({"count": count}), status_code=200
+        )
+    except ValueError as e:
+        return func.HttpResponse(str(e), status_code=400)
+    except Exception as e:
+        logger.error(
+            f"GetBuildingsInAoi: Error: {e}\n{traceback.format_exc()}",
+            stack_info=True,
+        )
+        return func.HttpResponse(
+            "Failed to count buildings in AOI.", status_code=500
+        )
+
+
+@app.route(
     route="GetBuildingEmbeddingsGeoJSON",
     auth_level=AUTH_LEVEL,
     methods=["GET"],
@@ -3607,6 +3753,49 @@ async def GetBuildingFootprintsGeoJSON(
 
 
 @app.route(
+    route="GetHgBuildingsGeoJSON",
+    auth_level=AUTH_LEVEL,
+    methods=["GET"],
+)
+async def GetHgBuildingsGeoJSON(req: func.HttpRequest) -> func.HttpResponse:
+    """Every classified hg_buildings row for an image layer, as a GeoJSON
+    FeatureCollection (docs/OptionB_AOI_Integration_Plan.md Module 6.7).
+
+    Unlike GetBuildingFootprintsGeoJSON (a random sample of ALL footprints,
+    unclassified), this returns only buildings a dtf-aoi run has actually
+    classified — it's what the Visualizer's AOI-predictions vector layer
+    fetches to render clickable, review_status-colored polygons. Small by
+    construction (only ever as large as the AOI(s) drawn so far for this
+    layer), so unlike GetBuildingFootprintsGeoJSON it is not sampled/capped.
+
+    Query params: imageLayerId
+    """
+    try:
+        image_layer_id = req.params.get("imageLayerId")
+        if not image_layer_id:
+            return func.HttpResponse(
+                "imageLayerId is required.", status_code=400
+            )
+
+        result = await asyncio.to_thread(
+            postgis_query.get_classified_buildings_geojson, image_layer_id
+        )
+        return func.HttpResponse(
+            json.dumps(result),
+            status_code=200,
+            mimetype="application/json",
+        )
+    except Exception as e:
+        logger.error(
+            f"Error in GetHgBuildingsGeoJSON: {e}\n{traceback.format_exc()}",
+            stack_info=True,
+        )
+        return func.HttpResponse(
+            "Error fetching classified buildings.", status_code=500
+        )
+
+
+@app.route(
     route="GetBuildingValidation",
     auth_level=AUTH_LEVEL,
     methods=["GET"],
@@ -3714,6 +3903,139 @@ async def PutBuildingValidation(req: func.HttpRequest) -> func.HttpResponse:
         )
         return func.HttpResponse(
             "Error saving building validation.", status_code=500
+        )
+
+
+@app.route(
+    route="PutBuildingDTFReview",
+    auth_level=AUTH_LEVEL,
+    methods=["PUT"],
+)
+async def PutBuildingDTFReview(req: func.HttpRequest) -> func.HttpResponse:
+    """Analyst Accept/Reject action on one AOI-scoped DamageTriageFormer
+    prediction (docs/OptionB_AOI_Integration_Plan.md Module 6.7).
+
+    Extends the existing PutBuildingValidation review pattern to
+    hg_buildings instead of the whole-layer VALIDATION labels store — the
+    two are separate stores because hg_buildings only exists for the
+    AOI-scoped dtf-aoi path, not the whole-layer dtf/embedding paths.
+    Never touches damage_class/geometry/any other column, only
+    review_status.
+
+    Body: { imageLayerId, buildingId, reviewStatus }
+    reviewStatus must be one of: pending_review, accepted, rejected.
+    """
+    try:
+        req_body = req.get_json()
+        image_layer_id = req_body.get("imageLayerId")
+        building_id = req_body.get("buildingId")
+        review_status = req_body.get("reviewStatus")
+
+        if not image_layer_id or not building_id or not review_status:
+            return func.HttpResponse(
+                "imageLayerId, buildingId, and reviewStatus are required.",
+                status_code=400,
+            )
+
+        updated = await asyncio.to_thread(
+            postgis_query.set_review_status,
+            image_layer_id,
+            building_id,
+            review_status,
+        )
+        if not updated:
+            return func.HttpResponse(
+                "No matching building found.", status_code=404
+            )
+
+        return func.HttpResponse(
+            json.dumps({"success": True}), status_code=200
+        )
+    except ValueError as e:
+        return func.HttpResponse(str(e), status_code=400)
+    except Exception as e:
+        logger.error(
+            f"PutBuildingDTFReview: Error: {e}\n{traceback.format_exc()}",
+            stack_info=True,
+        )
+        return func.HttpResponse(
+            "Failed to update building review status.", status_code=500
+        )
+
+
+@app.route(
+    route="GetAoiPredictionsGpkg",
+    auth_level=AUTH_LEVEL,
+    methods=["GET"],
+)
+async def GetAoiPredictionsGpkg(req: func.HttpRequest) -> func.HttpResponse:
+    """On-demand export of an AOI-scoped dtf-aoi run's current state.
+
+    Unlike model.gpkgUrl (a snapshot written at scoring time by
+    write_predictions_gpkg inside the training container, always
+    review_status="pending_review"), this queries hg_buildings live, so it
+    reflects any Accept/Reject decisions made after the job completed —
+    see docs/OptionB_AOI_Integration_Plan.md Module 6.7 / "Decide: human
+    review or fully automated?".
+
+    Query params:
+        imageLayerId, modelId
+        excludeRejected (optional, default "true"): when "false", rows an
+            analyst marked review_status="rejected" are included in the
+            export instead of being dropped.
+    """
+    try:
+        image_layer_id = req.params.get("imageLayerId")
+        model_id = req.params.get("modelId")
+        exclude_rejected = req.params.get("excludeRejected", "true").lower() != "false"
+        if not image_layer_id or not model_id:
+            return func.HttpResponse(
+                "imageLayerId and modelId are required.", status_code=400
+            )
+
+        with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            count = await asyncio.to_thread(
+                postgis_query.export_aoi_gpkg,
+                image_layer_id,
+                model_id,
+                tmp_path,
+                exclude_rejected=exclude_rejected,
+            )
+            if count == 0:
+                return func.HttpResponse(
+                    "No buildings found for this model run.",
+                    status_code=404,
+                )
+
+            artifact_processor = ArtifactProcessor(partition_key=image_layer_id)
+            artifact_name = f"dtf_aoi_predictions_{model_id}_current.gpkg"
+            await asyncio.to_thread(
+                artifact_processor.store_artifact,
+                artifact_name=artifact_name,
+                src_path=tmp_path,
+                namespace="artifacts",
+            )
+            download_url = await asyncio.to_thread(
+                artifact_processor.get_download_url,
+                identifier=artifact_name,
+                extra_partition_keys="artifacts",
+            )
+            return func.HttpResponse(
+                json.dumps({"url": download_url, "buildingCount": count}),
+                status_code=200,
+            )
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+    except Exception as e:
+        logger.error(
+            f"GetAoiPredictionsGpkg: Error: {e}\n{traceback.format_exc()}",
+            stack_info=True,
+        )
+        return func.HttpResponse(
+            "Failed to export AOI predictions.", status_code=500
         )
 
 

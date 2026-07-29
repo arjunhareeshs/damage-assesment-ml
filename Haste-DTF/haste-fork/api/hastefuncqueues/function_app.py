@@ -19,6 +19,9 @@ from hastegeo.core.models.stats import ProjectsSummary, StatsRequest
 from hastegeo.core.models.training import ExperimentConfig
 from hastegeo.core.processors.artifacts import ArtifactProcessor
 from hastegeo.core.processors.damage_triage import DTFInferencePostprocessor
+from hastegeo.core.processors.damage_triage_aoi import (
+    DTFAoiInferencePostprocessor,
+)
 from hastegeo.core.processors.embedding import EmbeddingPostprocessor
 from hastegeo.core.processors.imagery import ImageryPostProcessor
 from hastegeo.core.processors.inference import (
@@ -685,6 +688,111 @@ async def GetRunDTFInferenceQueueMessage(msg: func.QueueMessage) -> None:
             except Exception as inner_e:
                 logger.error(
                     "GetRunDTFInferenceQueueTrigger: Error saving failed "
+                    f"status: {inner_e}\n{traceback.format_exc()}",
+                    stack_info=True,
+                )
+
+
+@app.function_name(name="GetRunDTFAoiInferenceQueueTrigger")
+@app.queue_trigger(
+    arg_name="msg",
+    queue_name=config.get_queue_config()["dtf_aoi_queue_name"],
+    connection="AzureWebJobsStorage",
+)
+async def GetRunDTFAoiInferenceQueueMessage(msg: func.QueueMessage) -> None:
+    """Execute an AOI-scoped DamageTriageFormer inference job (Option B,
+    AOI-scoped — docs/OptionB_AOI_Integration_Plan.md).
+
+    Deserializes the dtf-aoi Model, loads its image layer, and drives the
+    DTFAoiInferencePostprocessor state machine (submit -> poll ->
+    finalize). Near-identical to GetRunDTFInferenceQueueMessage (the
+    whole-layer dtf path) above, bound to a separate queue
+    (dtf_aoi_queue_name) so an AOI-scoped run never competes with or blocks
+    a whole-layer run for the same image layer. No zip/inference
+    follow-on — the finished per-building predictions (written directly to
+    hg_buildings by the postprocessor) are the terminal result. Re-enqueues
+    itself while in progress.
+    """
+    logger.info(
+        "GetRunDTFAoiInferenceQueueTrigger function processed a message: "
+        f'{msg.get_body().decode("utf-8")}'
+    )
+    model_data = None
+    try:
+        model_data = Model(**json.loads(msg.get_body().decode("utf-8")))
+        try:
+            existing_model = await asyncio.to_thread(
+                MetadataProcessor(
+                    data_type=config.get_metadata_types().MODEL.value,
+                    partition_key=model_data.projectId,
+                ).load,
+                model_data.modelId,
+            )
+        except FileNotFoundError:
+            existing_model = None
+
+        if not existing_model:
+            logger.info(
+                f"DTF-AOI model {model_data.modelId} not found, likely "
+                "deleted, skipping processing."
+            )
+            return
+
+        image_layer = await asyncio.to_thread(
+            MetadataProcessor(
+                data_type=config.get_metadata_types().IMAGELAYER.value,
+                partition_key=model_data.projectId,
+            ).load,
+            model_data.imageLayerId,
+        )
+        image_layer = ImageLayer(**image_layer)
+
+        output = await asyncio.to_thread(
+            DTFAoiInferencePostprocessor(model_data, image_layer).process
+        )
+
+        await asyncio.to_thread(
+            MetadataProcessor(
+                data_type=config.get_metadata_types().MODEL.value,
+                partition_key=model_data.projectId,
+            ).save,
+            model_data.modelId,
+            output.dict(),
+        )
+    except ValidationError as e:
+        logger.error(
+            f"GetRunDTFAoiInferenceQueueTrigger: Validation error: {e}\n"
+            f"{traceback.format_exc()}"
+        )
+    except ValueError as e:
+        logger.error(
+            f"GetRunDTFAoiInferenceQueueTrigger: Invalid JSON: {e}\n"
+            f"{traceback.format_exc()}"
+        )
+    except Exception as e:
+        logger.error(
+            f"GetRunDTFAoiInferenceQueueTrigger: Error processing queue "
+            f"message: {e}\n{traceback.format_exc()}",
+            stack_info=True,
+        )
+        if model_data is not None:
+            try:
+                model_data.status = config.get_status_types().FAILED.value
+                model_data.statusMessage = MetadataUtils.append_status_message(
+                    model_data.statusMessage,
+                    f"AOI-scoped DamageTriageFormer inference failed: {str(e)}",
+                )
+                await asyncio.to_thread(
+                    MetadataProcessor(
+                        data_type=config.get_metadata_types().MODEL.value,
+                        partition_key=model_data.projectId,
+                    ).save,
+                    model_data.modelId,
+                    model_data.dict(),
+                )
+            except Exception as inner_e:
+                logger.error(
+                    "GetRunDTFAoiInferenceQueueTrigger: Error saving failed "
                     f"status: {inner_e}\n{traceback.format_exc()}",
                     stack_info=True,
                 )

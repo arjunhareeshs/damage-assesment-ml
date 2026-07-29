@@ -102,6 +102,11 @@ class ArtifactTypes(Enum):
     BUILDING_PREDICTIONS_GPKG = Template("building_predictions_${modelName}")
     # Option B: DamageTriageFormer per-building 5-class typology predictions.
     BUILDING_DTF_PREDICTIONS_GPKG = Template("dtf_predictions_${modelName}")
+    # Option B (AOI-scoped): same, but only the buildings touched by a
+    # single dtf-aoi run (not the whole layer) — see damage_triage_aoi.py.
+    BUILDING_DTF_AOI_PREDICTIONS_GPKG = Template(
+        "dtf_aoi_predictions_${modelName}"
+    )
 
 
 class InviteConfig(NamedTuple):
@@ -269,6 +274,9 @@ class Config:
             "dtf_queue_name": os.getenv(
                 "DTF_QUEUE_NAME", "dtf-queue"
             ),
+            "dtf_aoi_queue_name": os.getenv(
+                "DTF_AOI_QUEUE_NAME", "dtf-aoi-inference"
+            ),
         }
 
     @staticmethod
@@ -301,6 +309,7 @@ class Config:
             IMAGERY_CONFIG = "imageryprep_config"
             EMBEDDING_CONFIG = "embedding_config"
             DTF_CONFIG = "dtf_config"
+            DTF_AOI_CONFIG = "dtf_aoi_config"
             PROCESSED_IMAGERY = "processed_imagery_post_event_cog"
             RAW_IMAGERY = "raw_imagery"
             PREVIEW_RAW_IMAGERY = "preview_raw_imagery"

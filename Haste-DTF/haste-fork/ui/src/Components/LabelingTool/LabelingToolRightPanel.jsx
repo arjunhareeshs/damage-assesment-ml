@@ -1,10 +1,18 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 import { useEffect, useState } from "react";
-import { ChoiceGroup, PrimaryButton, Slider } from "@fluentui/react";
+import {
+  ActionButton,
+  ChoiceGroup,
+  DefaultButton,
+  PrimaryButton,
+  Slider,
+} from "@fluentui/react";
 import CreateEditModelTrainingModal from "../CreateEditModelTrainingModal";
 import { saveLabels, checkLabelsState } from "./LabelingToolHelper";
 import DrawingToolbar from "./DrawingToolbar";
+import AoiDrawTool from "./AoiDrawTool";
+import RunDtfAoiButton from "./RunDtfAoiButton";
 import PropType from "prop-types";
 import { updateShape } from "./LabelingToolHelper";
 import ImportLabelsModal from "./ImportLabelsModal";
@@ -30,6 +38,12 @@ const LabelingToolRightPanel = ({
   imageLayerId,
   undo,
   redo,
+  aoiGeoJson,
+  setAoiGeoJson,
+  buildingSelectActive,
+  setBuildingSelectActive,
+  selectedBuildingIds,
+  setSelectedBuildingIds,
 }) => {
   LabelingToolRightPanel.propTypes = {
     primaryClasses: PropType.array.isRequired,
@@ -50,7 +64,34 @@ const LabelingToolRightPanel = ({
     imageLayerId: PropType.string.isRequired,
     undo: PropType.func.isRequired,
     redo: PropType.func.isRequired,
+    aoiGeoJson: PropType.object,
+    setAoiGeoJson: PropType.func.isRequired,
+    buildingSelectActive: PropType.bool.isRequired,
+    setBuildingSelectActive: PropType.func.isRequired,
+    selectedBuildingIds: PropType.array.isRequired,
+    setSelectedBuildingIds: PropType.func.isRequired,
   };
+
+  function handleRunDtfAoi() {
+    setModalComponent(
+      <RunDtfAoiButton
+        onClose={() => setModalComponent(null)}
+        projectId={projectId}
+        imageLayerId={imageLayerId}
+        aoiGeoJson={aoiGeoJson}
+        selectedBuildingIds={selectedBuildingIds}
+        fetchProjectDetails={() => {}}
+      />
+    );
+  }
+
+  function handleToggleBuildingSelect() {
+    setBuildingSelectActive((prev) => !prev);
+  }
+
+  function handleClearBuildingSelection() {
+    setSelectedBuildingIds([]);
+  }
 
   useEffect(() => {
     if (selectedShape !== null) {
@@ -357,6 +398,49 @@ const LabelingToolRightPanel = ({
             menuProps={labelSavingMenuOptions()}
             className="w-100"
             text="Actions"
+          />
+        </div>
+        <div className="col-12 d-flex flex-column pt-2 pb-2 border-top">
+          <AoiDrawTool aoiGeoJson={aoiGeoJson} setAoiGeoJson={setAoiGeoJson} />
+
+          <DefaultButton
+            className="w-100 mt-2"
+            text={
+              buildingSelectActive
+                ? "Stop selecting buildings"
+                : "Select buildings"
+            }
+            iconProps={{ iconName: "TouchPointer" }}
+            checked={buildingSelectActive}
+            onClick={handleToggleBuildingSelect}
+          />
+          {selectedBuildingIds.length > 0 ? (
+            <div className="d-flex align-items-center justify-content-between mt-1">
+              <span style={{ fontSize: 12, color: "#333" }}>
+                {selectedBuildingIds.length} building
+                {selectedBuildingIds.length === 1 ? "" : "s"} selected
+              </span>
+              <ActionButton
+                iconProps={{ iconName: "Cancel" }}
+                onClick={handleClearBuildingSelection}
+                styles={{ root: { height: "auto" } }}
+              >
+                Clear
+              </ActionButton>
+            </div>
+          ) : null}
+
+          <PrimaryButton
+            id="runDtfAoiButton"
+            className="w-100 mt-2"
+            text="Run DamageTriageFormer on AOI"
+            disabled={!aoiGeoJson && selectedBuildingIds.length === 0}
+            title={
+              !aoiGeoJson && selectedBuildingIds.length === 0
+                ? "Draw an AOI or select buildings first"
+                : "Classify the selected buildings"
+            }
+            onClick={handleRunDtfAoi}
           />
         </div>
       </div>

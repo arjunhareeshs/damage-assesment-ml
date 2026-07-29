@@ -77,6 +77,21 @@ const InfoPanel = ({
                   )
                 }
               />
+              <Checkbox
+                className="mt-2"
+                defaultChecked={true}
+                label="AOI DamageTriageFormer predictions"
+                onChange={(e, checked) => {
+                  togglePredictedDamageLayerVisibility(
+                    "dtfAoiPredictionsLayer",
+                    checked
+                  );
+                  togglePredictedDamageLayerVisibility(
+                    "dtfAoiPredictionsOutline",
+                    checked
+                  );
+                }}
+              />
             </div>
           </div>
           <div className="d-flex flex-column">

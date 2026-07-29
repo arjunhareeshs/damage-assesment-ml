@@ -2,6 +2,7 @@
 # Licensed under the MIT License.
 import json
 import os
+import tempfile
 from typing import NamedTuple
 
 from hastegeo.core.runners.unified_runner import UnifiedRunner
@@ -9,6 +10,7 @@ from hastegeo.core.runners.unified_runner import UnifiedRunner
 from ..config import ArtifactTypes, Config
 from ..data_layer.unified import UnifiedDataLayer
 from ..models.projects import ImageLayer, ImageryPreprocessJob
+from ..utils import postgis_load
 from ..utils.data import extract_from_url
 from ..utils.logs import Logger
 from ..utils.metadata import MetadataUtils
@@ -492,6 +494,8 @@ class ImageryPostProcessor:
         building_footprints_error = processed_manifest.get(
             "building_footprints_error", ""
         )
+        if building_footprints_filename and not building_footprints_error:
+            self._load_footprints_into_postgis(building_footprints_filename)
         if building_footprints_error:
             self.image_data.status = (
                 self.config.get_status_types().FAILED.value
@@ -514,6 +518,60 @@ class ImageryPostProcessor:
             filename=valid_area_mask_filename,
             imagery_type=self.config.get_artifact_types().VALID_AREA_MASK,
         )
+
+    def _load_footprints_into_postgis(self, building_footprints_filename):
+        """Load the freshly-produced footprints GPKG into ``hg_buildings``.
+
+        Runs here (in the API/worker process, which has PostGIS
+        connectivity/credentials) rather than inside the imageryprep
+        Docker subprocess. This backs the AOI-scoped DamageTriageFormer
+        path (``modelType="dtf-aoi"``, see
+        ``hastegeo.core.utils.postgis_query.buildings_in_aoi``) with a
+        live spatial index of every building in this layer. A failure here
+        is logged but does not fail the image layer — the whole-layer
+        ``modelType="dtf"`` path and the map/labeling tool don't depend on
+        ``hg_buildings`` at all, only the AOI path does.
+
+        The GPKG is a binary SQLite file, so it must be fetched as raw
+        bytes (``as_chunk=True``) rather than the UTF-8-decoded text path
+        ``get_filecontent_from_task`` takes by default.
+        """
+        try:
+            chunks = self.runner.get_filecontent_from_task(
+                job_id=self.image_data.preprocessJob.jobId,
+                task_id=self.image_data.preprocessJob.taskId,
+                filename=building_footprints_filename,
+                as_chunk=True,
+            )
+            if not chunks:
+                self.logger.warning(
+                    "Building-footprints GPKG %s not found on task output; "
+                    "skipping hg_buildings load for image layer %s",
+                    building_footprints_filename,
+                    self.image_data.imageLayerId,
+                )
+                return
+            with tempfile.NamedTemporaryFile(suffix=".gpkg") as tmp:
+                for chunk in chunks:
+                    tmp.write(chunk)
+                tmp.flush()
+                count = postgis_load.load_footprints_into_postgis(
+                    self.image_data, tmp.name
+                )
+            self.logger.info(
+                "Loaded %d buildings into hg_buildings for image layer %s",
+                count,
+                self.image_data.imageLayerId,
+            )
+        except Exception as exc:
+            self.logger.error(
+                "Failed loading building footprints into PostGIS for "
+                "image layer %s (AOI-scoped DamageTriageFormer runs will "
+                "see no buildings until this is retried): %s",
+                self.image_data.imageLayerId,
+                exc,
+                exc_info=True,
+            )
 
     def _generate_imagery_url(
         self, filename: str, imagery_type: ArtifactTypes, validate=True

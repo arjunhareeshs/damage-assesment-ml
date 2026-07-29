@@ -469,6 +469,21 @@ class Model(BaseModel):
     # (dtf_class, dtf_class_name, dtf_confidence, dtf_prob_0..4) on the same
     # GeoPackage — see hastegeo/workflows/damage_triage_infer.py.
     dtfJob: Optional[TrainingJob] = Field(default=None)
+    # ── Option B (AOI-scoped): DamageTriageFormer inference restricted to
+    # an analyst-drawn area of interest (dtf-aoi sub-row) ───────────────
+    # A Model with modelType="dtf-aoi" represents a DamageTriageFormer run
+    # scoped to either a drawn AOI polygon or an explicit building-id
+    # selection, resolved against the hg_buildings PostGIS table (see
+    # hastegeo/core/utils/postgis_query.py) rather than the whole layer.
+    # Unlike modelType="dtf", it does not repaint a full-layer raster —
+    # it PATCHes per-building rows in hg_buildings (damage_class,
+    # confidence, mask_url, crop_url, review_status), leaving every other
+    # building's row and the layer's existing dtf raster/gpkg untouched.
+    # gpkgUrl for a dtf-aoi row is an AOI-scoped export (only the buildings
+    # touched by this run), not a full-layer export.
+    dtfAoi: Optional[dict] = Field(default=None)
+    dtfBuildingIds: Optional[List[str]] = Field(default=None)
+    dtfAoiJob: Optional[TrainingJob] = Field(default=None)
     dependsOn: Optional[tuple[str, str]] = Field(
         default=("ImageLayer", "imageLayerId")
     )
