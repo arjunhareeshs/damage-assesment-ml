@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 import { apiPut } from "../../util/api";
 import settings from "../../assets/json/settings.json";
-import { getAzureMapsAuthOptions } from "../../util/azureMapsAuth";
+import { getAzureMapsAuthOptions, isAzureMapsPlaceholder } from "../../util/azureMapsAuth";
 
 // AOI-scoped DamageTriageFormer (Option B, AOI-scoped —
 // docs/OptionB_AOI_Integration_Plan.md Module 5). "draw-rectangle" is not
@@ -95,6 +95,11 @@ export function loadImagery(tileUrl, map, imageryRef, customId, isVisible) {
 
   var tempTileUrlPath = tileUrl;
   if (tempTileUrlPath === "") {
+    if (isAzureMapsPlaceholder) {
+      // No real Azure Maps key — skip fallback to avoid 401 errors.
+      // The map background will be blank; only COG imagery will show.
+      return;
+    }
     tempTileUrlPath = `https://atlas.microsoft.com/map/tile?api-version=2.1&tilesetId=microsoft.imagery&zoom={z}&x={x}&y={y}`;
   }
 

@@ -123,6 +123,30 @@ const CLASS_OPTIONS = [
   { key: String(CLASS_CLOUDY), text: "Cloudy" },
 ];
 
+// DamageTriageFormer's 5 damage-typology classes and their map colors —
+// mirrors DTF_CATEGORIES / DTF_IDX_TO_COLOR in
+// hastegeo/workflows/damage_triage_infer.py (class_idx -> DTF_IDX_TO_COLOR[class_idx+1])
+// so a building's color here matches its per-crop mask thumbnail.
+const DTF_CATEGORIES = [
+  "Undamaged",
+  "Partial Roof Damage",
+  "Total Roof Damage",
+  "Partial Structural Collapse",
+  "Total Structural Collapse",
+];
+const DTF_COLORS = ["#FFFFFF", "#FCBEA5", "#FB7050", "#D32020", "#67000D"];
+
+// Local bridge server (local_api_server.py, project root) that runs the
+// DamageTriageFormer pipeline synchronously for the "Classify selected"
+// button — NOT the production Azure Functions API (that's async/queued and
+// needs a full PostGIS+Azurite stack). Override via VITE_LOCAL_CLASSIFY_URL
+// for a non-default port.
+const CLASSIFY_SERVER_URL =
+  (typeof import.meta !== "undefined" &&
+    import.meta.env &&
+    import.meta.env.VITE_LOCAL_CLASSIFY_URL) ||
+  "http://127.0.0.1:8787";
+
 const MIN_PER_CLASS = 3;
 // Predict batch size for the "Predict all buildings" full-coverage pass.
 // Large enough to amortize the OvRLogisticRegression.predict() per-call
@@ -145,6 +169,36 @@ function findGlMap(atlasMap) {
     }
   }
   return null;
+}
+
+// Find the internal MapLibre/Mapbox-GL fill layer id(s) that render our
+// buildings source, by inspecting the live style. Matches on EITHER the
+// source id (e.g. "buildings", or anything Azure Maps renamed containing
+// "build") OR the vector tile's source-layer name (PMTILES_SOURCE_LAYER) —
+// two independent signals so a renamed/retyped internal layer is still
+// found by at least one of them. Returns [] (never anything falsy that
+// could be mistaken for "no filter") if discovery fails.
+function discoverInternalLayers(glMap) {
+  if (!glMap || typeof glMap.getStyle !== "function") return [];
+  try {
+    const style = glMap.getStyle();
+    const srcs = Object.keys(style.sources || {});
+    const ours = srcs.filter((s) => s === "buildings" || /build/i.test(s));
+    const sourceIds = [...new Set(["buildings", ...ours, ...srcs])];
+    const layerIds = (style.layers || [])
+      .filter(
+        (l) =>
+          l.type === "fill" &&
+          (sourceIds.includes(l.source) ||
+            /build/i.test(l.id) ||
+            l["source-layer"] === PMTILES_SOURCE_LAYER)
+      )
+      .map((l) => l.id);
+    return { sourceIds, layerIds };
+  } catch (e) {
+    console.warn("discoverInternalLayers: glMap.getStyle() failed:", e);
+    return { sourceIds: [], layerIds: [] };
+  }
 }
 
 // Build the fillColor paint expression for a given feature-state key
@@ -173,6 +227,32 @@ function fillOpacityExpr(stateKey) {
     ["==", ["feature-state", stateKey], CLASS_INTACT], LABELED_FILL_OPACITY,
     ["==", ["feature-state", stateKey], CLASS_DAMAGED], LABELED_FILL_OPACITY,
     ["==", ["feature-state", stateKey], CLASS_CLOUDY], LABELED_FILL_OPACITY,
+    0,
+  ];
+}
+
+// Same shape as fillColorExpr/fillOpacityExpr, but over DTF's 5-class scale
+// (feature-state key "dtf", class indices 0-4) instead of the in-browser
+// 3-class embedding model's labels.
+function fillColorExprDtf() {
+  return [
+    "case",
+    ["==", ["feature-state", "dtf"], 0], DTF_COLORS[0],
+    ["==", ["feature-state", "dtf"], 1], DTF_COLORS[1],
+    ["==", ["feature-state", "dtf"], 2], DTF_COLORS[2],
+    ["==", ["feature-state", "dtf"], 3], DTF_COLORS[3],
+    ["==", ["feature-state", "dtf"], 4], DTF_COLORS[4],
+    UNLABELED_COLOR,
+  ];
+}
+function fillOpacityExprDtf() {
+  return [
+    "case",
+    ["==", ["feature-state", "dtf"], 0], LABELED_FILL_OPACITY,
+    ["==", ["feature-state", "dtf"], 1], LABELED_FILL_OPACITY,
+    ["==", ["feature-state", "dtf"], 2], LABELED_FILL_OPACITY,
+    ["==", ["feature-state", "dtf"], 3], LABELED_FILL_OPACITY,
+    ["==", ["feature-state", "dtf"], 4], LABELED_FILL_OPACITY,
     0,
   ];
 }
@@ -254,6 +334,11 @@ const InteractiveLabeler = () => {
   // reading our maps.
   const labeledMapRef = useRef({});
   const predictionsMapRef = useRef({});
+  // DTF results: building id -> DamageTriageFormer class index (0-4), loaded
+  // from a run_local_aoi_assessment.py / damage_triage_aoi_infer manifest.
+  // Building id here is assumed to match the map feature's row-index id
+  // (both are ultimately derived from the same footprints file's row order).
+  const dtfResultsMapRef = useRef({});
   // Saved-labels keyed by Overture id, restored once from PutInteractiveLabels.
   // We can only re-apply them as feature-state once their tiles render
   // (the rendered feature carries both the row-index id and overture_id),
@@ -281,7 +366,7 @@ const InteractiveLabeler = () => {
 
   const [isMapReady, setIsMapReady] = useState(false);
   const [selectedClass, setSelectedClass] = useState(CLASS_DAMAGED);
-  const [viewMode, setViewMode] = useState("label"); // "label" | "predict"
+  const [viewMode, setViewMode] = useState("label"); // "label" | "predict" | "dtf"
   const [showFootprints, setShowFootprints] = useState(true);
   const [counts, setCounts] = useState({ 0: 0, 1: 0, 2: 0 });
   const [viewportPredicted, setViewportPredicted] = useState(0);
@@ -293,6 +378,14 @@ const InteractiveLabeler = () => {
   const [fullPredict, setFullPredict] = useState(null);
   const [backend, setBackend] = useState(null);
 
+  // "label": click/box-select assigns the 3-class embedding label (existing
+  // behavior). "classify": click/box-select instead marks buildings pending
+  // for a DamageTriageFormer run via the local classify server — see
+  // classifySelectedBuildings().
+  const [selectionMode, setSelectionMode] = useState("label");
+  const [pendingCount, setPendingCount] = useState(0);
+  const [classifyBusy, setClassifyBusy] = useState(false);
+
   // selectedClass / viewMode are read by long-lived map event handlers.
   const selectedClassRef = useRef(selectedClass);
   useEffect(() => {
@@ -302,6 +395,12 @@ const InteractiveLabeler = () => {
   useEffect(() => {
     viewModeRef.current = viewMode;
   }, [viewMode]);
+  const selectionModeRef = useRef(selectionMode);
+  useEffect(() => {
+    selectionModeRef.current = selectionMode;
+  }, [selectionMode]);
+  // id -> {id, geometry, source} for buildings marked pending-classify.
+  const pendingClassifyRef = useRef(new Map());
 
   // Detect the compute backend up-front so the panel shows WebGPU vs CPU.
   useEffect(() => {
@@ -549,6 +648,23 @@ const InteractiveLabeler = () => {
         })
       );
 
+      // Distinct highlight for buildings pending a "Classify selected" run
+      // (selectionMode === "classify") — a thick outline on top of whatever
+      // fill color the current view mode is showing, so pending state stays
+      // visible regardless of view mode.
+      map.layers.add(
+        new window.atlas.layer.LineLayer("buildings", "embeddingPendingOutline", {
+          sourceLayer: PMTILES_SOURCE_LAYER,
+          strokeColor: "#2b88d8",
+          strokeWidth: [
+            "case",
+            ["==", ["feature-state", "pending"], true],
+            4,
+            0,
+          ],
+        })
+      );
+
       // §4: reach the internal Mapbox-GL map for setFeatureState +
       // queryRenderedFeatures. Without it, we can render but can't recolor
       // individual buildings on click.
@@ -558,31 +674,14 @@ const InteractiveLabeler = () => {
         setStatus(
           "Cannot reach the internal map renderer — labeling will not show colors."
         );
-      } else if (typeof glMap.getStyle === "function") {
+      } else {
         // Discover the source/layer ids the renderer actually uses (Azure
         // Maps prefixes ours). queryRenderedFeatures must target the
         // internal ids, and setFeatureState must use the source id the
         // renderer assigned.
-        try {
-          const style = glMap.getStyle();
-          const srcs = Object.keys(style.sources || {});
-          const ours = srcs.filter(
-            (s) => s === "buildings" || /build/i.test(s)
-          );
-          internalSourceIdsRef.current = [
-            ...new Set(["buildings", ...ours, ...srcs]),
-          ];
-          internalLayerIdsRef.current = (style.layers || [])
-            .filter(
-              (l) =>
-                l.type === "fill" &&
-                (internalSourceIdsRef.current.includes(l.source) ||
-                  /build/i.test(l.id))
-            )
-            .map((l) => l.id);
-        } catch (e) {
-          console.warn("glMap.getStyle() failed:", e);
-        }
+        const { sourceIds, layerIds } = discoverInternalLayers(glMap);
+        internalSourceIdsRef.current = sourceIds;
+        internalLayerIdsRef.current = layerIds;
       }
 
       // Click → label the building under the cursor. Box-select (Ctrl+drag)
@@ -597,7 +696,11 @@ const InteractiveLabeler = () => {
         }
         const f = clickedFeature(map, e);
         if (!f) return;
-        labelBuilding(f.id, f.properties, selectedClassRef.current);
+        if (selectionModeRef.current === "classify") {
+          togglePendingClassify(f);
+        } else {
+          labelBuilding(f.id, f.properties, selectedClassRef.current);
+        }
       });
       map.events.add("contextmenu", fillLayer, (e) => {
         const f = clickedFeature(map, e);
@@ -644,6 +747,25 @@ const InteractiveLabeler = () => {
   }
 
   // ── Internal-map helpers ──────────────────────────────────────────────────
+  // Returns the buildings layer ids to restrict a queryRenderedFeatures call
+  // to, or null if they genuinely can't be found. NEVER returns [] with the
+  // intent of "query everything" — an empty/undefined `layers` filter makes
+  // queryRenderedFeatures search every rendered layer (basemap, labels,
+  // etc.), which is what previously caused a drag box to grab every visible
+  // feature instead of just the buildings inside it. If the cached ids are
+  // empty, retry discovery once (a tile/style update may have populated it
+  // since init) before giving up.
+  function resolveInternalLayerIds(gl) {
+    if (internalLayerIdsRef.current.length) return internalLayerIdsRef.current;
+    const { sourceIds, layerIds } = discoverInternalLayers(gl);
+    if (layerIds.length) {
+      internalSourceIdsRef.current = sourceIds;
+      internalLayerIdsRef.current = layerIds;
+      return layerIds;
+    }
+    return null;
+  }
+
   // Walk the rendered features at a click point and return the first one
   // from our buildings layer, with its id + props (which include f_*).
   function clickedFeature(map, e) {
@@ -655,21 +777,21 @@ const InteractiveLabeler = () => {
       px = pos && pos[0];
     }
     if (!px) return null;
+    const layers = resolveInternalLayerIds(gl);
+    if (!layers) {
+      setStatus("Cannot find the buildings layer — selection disabled.");
+      return null;
+    }
     let rf = [];
     try {
-      rf = gl.queryRenderedFeatures(
-        px,
-        internalLayerIdsRef.current.length
-          ? { layers: internalLayerIdsRef.current }
-          : undefined
-      );
+      rf = gl.queryRenderedFeatures(px, { layers });
     } catch (err) {
       console.warn("queryRenderedFeatures failed:", err);
       return null;
     }
     const f = rf[0];
     if (!f || f.id == null) return null;
-    return { id: f.id, properties: f.properties, source: f.source };
+    return { id: f.id, properties: f.properties, source: f.source, geometry: f.geometry };
   }
 
   // Read all currently-rendered features from the buildings layer, hydrate
@@ -727,6 +849,8 @@ const InteractiveLabeler = () => {
       if (entry) setFeatureStateLabel(f.source, id, entry.label);
       const pred = predictionsMapRef.current[id];
       if (pred != null) setFeatureStatePred(f.source, id, pred);
+      const dtfCls = dtfResultsMapRef.current[id];
+      if (dtfCls != null) setFeatureStateDtf(f.source, id, dtfCls);
     }
 
     // Viewport-scoped predict — only train + score what's on screen.
@@ -762,6 +886,34 @@ const InteractiveLabeler = () => {
       console.warn("setFeatureState (pred) failed:", err);
     }
   }
+  function setFeatureStateDtf(sourceId, id, clsIdx) {
+    const gl = glMapRef.current;
+    if (!gl) return;
+    try {
+      gl.setFeatureState(
+        { source: sourceId, sourceLayer: PMTILES_SOURCE_LAYER, id },
+        { dtf: clsIdx }
+      );
+      mapRef.current?.triggerRepaint && mapRef.current.triggerRepaint();
+    } catch (err) {
+      console.warn("setFeatureState (dtf) failed:", err);
+    }
+  }
+  // Marks a building as pending classification (a distinct outline, not a
+  // fill color, so it doesn't fight with whatever view mode is showing).
+  function setFeatureStatePending(sourceId, id, pending) {
+    const gl = glMapRef.current;
+    if (!gl) return;
+    try {
+      gl.setFeatureState(
+        { source: sourceId, sourceLayer: PMTILES_SOURCE_LAYER, id },
+        { pending }
+      );
+      mapRef.current?.triggerRepaint && mapRef.current.triggerRepaint();
+    } catch (err) {
+      console.warn("setFeatureState (pending) failed:", err);
+    }
+  }
   function clearFeatureStateLabel(sourceId, id) {
     const gl = glMapRef.current;
     if (!gl) return;
@@ -791,11 +943,18 @@ const InteractiveLabeler = () => {
     if (!map) return;
     const fill = map.layers.getLayerById?.("embeddingFill");
     if (!fill) return;
-    fill.setOptions({
-      fillColor: fillColorExpr(viewMode === "predict" ? "pred" : "label"),
-      fillOpacity: fillOpacityExpr(viewMode === "predict" ? "pred" : "label"),
-    });
-    if (viewMode === "predict") hydrateViewport(map);
+    if (viewMode === "dtf") {
+      fill.setOptions({
+        fillColor: fillColorExprDtf(),
+        fillOpacity: fillOpacityExprDtf(),
+      });
+    } else {
+      fill.setOptions({
+        fillColor: fillColorExpr(viewMode === "predict" ? "pred" : "label"),
+        fillOpacity: fillOpacityExpr(viewMode === "predict" ? "pred" : "label"),
+      });
+    }
+    if (viewMode === "predict" || viewMode === "dtf") hydrateViewport(map);
   }, [viewMode, isMapReady]);
 
   // Show / hide the buildings layers without unmounting them. Driven by
@@ -804,7 +963,7 @@ const InteractiveLabeler = () => {
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
-    for (const layerId of ["embeddingFill", "embeddingOutline"]) {
+    for (const layerId of ["embeddingFill", "embeddingOutline", "embeddingPendingOutline"]) {
       const layer = map.layers.getLayerById?.(layerId);
       if (layer) layer.setOptions({ visible: showFootprints });
     }
@@ -871,6 +1030,116 @@ const InteractiveLabeler = () => {
     clearFeatureStateLabel(primarySourceId(), id);
     refreshCounts();
   }
+  // Apply a run_local_aoi_assessment.py / damage_triage_aoi_infer manifest
+  // ({buildings: [{building_id, class, class_name, confidence}, ...]}) to
+  // the map: one setFeatureState call per building, keyed by the same id
+  // the manifest's building_id carries. Colors take effect immediately for
+  // any building already rendered; hydrateViewport re-applies the rest as
+  // their tiles come into view (see dtfResultsMapRef there).
+  function loadDtfResults(manifest) {
+    const buildings = (manifest && manifest.buildings) || [];
+    let n = 0;
+    for (const b of buildings) {
+      if (b.class == null || b.class < 0) continue;
+      const id = Number(b.building_id);
+      if (Number.isNaN(id)) continue;
+      dtfResultsMapRef.current[id] = b.class;
+      setFeatureStateDtf(primarySourceId(), id, b.class);
+      n++;
+    }
+    setStatus(`Loaded ${n} DTF prediction(s) from manifest.`);
+    setViewMode("dtf");
+  }
+
+  // ── "Classify selected" flow (selectionMode === "classify") ────────────────
+  // Click/box-select in this mode mark buildings pending (blue outline,
+  // embeddingPendingOutline layer) instead of assigning a 3-class label.
+  // "Classify Selected" then POSTs their geometries to the local bridge
+  // server (local_api_server.py), which runs DamageTriageFormer
+  // building-by-building and returns one damage class per building — applied
+  // via loadDtfResults, the same path the manifest-file loader uses.
+  function togglePendingClassify(f) {
+    if (!f.geometry) {
+      setStatus("This building has no geometry available to classify.");
+      return;
+    }
+    const pending = pendingClassifyRef.current;
+    const source = f.source || primarySourceId();
+    if (pending.has(f.id)) {
+      pending.delete(f.id);
+      setFeatureStatePending(source, f.id, false);
+    } else {
+      pending.set(f.id, { id: f.id, geometry: f.geometry, source });
+      setFeatureStatePending(source, f.id, true);
+    }
+    setPendingCount(pending.size);
+  }
+  function addPendingClassify(items) {
+    const pending = pendingClassifyRef.current;
+    let added = 0;
+    let skipped = 0;
+    for (const it of items) {
+      if (it.id == null) continue;
+      if (!it.geometry) {
+        skipped++;
+        continue;
+      }
+      const source = it.source || primarySourceId();
+      if (!pending.has(it.id)) added++;
+      pending.set(it.id, { id: it.id, geometry: it.geometry, source });
+      setFeatureStatePending(source, it.id, true);
+    }
+    setPendingCount(pending.size);
+    if (added > 0) {
+      setStatus(
+        `Selected ${added} building(s) for classification (${pending.size} total)` +
+          (skipped > 0 ? `, ${skipped} skipped (no geometry).` : ".")
+      );
+    } else if (skipped > 0) {
+      setStatus(`${skipped} building(s) had no geometry — nothing selected.`);
+    }
+  }
+  function clearPendingClassify() {
+    const pending = pendingClassifyRef.current;
+    for (const b of pending.values()) {
+      setFeatureStatePending(b.source, b.id, false);
+    }
+    pending.clear();
+    setPendingCount(0);
+  }
+  async function classifySelectedBuildings() {
+    const buildings = Array.from(pendingClassifyRef.current.values()).map((b) => ({
+      building_id: b.id,
+      geometry: b.geometry,
+    }));
+    if (buildings.length === 0) {
+      setStatus("No buildings selected — click buildings (or Ctrl+drag) in Classify mode first.");
+      return;
+    }
+    setClassifyBusy(true);
+    setStatus(`Classifying ${buildings.length} building(s)...`);
+    try {
+      const resp = await fetch(`${CLASSIFY_SERVER_URL}/classify`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ buildings }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        throw new Error(data.error || `HTTP ${resp.status}`);
+      }
+      loadDtfResults(data);
+      clearPendingClassify();
+    } catch (err) {
+      console.error("Classify request failed:", err);
+      setStatus(
+        `Classify failed: ${err.message}. Is local_api_server.py running on ${CLASSIFY_SERVER_URL}?`
+      );
+    } finally {
+      setClassifyBusy(false);
+    }
+  }
+
   function refreshCounts() {
     const next = { 0: 0, 1: 0, 2: 0 };
     Object.values(labeledMapRef.current).forEach((e) => {
@@ -929,6 +1198,11 @@ const InteractiveLabeler = () => {
 
       const gl = glMapRef.current;
       if (!gl) return;
+      const layers = resolveInternalLayerIds(gl);
+      if (!layers) {
+        setStatus("Cannot find the buildings layer — box-select disabled.");
+        return;
+      }
       let rf = [];
       try {
         rf = gl.queryRenderedFeatures(
@@ -936,9 +1210,7 @@ const InteractiveLabeler = () => {
             [x1, y1],
             [x2, y2],
           ],
-          internalLayerIdsRef.current.length
-            ? { layers: internalLayerIdsRef.current }
-            : undefined
+          { layers }
         );
       } catch (err) {
         console.warn("box-select queryRenderedFeatures failed:", err);
@@ -946,8 +1218,17 @@ const InteractiveLabeler = () => {
       }
       const items = rf
         .filter((f) => f.id != null)
-        .map((f) => ({ id: f.id, properties: f.properties, source: f.source }));
-      labelBuildings(items, selectedClassRef.current);
+        .map((f) => ({
+          id: f.id,
+          properties: f.properties,
+          source: f.source,
+          geometry: f.geometry,
+        }));
+      if (selectionModeRef.current === "classify") {
+        addPendingClassify(items);
+      } else {
+        labelBuildings(items, selectedClassRef.current);
+      }
     };
 
     canvas.addEventListener("mousedown", onDown);
@@ -1390,11 +1671,47 @@ const InteractiveLabeler = () => {
           )}
 
           <ChoiceGroup
-            label="Set class"
-            selectedKey={String(selectedClass)}
-            options={CLASS_OPTIONS}
-            onChange={(e, o) => setSelectedClass(parseInt(o.key, 10))}
+            label="Click / Ctrl+drag to"
+            selectedKey={selectionMode}
+            options={[
+              { key: "label", text: "Assign class (train)" },
+              { key: "classify", text: "Select for DTF classify" },
+            ]}
+            onChange={(e, o) => {
+              if (o.key !== selectionMode && pendingCount > 0) {
+                clearPendingClassify();
+              }
+              setSelectionMode(o.key);
+            }}
           />
+
+          {selectionMode === "classify" ? (
+            <div style={{ marginTop: 8, marginBottom: 12 }}>
+              <div style={{ fontSize: 12, color: "#666", marginBottom: 6 }}>
+                {pendingCount} building{pendingCount === 1 ? "" : "s"} selected
+                (blue outline). Runs against the local classify server at{" "}
+                {CLASSIFY_SERVER_URL}.
+              </div>
+              <PrimaryButton
+                text={classifyBusy ? "Classifying…" : `Classify Selected (${pendingCount})`}
+                disabled={classifyBusy || pendingCount === 0}
+                onClick={classifySelectedBuildings}
+                style={{ marginRight: 8 }}
+              />
+              <DefaultButton
+                text="Clear selection"
+                disabled={classifyBusy || pendingCount === 0}
+                onClick={clearPendingClassify}
+              />
+            </div>
+          ) : (
+            <ChoiceGroup
+              label="Set class"
+              selectedKey={String(selectedClass)}
+              options={CLASS_OPTIONS}
+              onChange={(e, o) => setSelectedClass(parseInt(o.key, 10))}
+            />
+          )}
 
           <div style={{ marginTop: 8, fontSize: 13 }}>
             <div style={{ color: CLASS_COLORS[CLASS_INTACT] }}>
@@ -1408,16 +1725,66 @@ const InteractiveLabeler = () => {
             </div>
           </div>
 
-          <Toggle
+          <ChoiceGroup
             label="View"
-            onText="Predicted"
-            offText="Labeled"
-            checked={viewMode === "predict"}
-            onChange={(e, checked) =>
-              setViewMode(checked ? "predict" : "label")
-            }
-            style={{ marginTop: 12 }}
+            selectedKey={viewMode}
+            options={[
+              { key: "label", text: "Labeled" },
+              { key: "predict", text: "Predicted" },
+              { key: "dtf", text: "DTF damage" },
+            ]}
+            onChange={(e, o) => setViewMode(o.key)}
+            styles={{ root: { marginTop: 12 } }}
           />
+
+          <div style={{ marginTop: 8 }}>
+            <input
+              type="file"
+              accept="application/json"
+              id="dtfManifestInput"
+              style={{ display: "none" }}
+              onChange={(e) => {
+                const file = e.target.files && e.target.files[0];
+                e.target.value = "";
+                if (!file) return;
+                const reader = new FileReader();
+                reader.onload = () => {
+                  try {
+                    loadDtfResults(JSON.parse(reader.result));
+                  } catch (err) {
+                    console.warn("Failed to parse DTF manifest:", err);
+                    setStatus("Could not parse DTF manifest JSON.");
+                  }
+                };
+                reader.readAsText(file);
+              }}
+            />
+            <DefaultButton
+              text="Load DTF results…"
+              onClick={() =>
+                document.getElementById("dtfManifestInput")?.click()
+              }
+            />
+          </div>
+
+          {viewMode === "dtf" && (
+            <div style={{ marginTop: 8, fontSize: 12 }}>
+              {DTF_CATEGORIES.map((name, idx) => (
+                <div key={name} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span
+                    style={{
+                      display: "inline-block",
+                      width: 12,
+                      height: 12,
+                      background: DTF_COLORS[idx],
+                      border: "1px solid #999",
+                    }}
+                  />
+                  {name}
+                </div>
+              ))}
+            </div>
+          )}
 
           <Toggle
             label="Footprints"

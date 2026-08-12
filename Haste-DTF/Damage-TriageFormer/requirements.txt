@@ -1,13 +1,18 @@
-torch
-torchvision
-torchaudio
-transformers
-timm
-einops
-opencv-python
-pillow
-shapely
-geopandas
-torchmetrics
-tqdm
-matplotlib
+torch==2.2.0
+torchvision==0.17.0
+torchaudio==2.2.0
+# 4.56+ is required for `dinov3_vit` to be a recognized model_type (4.37.2
+# raises KeyError: 'dinov3_vit'); <5 because transformers 5.x restructures the
+# ViT module tree and breaks DinoV3Backbone's transformer-layer lookup.
+transformers>=4.56,<5
+timm==0.9.16
+einops==0.8.0
+opencv-python==4.10.0.84
+pillow==10.2.0
+shapely==2.0.6
+geopandas==0.14.1
+torchmetrics==1.3.2
+tqdm==4.67.0
+matplotlib==3.9.0
+pandas==2.2.0
+numpy==1.26.4

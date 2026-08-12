@@ -1,0 +1,27 @@
+# The image runs its own `npm install`, and the Dockerfile's `COPY . .` came
+# after it with nothing excluded -- so the host's node_modules was copied over
+# the container's. On a Windows host that leaked win32 binaries
+# (@rollup/rollup-win32-x64-msvc, .cmd/.ps1 bin shims) into a Linux image and
+# made the build depend on each developer's local tree. Excluding it here makes
+# the build reproducible and drops ~400 MB from the image.
+node_modules
+dist
+build
+.vite
+
+# Never bake local secrets/overrides into the image; the Dockerfile copies
+# .env.docker explicitly and that is the only env file it should get.
+.env
+.env.*
+!.env.docker
+
+.git
+.gitignore
+*.log
+npm-debug.log*
+.DS_Store
+coverage
+.vscode
+.idea
+Dockerfile
+.dockerignore

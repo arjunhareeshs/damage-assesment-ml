@@ -49,10 +49,23 @@ class ImageryDownloader:
             for url in urls:
                 try:
                     url_type = self._validate_url(url)
-                    if url_type == "azureblobstorage":
+                    # "localupload" is the configured local blob endpoint
+                    # (BLOB_ACCOUNT_URL, e.g. http://azurite:10000) that the
+                    # chunked uploader returns URLs on. It speaks the Azure
+                    # Blob protocol, so it routes to the same downloader --
+                    # without this branch such URLs passed validation and were
+                    # then silently dropped, leaving file_paths empty and
+                    # surfacing as a bare "Unable to download raw imagery".
+                    if url_type in ("azureblobstorage", "localupload"):
                         azure_urls.append(url)
                     elif url_type == "awss3":
                         aws_urls.append(url)
+                    else:
+                        self.logger.warning(
+                            "Unhandled allowlisted URL type %r; skipping %s",
+                            url_type,
+                            url,
+                        )
                 except Exception as e:
                     self.logger.warning(f"Skipping URL not in allowlist: {e}")
 

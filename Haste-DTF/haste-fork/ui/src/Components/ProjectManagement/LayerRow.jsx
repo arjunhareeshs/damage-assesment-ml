@@ -54,7 +54,9 @@ const LayerRow = ({
   // cached building footprints, so the button is available regardless of
   // whether this layer uses the building-labeling or standard workflow.
   const dtfModels =
-    (item.models || []).filter((m) => m.modelType === "dtf") || [];
+    (item.models || []).filter(
+      (m) => m.modelType === "dtf" || m.modelType === "dtf-aoi"
+    ) || [];
 
   function handleEmbed() {
     setModalComponent(

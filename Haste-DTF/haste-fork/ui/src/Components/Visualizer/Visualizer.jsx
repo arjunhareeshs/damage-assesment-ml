@@ -11,7 +11,7 @@ import { convertDateToString } from "../../util/conversion";
 import VisualizerImageryControls from "./VisualizerImageryControls"
 import DtfAoiReviewPanel from "../BuildingValidation/DtfAoiReviewPanel";
 import "../../assets/css/visualizer.css";
-import { getAzureMapsAuthOptions } from "../../util/azureMapsAuth";
+import { getAzureMapsAuthOptions, isAzureMapsPlaceholder } from "../../util/azureMapsAuth";
 
 // AOI-scoped DamageTriageFormer (Option B, AOI-scoped —
 // docs/OptionB_AOI_Integration_Plan.md Module 6.7). Color ramp for the
@@ -161,13 +161,13 @@ const Visualizer = ({ setModalComponent }) => {
 
         // PRE EVENT MAP SETUP
         const primaryMap = new window.atlas.Map(primaryMapRef.current, {
-          style: "satellite",
+          style: isAzureMapsPlaceholder ? "blank" : "satellite",
           authOptions: authOptions,
         });
 
         // POST EVENT MAP SETUP
         const secondaryMap = new window.atlas.Map(secondaryMapRef.current, {
-          style: "satellite",
+          style: isAzureMapsPlaceholder ? "blank" : "satellite",
           authOptions: authOptions,
         });
 
@@ -353,8 +353,8 @@ const Visualizer = ({ setModalComponent }) => {
       layer.customId = customId;
 
       map.layers.add(layer);
-    } else {
-
+    } else if (!isAzureMapsPlaceholder) {
+      // Only fall back to Azure Maps satellite when a real key is configured
       const tempTileUrlPath = `https://atlas.microsoft.com/map/tile?api-version=2.1&tilesetId=microsoft.imagery&zoom={z}&x={x}&y={y}`;
 
       var imagery = new window.atlas.layer.TileLayer({

@@ -72,6 +72,42 @@ logger = HasteLogger.get_logger(
 logger.info("Executing %s", __file__)
 
 DEFAULT_PAD_PX = 32
+DTF_HF_MODEL_ID = "Ymx1025/DamageTriageFormer-model"
+
+
+def _ensure_checkpoint_locally(checkpoint_path: str, checkpoint_config_path: str):
+    """Return a (checkpoint_path, checkpoint_config_path) pair that actually
+    exists in *this* container's filesystem, downloading from Hugging Face
+    if the given paths don't exist here (see call site: those paths are
+    commonly resolved by a different container's filesystem).
+
+    Downloads into HASTE_HF_CACHE_DIR when set — LocalRunner points this at
+    a fixed subdirectory of the azurite volume, which (unlike this
+    container's own home directory) is mounted into every task container
+    it spawns, so the checkpoint is fetched once and reused by every run
+    instead of being re-downloaded from Hugging Face each time. Falls back
+    to this container's own HF cache when the env var isn't set (e.g. run
+    outside LocalRunner)."""
+    if os.path.exists(checkpoint_path) and os.path.exists(checkpoint_config_path):
+        return checkpoint_path, checkpoint_config_path
+
+    from huggingface_hub import hf_hub_download
+
+    cache_dir = os.environ.get("HASTE_HF_CACHE_DIR") or os.path.join(
+        os.path.expanduser("~"), ".cache", "huggingface", "hub"
+    )
+    os.makedirs(cache_dir, exist_ok=True)
+    logger.info(
+        f"Checkpoint not found locally at {checkpoint_path!r}; downloading "
+        f"{DTF_HF_MODEL_ID} into this container's own cache..."
+    )
+    checkpoint_path = hf_hub_download(
+        repo_id=DTF_HF_MODEL_ID, filename="best_model.pth", cache_dir=cache_dir
+    )
+    checkpoint_config_path = hf_hub_download(
+        repo_id=DTF_HF_MODEL_ID, filename="config.json", cache_dir=cache_dir
+    )
+    return checkpoint_path, checkpoint_config_path
 
 
 def crop_class_mask_to_png(class_idx: int, crop_size: int) -> np.ndarray:
@@ -98,6 +134,7 @@ def run_damage_triage_aoi(
     *,
     pad_px: int = DEFAULT_PAD_PX,
     crop_size: int = DTF_IM_SIZE,
+    preloaded_model: tuple | None = None,
 ) -> list:
     """Run DamageTriageFormer once per building in ``buildings``.
 
@@ -108,9 +145,15 @@ def run_damage_triage_aoi(
             ``hastegeo.core.utils.postgis_query.buildings_in_aoi``.
         checkpoint_path / checkpoint_config_path: DamageTriageFormer
             checkpoint + its training-run config.json (see
-            ``damage_triage_infer.py::build_dtf_model``).
+            ``damage_triage_infer.py::build_dtf_model``). Ignored if
+            ``preloaded_model`` is given.
         output_dir: where ``building_<id>.png`` / ``mask_<id>.png`` are
             written.
+        preloaded_model: optional ``(model, use_gated)`` tuple, as returned
+            by ``build_dtf_model`` — pass this from a long-lived caller (e.g.
+            a local HTTP server that keeps the model resident across
+            requests) to skip the checkpoint load below. ``checkpoint_path``/
+            ``checkpoint_config_path`` may be ``None`` when this is set.
 
     Returns:
         ``[{building_id, class, class_name, confidence, probs,
@@ -121,15 +164,19 @@ def run_damage_triage_aoi(
     n_total = len(buildings)
     log_progress(f"{n_total} buildings in scope for this AOI run")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log_progress(f"Loading DamageTriageFormer checkpoint on {device}...")
-    # Loaded ONCE for the whole run, not once per building — reloading a
-    # ~500MB ViT-L checkpoint per building would make even a modest AOI
-    # (thousands of buildings) impractical. See "Biggest pitfalls" #4 in
-    # docs/OptionB_AOI_Integration_Plan.md.
-    model, use_gated = build_dtf_model(
-        checkpoint_path, checkpoint_config_path, device
-    )
+    if preloaded_model is not None:
+        model, use_gated = preloaded_model
+        device = next(model.parameters()).device
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        log_progress(f"Loading DamageTriageFormer checkpoint on {device}...")
+        # Loaded ONCE for the whole run, not once per building — reloading a
+        # ~500MB ViT-L checkpoint per building would make even a modest AOI
+        # (thousands of buildings) impractical. See "Biggest pitfalls" #4 in
+        # docs/OptionB_AOI_Integration_Plan.md.
+        model, use_gated = build_dtf_model(
+            checkpoint_path, checkpoint_config_path, device
+        )
     log_progress(
         f"Model architecture: {'gated head' if use_gated else 'severity head'}"
     )
@@ -309,6 +356,19 @@ def main():
         or files.get("checkpoint_config")
         or os.getenv("DTF_CHECKPOINT_CONFIG_PATH", "/opt/dtf-checkpoint/config.json")
     )
+    # checkpoint_cache/files paths above are frequently resolved by a
+    # *different* container (e.g. the queue-worker's own
+    # DTFAoiInferencePostprocessor, which downloads into its own local HF
+    # cache) than the one this script runs in — containers don't share a
+    # filesystem, so a path valid there is not guaranteed to exist here.
+    # Fall back to downloading directly into this container's own cache
+    # rather than failing outright on a path from a different filesystem.
+    if not os.path.exists(checkpoint_path) or not os.path.exists(
+        checkpoint_config_path
+    ):
+        checkpoint_path, checkpoint_config_path = _ensure_checkpoint_locally(
+            checkpoint_path, checkpoint_config_path
+        )
 
     try:
         if not image_path or not os.path.exists(image_path):

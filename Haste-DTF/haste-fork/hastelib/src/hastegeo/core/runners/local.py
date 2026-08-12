@@ -317,6 +317,18 @@ class LocalRunner(BaseRunner):
             if dataloader_workers:
                 task_env["HASTE_DATALOADER_WORKERS"] = dataloader_workers
 
+            # Size/limit knobs the spawned workflows read from their own
+            # environment. Without an explicit passthrough these stay at
+            # their in-container defaults, so raising a cap on the API side
+            # has no effect on the container that actually enforces it.
+            for passthrough_key in (
+                "HASTE_USER_FOOTPRINTS_MAX_BYTES",
+                "HASTE_MAX_IMAGERY_DOWNLOAD_BYTES",
+            ):
+                passthrough_value = os.getenv(passthrough_key)
+                if passthrough_value:
+                    task_env[passthrough_key] = passthrough_value
+
             self.logger.info(
                 "[PIPELINE-TRACE] ========== STORAGE CONFIG SETUP =========="
             )
@@ -371,6 +383,41 @@ class LocalRunner(BaseRunner):
                 self.logger.info(
                     f"[PIPELINE-TRACE] No storage_config found - config exists: {self.config is not None}"
                 )
+
+            # Pass through HuggingFace auth so spawned containers can fetch
+            # gated models (e.g. facebook/dinov3-vitl16-pretrain-lvd1689m,
+            # used by DamageTriageFormer's backbone) — without this, the
+            # DTF/DTF-AOI inference container fails with GatedRepoError even
+            # though the operator has already been granted access on
+            # huggingface.co, because the container has no credentials.
+            hf_token = os.environ.get("HF_TOKEN") or os.environ.get(
+                "HUGGING_FACE_HUB_TOKEN"
+            )
+            if hf_token:
+                task_env["HF_TOKEN"] = hf_token
+                task_env["HUGGING_FACE_HUB_TOKEN"] = hf_token
+
+            # Spawned task containers are siblings (launched via the Docker
+            # socket), not descendants — they don't inherit hastefuncqueues'
+            # own HF cache bind mount, so each one would otherwise start
+            # with an empty ~/.cache and re-download the checkpoint from
+            # Hugging Face on every single run. The azurite volume is
+            # already mounted into every task container (see above), so
+            # point the HF cache at a fixed subdirectory of it instead —
+            # one persistent cache shared across all task runs, no extra
+            # host-path plumbing required.
+            task_env["HASTE_HF_CACHE_DIR"] = "/shared/azurite/hf_cache"
+            # HASTE_HF_CACHE_DIR only reaches the two explicit
+            # hf_hub_download() calls in _ensure_checkpoint_locally (the DTF
+            # checkpoint + its config). The model *also* builds a DINOv3
+            # ViT-L/16 backbone via AutoModel.from_pretrained() deep inside
+            # DTFModel.__init__ (src/model/backbone.py), which knows nothing
+            # about that variable and would fall back to the container's own
+            # empty ~/.cache — a second 1.2 GB download on every single run.
+            # HF_HUB_CACHE is the variable huggingface_hub/transformers both
+            # honour, so point it at the same shared azurite directory and
+            # both models resolve from one persistent cache.
+            task_env["HF_HUB_CACHE"] = "/shared/azurite/hf_cache"
 
             if env_vars:
                 self.logger.info(

@@ -38,9 +38,20 @@ _AZURITE_DEV_HOSTS = ("azurite", "localhost", "127.0.0.1")
 def validate_imagery_url(url: str) -> str:
     """Validate a remote imagery URL against the allowlist of permitted hosts.
 
-    Returns a string identifying the source type ('azureblobstorage' or
-    'awss3'). Raises ValueError if the URL is malformed or the host is not
-    on the allowlist — callers must treat this as a hard rejection.
+    Returns a string identifying the source type ('azureblobstorage',
+    'awss3', or 'localupload'). Raises ValueError if the URL is malformed
+    or the host is not on the allowlist — callers must treat this as a
+    hard rejection.
+
+    Also permits the exact host/port/scheme of the configured local
+    upload endpoint (``BLOB_ACCOUNT_URL``), mirroring
+    :func:`validate_footprint_url` — the chunked file uploader
+    (``UploadFileByChunk``) returns URLs on that same host for both
+    imagery and footprint files, so both must be able to pass through
+    this check in local dev. No broader loopback allowance is made here:
+    only an exact match to the configured endpoint is accepted, so a
+    misconfigured production deployment without ``BLOB_ACCOUNT_URL`` set
+    still rejects all local hosts.
     """
     parsed = urlparse(url)
     if parsed.scheme not in ("https", "http"):
@@ -61,6 +72,16 @@ def validate_imagery_url(url: str) -> str:
         or host.endswith(".amazonaws.com")
     ):
         return "awss3"
+
+    endpoint = _parse_local_upload_endpoint()
+    if endpoint is not None:
+        e_scheme, e_host, e_port = endpoint
+        if (
+            parsed.scheme == e_scheme
+            and host.lower() == e_host
+            and (parsed.port or None) == e_port
+        ):
+            return "localupload"
 
     raise ValueError(
         f"URL host {host!r} is not on the allowlist of permitted imagery sources"

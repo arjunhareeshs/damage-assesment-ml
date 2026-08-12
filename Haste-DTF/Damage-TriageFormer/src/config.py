@@ -28,7 +28,30 @@ LR = 1e-4
 WEIGHT_DECAY = 1e-4
 
 # Model Configuration
-BACKBONE = "facebook/dinov3-vitl16-pretrain-lvd1689m"
+# Prefer a locally-downloaded backbone (populated by the project root's
+# download_models.py into models/backbone/dinov3-vitl16/) over hitting the
+# Hugging Face Hub. AutoModel/AutoConfig.from_pretrained() accept a local
+# directory path transparently, so this is a drop-in swap. Falls back to the
+# HF repo id (network fetch) when the local folder isn't present — e.g. for
+# the Azure/Docker server pipeline, which downloads into its own container
+# filesystem and never has this local models/ folder, so this is a no-op
+# there.
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(BASE_DIR))
+_LOCAL_BACKBONE_DIR = os.path.join(_PROJECT_ROOT, "models", "backbone", "dinov3-vitl16")
+# Check for actual weight content, not just directory existence — a
+# download that was interrupted/failed partway can leave an empty (or
+# config-only) directory behind, which must NOT be treated as "downloaded".
+_LOCAL_BACKBONE_READY = os.path.isfile(
+    os.path.join(_LOCAL_BACKBONE_DIR, "config.json")
+) and any(
+    fn.endswith((".safetensors", ".bin"))
+    for fn in (os.listdir(_LOCAL_BACKBONE_DIR) if os.path.isdir(_LOCAL_BACKBONE_DIR) else [])
+)
+BACKBONE = (
+    _LOCAL_BACKBONE_DIR
+    if _LOCAL_BACKBONE_READY
+    else os.environ.get("DTF_BACKBONE_REPO", "facebook/dinov3-vitl16-pretrain-lvd1689m")
+)
 PATCH_SIZE = 16
 USE_HIERARCHICAL = True  # Use hierarchical Type+Extent classification
 

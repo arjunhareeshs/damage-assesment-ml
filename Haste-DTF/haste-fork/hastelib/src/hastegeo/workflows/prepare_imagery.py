@@ -678,33 +678,69 @@ class ImageryWorkflow:
     ):
         """Download the user-supplied gpkg to ``output_path``.
 
-        One-shot fetch (no streaming) — the response body is read fully
-        into memory, size-checked against ``max_bytes``, and written
-        atomically. Refuses to follow cross-host redirects (so an
-        allowlisted source can't bounce us to an internal host) and
-        bounds the in-memory load at ``max_bytes`` (so a hostile or
-        accidental multi-GB upload can't OOM the imageryprep container).
+        Streams the body to disk in chunks, aborting as soon as the bytes
+        written exceed ``max_bytes``. Streaming (rather than buffering the
+        whole body via ``resp.content``) keeps peak memory flat regardless
+        of file size — a statewide footprint GPKG is easily multiple GB and
+        buffering one in RAM would OOM the imageryprep container long
+        before the size check could reject it. Refuses to follow
+        cross-host redirects so an allowlisted source can't bounce us to
+        an internal host.
         """
-        # Single-shot fetch — no streaming. ``allow_redirects=False`` so
-        # an allowlisted source can't redirect to an internal host;
-        # ``raise_for_status`` to fail loudly on 4xx/5xx; size check
-        # against ``max_bytes`` to bound memory + disk; then atomic write.
+        # ``allow_redirects=False`` so an allowlisted source can't redirect
+        # to an internal host; ``raise_for_status`` to fail loudly on
+        # 4xx/5xx; ``stream=True`` plus an incremental byte count so the
+        # cap is enforced without ever holding the whole body in memory.
         resp = requests.get(
-            url, timeout=timeout_seconds, allow_redirects=False
+            url,
+            timeout=timeout_seconds,
+            allow_redirects=False,
+            stream=True,
         )
-        if resp.status_code in (301, 302, 303, 307, 308):
-            raise RuntimeError(
-                "Redirects are not followed for user-supplied "
-                f"building-footprint URLs (got {resp.status_code})."
-            )
-        resp.raise_for_status()
-        if len(resp.content) > max_bytes:
-            raise RuntimeError(
-                f"User-supplied building footprints exceed the max size of "
-                f"{max_bytes} bytes (got {len(resp.content)} bytes)."
-            )
-        with open(output_path, "wb") as f:
-            f.write(resp.content)
+        try:
+            if resp.status_code in (301, 302, 303, 307, 308):
+                raise RuntimeError(
+                    "Redirects are not followed for user-supplied "
+                    f"building-footprint URLs (got {resp.status_code})."
+                )
+            resp.raise_for_status()
+
+            # Trust Content-Length only to reject early; the streamed
+            # count below is authoritative since the header can lie.
+            declared = resp.headers.get("Content-Length")
+            if declared and declared.isdigit() and int(declared) > max_bytes:
+                raise RuntimeError(
+                    "User-supplied building footprints exceed the max size "
+                    f"of {max_bytes} bytes (got {int(declared)} bytes)."
+                )
+
+            written = 0
+            with open(output_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8 * 1024 * 1024):
+                    if not chunk:
+                        continue
+                    written += len(chunk)
+                    if written > max_bytes:
+                        raise RuntimeError(
+                            "User-supplied building footprints exceed the "
+                            f"max size of {max_bytes} bytes (aborted after "
+                            f"{written} bytes)."
+                        )
+                    f.write(chunk)
+        except Exception:
+            # Don't leave a truncated gpkg behind for the clip step to
+            # trip over with a confusing "not a valid GeoPackage" error.
+            if os.path.exists(output_path):
+                try:
+                    os.remove(output_path)
+                except OSError:
+                    logger.warning(
+                        "Could not remove partial footprint download %s",
+                        output_path,
+                    )
+            raise
+        finally:
+            resp.close()
 
 
 def _download_imagery(urls, dst_directory):

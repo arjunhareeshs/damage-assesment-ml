@@ -1,26 +1,25 @@
-# Use the official Node.js image as the base image
-FROM mcr.microsoft.com/azurelinux/base/nodejs:20.14
+# Stage 1: Build Vite React App
+FROM mcr.microsoft.com/azurelinux/base/nodejs:20.14 AS builder
 
-# Set the working directory
 WORKDIR /app
 
-# Copy the package.json and package-lock.json files
+# Copy dependency manifests first for layer caching
 COPY ../../UI/package*.json ./
+RUN npm ci || npm install
 
-# Install the dependencies
-RUN npm install
-
-# Copy the rest of the application code
+# Copy source code and build production assets
 COPY ../../UI .
-
-# Build the Vite application
 RUN npm run build
 
-# Install serve to serve the build
-RUN npm install -g serve
+# Stage 2: Ultra-slim production web server (~25 MB)
+FROM nginx:1.25-alpine AS production
 
-# Expose the necessary port
+# Copy compiled static distribution from builder stage
+COPY --from=builder /app/dist /usr/share/nginx/html
+
+# Add Single Page Application (SPA) fallback routing configuration
+RUN printf 'server { listen 5000; location / { root /usr/share/nginx/html; try_files $uri $uri/ /index.html; } }\n' > /etc/nginx/conf.d/default.conf
+
 EXPOSE 5000
 
-# Command to run the application
-CMD ["serve", "-s", "dist", "-l", "5000"]
+CMD ["nginx", "-g", "daemon off;"]

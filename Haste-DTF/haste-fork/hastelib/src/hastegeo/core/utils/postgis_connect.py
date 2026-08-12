@@ -53,8 +53,17 @@ def get_connection():
             "https://ossrdbms-aad.database.windows.net/.default"
         ).token
 
+    # TLS is required by default so a production deployment against Azure
+    # Database for PostgreSQL never silently negotiates plaintext. The
+    # local-dev postgis container in docker/docker-compose.yml is built
+    # without TLS support, so that stack (and only that stack) opts out by
+    # setting POSTGRES_SSLMODE=disable -- without this the footprint load
+    # fails with "server does not support SSL, but SSL was required" and
+    # AOI-scoped DamageTriageFormer runs see an empty hg_buildings table.
+    sslmode = os.getenv("POSTGRES_SSLMODE", "require")
+
     connection_string = (
         f"host={host} port={port} dbname={database} user={user} "
-        f"password={password} sslmode=require"
+        f"password={password} sslmode={sslmode}"
     )
     return psycopg2.connect(connection_string)

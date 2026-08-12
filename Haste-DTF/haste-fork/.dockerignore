@@ -1,0 +1,25 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+node_modules
+dist
+build
+.ds_store
+*.log
+checkpoints/*.pth
+data/tiles_1024
+*.incomplete
+# The training / imageryprep / api images all build with the repo root as
+# context but none of them COPY from ui/. The ui image has its own context
+# (compose `build: ../ui`), so excluding it here costs nothing and keeps
+# ~479 MB from being tarred and sent to the daemon on every build.
+ui
+.pytest_cache
+.mypy_cache
+.ruff_cache
+htmlcov
+.coverage

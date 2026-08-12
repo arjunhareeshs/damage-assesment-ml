@@ -1,0 +1,37 @@
+# GPU overlay for the local stack.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
+#
+# The base compose file is CPU-only on purpose: it must come up on any machine,
+# including the majority of dev laptops with no NVIDIA device. This overlay is
+# the single place that turns GPU on, and it flips BOTH halves at once:
+#
+#   TORCH_VARIANT=cu124   -> the training image is built with the CUDA wheels
+#   HASTE_ENABLE_GPU=1    -> LocalRunner attaches a GPU DeviceRequest to the
+#                            task containers it spawns
+#
+# Keeping them in one file is the point. Set only the first and you ship 3.2 GB
+# of CUDA libraries that never see a device; set only the second and every task
+# container asks for a GPU that torch cannot use. Neither half is detectable
+# from the other at runtime, so they are declared together here.
+#
+# Requirements on the host: an NVIDIA GPU, a recent driver, and the NVIDIA
+# Container Toolkit registered with Docker (`docker info` lists an `nvidia`
+# runtime, and `docker run --rm --gpus all <cuda-image> nvidia-smi` succeeds).
+# If that check fails, do not use this overlay -- the base file is correct.
+#
+# Note this rebuilds the training image: the CPU and CUDA variants are different
+# images under the same `haste-training:latest` tag, so switching between the
+# base file and this overlay requires `--build` to re-resolve the environment.
+
+services:
+  hastefuncqueues:
+    environment:
+      HASTE_ENABLE_GPU: "1"
+      # Narrow to specific devices with e.g. HASTE_GPU_DEVICES=0,1
+      HASTE_GPU_DEVICES: "${HASTE_GPU_DEVICES:-all}"
+
+  training_image:
+    build:
+      args:
+        TORCH_VARIANT: cu124

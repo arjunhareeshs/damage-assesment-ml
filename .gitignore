@@ -1,0 +1,16 @@
+# Ignore data directories and large dataset files
+data/
+**/data/
+*.geojson
+*.tif
+*.tiff
+*.gpkg
+
+# Downloaded model weights (fetched via download_models.py)
+models/
+
+# Environment & Python caches
+__pycache__/
+.venv/
+*.py[cod]
+.DS_Store

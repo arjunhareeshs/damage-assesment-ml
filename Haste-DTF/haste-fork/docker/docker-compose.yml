@@ -145,6 +145,9 @@ services:
       POSTGRES_DATABASE: "haste"
       POSTGRES_USER: "haste"
       POSTGRES_PASSWORD: "haste-dev-only"  # pragma: allowlist secret # gitleaks:allow
+      # The local postgis image has no TLS; hastegeo defaults to
+      # sslmode=require for production safety, so dev opts out here.
+      POSTGRES_SSLMODE: "disable"
     volumes:
       - ../data:/app/data
       - /var/run/docker.sock:/var/run/docker.sock
@@ -175,6 +178,11 @@ services:
       AzureFunctionsJobHost__logging__logLevel__Function: "Information"
       AzureFunctionsJobHost__logging__logLevel__Worker: "Information"
       AzureFunctionsJobHost__logging__logLevel__haste: "Information"
+      # Passed through to spawned training containers (LocalRunner,
+      # local.py) so DamageTriageFormer's gated DINOv3 backbone can
+      # authenticate. Set HF_TOKEN in your shell before `docker compose up`
+      # once you have huggingface.co access to facebook/dinov3-vitl16-pretrain-lvd1689m.
+      HF_TOKEN: "${HF_TOKEN:-}"
       BLOB_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;QueueEndpoint=http://azurite:10001/devstoreaccount1;"  # pragma: allowlist secret # gitleaks:allow
       QUEUE_ACCOUNT_URL: "http://azurite:10001/devstoreaccount1"
       BLOB_ACCOUNT_URL: "http://azurite:10000/devstoreaccount1"
@@ -196,14 +204,37 @@ services:
       POSTGRES_DATABASE: "haste"
       POSTGRES_USER: "haste"
       POSTGRES_PASSWORD: "haste-dev-only"  # pragma: allowlist secret # gitleaks:allow
+      # The local postgis image has no TLS; hastegeo defaults to
+      # sslmode=require for production safety, so dev opts out here.
+      POSTGRES_SSLMODE: "disable"
       AZURE_STORAGE_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;QueueEndpoint=http://azurite:10001/devstoreaccount1;"  # pragma: allowlist secret # gitleaks:allow
       AZURE_STORAGE_USE_EMULATOR: "true"
       AZURE_STORAGE_EMULATOR_HOST: "azurite:10000"
       AZURE_BATCH_DOCKER_IMAGE: "haste-training:latest"
       AZURE_BATCH_IMAGERYPREP_DOCKER_IMAGE: "haste-imageryprep:latest"
       HASTE_DEBUG_VERBOSE: "1"
+      # Keep failed task dirs so output.log survives cleanup_task() for
+      # diagnosis; the UI status message alone is rarely enough.
+      PRESERVE_LOCAL_TASK_DIRS: "${PRESERVE_LOCAL_TASK_DIRS:-0}"
+      # Statewide building-footprint GPKGs run to several GB, well past the
+      # 500MB in-code default. Safe to raise now that the download streams
+      # to disk and the clip step reads only the AOI bbox, so peak memory
+      # no longer scales with file size. Forwarded to spawned containers by
+      # LocalRunner (see the passthrough list in runners/local.py).
+      HASTE_USER_FOOTPRINTS_MAX_BYTES: "${HASTE_USER_FOOTPRINTS_MAX_BYTES:-4294967296}"
       HASTE_OUTPUT_DIR: "/shared/azurite"
-      HASTE_ENABLE_GPU: "${HASTE_ENABLE_GPU:-1}"
+      # CPU-safe by default. This used to default to "1", which made LocalRunner
+      # attach a GPU DeviceRequest to every spawned task container; on a host
+      # without an NVIDIA GPU `containers.run(device_requests=...)` fails and the
+      # pipeline dies. It only worked here because docker/.env sets 0 -- and
+      # docker/.env is gitignored, so anyone cloning the repo hit the failure.
+      #
+      # This value is paired with the training image's TORCH_VARIANT build arg:
+      # requesting a GPU is pointless against a CPU-only torch build, and a
+      # cu124 build is wasted without the device. Do not set this to 1 here --
+      # use the override file, which flips both together and cannot drift:
+      #   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up
+      HASTE_ENABLE_GPU: "${HASTE_ENABLE_GPU:-0}"
       HASTE_GPU_DEVICES: "${HASTE_GPU_DEVICES:-all}"
       HASTE_DATALOADER_WORKERS: "8"
       TITILER_ENDPOINT: "http://titiler:8000/"
@@ -218,7 +249,14 @@ services:
       - ../data:/app/data
       - azurite-data:/shared/azurite  # Mount azurite blob storage for LocalRunner access
       - /var/run/docker.sock:/var/run/docker.sock  # Enable Docker access for LocalRunner
-      - ~/.cache/huggingface/hub:/root/.cache/huggingface/hub  # HF checkpoint cache for DTF inference
+      # HF checkpoint cache for DTF inference. Must land on the path
+      # _download_hf_checkpoint() actually uses: it hardcodes
+      # Path.home()/".cache"/"huggingface"/"hub", and HOME is "/home" for
+      # appuser in this image -- so mounting at /root/... left the cache
+      # unreadable (appuser got EACCES) and the checkpoint re-downloaded
+      # into a non-writable dir. Mounting at /home/... instead avoids
+      # overriding HOME, which the Functions host also relies on.
+      - ~/.cache/huggingface/hub:/home/.cache/huggingface/hub
     group_add:
       - "${DOCKER_GID:-1001}"
     depends_on:
@@ -260,6 +298,13 @@ services:
     build:
       context: ..
       dockerfile: ./docker/training/Dockerfile
+      args:
+        # The local stack exposes no GPU to these containers, so the CUDA wheels
+        # are dead weight here: `cpu` drops nvidia/* (2.7 GB) and triton (555 MB).
+        # Azure Batch / ACR builds go through build_and_push_images.sh, which does
+        # not pass this arg and therefore keeps the Dockerfile's cu124 default.
+        # Set HASTE_TORCH_VARIANT=cu124 if you run this stack on a GPU host.
+        TORCH_VARIANT: ${HASTE_TORCH_VARIANT:-cpu}
     image: haste-training
 
   # Imagery preparation image

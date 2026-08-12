@@ -47,9 +47,11 @@ def create_queues():
         "local-inference-queue",
         "local-embedding-queue",
         "local-dtf-queue",
+        "local-dtf-aoi-queue",
         "local-image-queue-poison",
         "local-embedding-queue-poison",
-        "local-dtf-queue-poison"
+        "local-dtf-queue-poison",
+        "local-dtf-aoi-queue-poison"
     ]
     
     success_count = 0
@@ -106,11 +108,17 @@ def configure_blob_cors():
         return False
 
 
-def upload_file_to_blob(container_name, blob_name, file_path):
-    """Upload a local file to Azurite as a blob."""
+def upload_file_to_blob(container_name, blob_name, file_path, overwrite=True):
+    """Upload a local file to Azurite as a blob.
+
+    overwrite=False skips the upload if the blob already exists, so
+    re-running data-init on every `docker-compose up` doesn't clobber
+    live state (e.g. project_stats.json / users_acl.json) that the app
+    has since written into the persisted azurite-data volume.
+    """
     try:
         blob_service_client = BlobServiceClient.from_connection_string(CONNECTION_STRING)
-        
+
         # Create container if it doesn't exist - with public blob access for local dev
         container_client = blob_service_client.get_container_client(container_name)
         try:
@@ -127,18 +135,22 @@ def upload_file_to_blob(container_name, blob_name, file_path):
                     print(f"Note: Could not set public access on existing container: {access_error}")
             else:
                 raise e
-        
+
         # Upload the file
         if not os.path.exists(file_path):
             print(f"ERROR: File not found: {file_path}")
             return False
-            
+
+        blob_client = container_client.get_blob_client(blob_name)
+        if not overwrite and blob_client.exists():
+            print(f"Blob already exists, leaving in place: {blob_name}")
+            return True
+
         with open(file_path, 'rb') as data:
-            blob_client = container_client.get_blob_client(blob_name)
             blob_client.upload_blob(data, overwrite=True)
             print(f"✓ Uploaded {file_path} as {blob_name}")
             return True
-            
+
     except Exception as e:
         print(f"ERROR uploading {file_path}: {e}")
         return False
@@ -162,15 +174,20 @@ def main():
         print("Continuing despite CORS configuration failure.")
 
     print("\n--- Uploading Blob Files ---")
+    # config_admin_settings.json is safe to refresh from the repo every
+    # time. users_acl.json and project_stats.json hold live app state
+    # (users, projects) once the stack has been used, so they're only
+    # seeded the first time the blob doesn't exist yet - overwriting them
+    # unconditionally would wipe out real projects on every rebuild.
     files_to_upload = [
-        ("data", "config_admin_settings.json", "/data/config_admin_settings.json"),
-        ("data", "users_acl.json", "/data/users_acl.json"),
-        ("data", "project_stats.json", "/data/project_stats.json")
+        ("data", "config_admin_settings.json", "/data/config_admin_settings.json", True),
+        ("data", "users_acl.json", "/data/users_acl.json", False),
+        ("data", "project_stats.json", "/data/project_stats.json", False),
     ]
-    
+
     upload_success_count = 0
-    for container, blob, path in files_to_upload:
-        if upload_file_to_blob(container, blob, path):
+    for container, blob, path, overwrite in files_to_upload:
+        if upload_file_to_blob(container, blob, path, overwrite=overwrite):
             upload_success_count += 1
             
     if upload_success_count == len(files_to_upload):

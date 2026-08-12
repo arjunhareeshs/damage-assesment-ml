@@ -1,4 +1,7 @@
-FROM mcr.microsoft.com/azure-functions/python:4-nightly-python3.11-slim
+# Pinned to the same stable tag docker/api/Dockerfile uses. The previous
+# `4-nightly-...` tag silently changes the base under every rebuild, so two
+# developers could never produce the same image.
+FROM mcr.microsoft.com/azure-functions/python:4.30.0-python3.11-slim
 
 RUN apt-get update && apt-get install -y \
     vim \
@@ -25,7 +28,9 @@ COPY --chown=appuser:appgroup docker/imageryprep/scripts /app/scripts/
 COPY --chown=appuser:appgroup docker/imageryprep/requirements.txt /app/
 
 # Install dependencies (no need to install haste package since we copy source directly)
-RUN pip install -r /app/requirements.txt
+# --no-cache-dir: without it the downloaded wheels (~500 MB, incl. the GDAL
+# and opencv manylinux wheels) are baked into this layer and shipped.
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # Provide CLI entrypoints expected by the workflows without requiring a separate package install
 RUN printf '#!/bin/bash\nexec python -m hastegeo.workflows.prepare_imagery "$@"\n' > /usr/local/bin/prepare-imagery \

@@ -134,7 +134,14 @@ const ModelRow = ({ models, projectId, imageLayerId, imagerySource, eventTypes, 
             />
           );
         }
-        if (model.modelType === "dtf") {
+        // "dtf-aoi" (AOI-scoped runs) shares DTFModelRow with the whole-layer
+        // "dtf" path: both are DamageTriageFormer runs whose results hang off
+        // model.gpkgUrl. Without this they fell through to the generic row,
+        // whose ModelResultsButton stays disabled unless inferenceStatus ===
+        // "Processed" — a field the AOI path never populates (it reports
+        // completion via status/gpkgUrl instead), leaving finished AOI runs
+        // with a permanently greyed-out Results menu.
+        if (model.modelType === "dtf" || model.modelType === "dtf-aoi") {
           return (
             <DTFModelRow
               key={index}

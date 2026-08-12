@@ -1,0 +1,9 @@
+2026-08-07T05:39:46.003051+00:00|5 buildings in scope for this AOI run
+2026-08-07T05:39:46.003051+00:00|Loading DamageTriageFormer checkpoint on cpu...
+2026-08-07T05:39:48.358572+00:00|Model architecture: gated head
+2026-08-07T05:41:37.610982+00:00|Scored building 5/5
+2026-08-07T05:41:37.611982+00:00|Classified 5/5 buildings
+2026-08-07T06:11:16.100443+00:00|1 buildings in scope for this AOI run
+2026-08-07T06:11:16.100443+00:00|Model architecture: gated head
+2026-08-07T06:11:35.460214+00:00|Scored building 1/1
+2026-08-07T06:11:35.461211+00:00|Classified 1/1 buildings

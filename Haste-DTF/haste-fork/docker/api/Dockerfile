@@ -1,20 +1,20 @@
-# Use the official Azure Functions Python 3.11 image as a base image
-FROM mcr.microsoft.com/azure-functions/python:4-nightly-python3.11-slim
+# Use the official stable Azure Functions Python 3.11 slim image
+FROM mcr.microsoft.com/azure-functions/python:4.30.0-python3.11-slim
 
 # Set the working directory
 WORKDIR /home/site/wwwroot
 
-# Copy the Azure Functions API code from the specified directory
+# Copy requirements first to leverage Docker layer caching
+COPY ../../api/hastefuncapi/requirements.txt .
+
+# Install dependencies with no-cache-dir to minimize image size
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the Azure Functions API application code
 COPY ../../api/hastefuncapi/ .
-#COPY ../../api/hastefuncapi/ /home/site/wwwroot/ --chown=www-data:www-data --exclude .venv
 
-# Install dependencies
-#COPY ../../api/hastefuncapi/requirements.txt .
-RUN pip install -r requirements.txt
-
-# Expose the necessary ports
-# EXPOSE 80
-# EXPOSE 443
+# Expose the Azure Functions host port
 EXPOSE 7071
+
 # Start the Azure Functions host
-CMD ["func", "host", "start", "--verbose"]
+CMD ["func", "host", "start"]

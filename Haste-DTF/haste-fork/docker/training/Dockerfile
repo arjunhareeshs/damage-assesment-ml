@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 # ---------- Stage 1: Build Conda Environment ----------
 FROM mcr.microsoft.com/azureml/curated/minimal-py312-cuda12.4-inference AS conda-env
 
@@ -28,12 +29,36 @@ RUN for i in 1 2 3 4 5; do \
 # Copy only env.yml first (maximize build cache)
 COPY docker/training/env/env.yml /tmp/env.yml
 
-# Create environment using micromamba and pack it for reuse
-# Force-reinstall setuptools after pip to restore conda-managed files pip may clobber
-RUN micromamba create -f /tmp/env.yml -y \
+# Torch build variant. `cu124` (the default) is what Azure Batch GPU nodes need,
+# so build_and_push_images.sh keeps the default and the ACR image is unchanged.
+# Passing `cpu` rewrites the pinned wheels to the CPU builds, which drops the
+# transitively-pulled `nvidia/*` CUDA runtime (2.7 GB) and `triton` (555 MB)
+# from site-packages. docker-compose.yml passes `cpu` for the local stack, where
+# no GPU is exposed to the containers anyway.
+ARG TORCH_VARIANT=cu124
+RUN sed -i "s/+cu124/+${TORCH_VARIANT}/g; s#/whl/cu124#/whl/${TORCH_VARIANT}#g" /tmp/env.yml
+
+# Create environment using micromamba and pack it for reuse.
+# Force-reinstall setuptools after pip to restore conda-managed files pip may clobber.
+# The pip download cache lives on a BuildKit cache mount instead of in the layer:
+# editing env.yml then re-resolves without re-fetching ~4 GB of torch/CUDA wheels,
+# and those downloads never become immutable build-cache layers.
+# Do NOT also mount /opt/miniconda/pkgs as a cache: `micromamba clean -afy` below
+# removes that directory outright and fails on a mount point with
+# "filesystem error: cannot remove: Device or resource busy". The conda-side
+# tarballs are only ~185 MB anyway; the pip wheels are what actually cost.
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+	micromamba create -f /tmp/env.yml -y \
 	&& micromamba install -n bda -c conda-forge setuptools --force-reinstall -y \
 	&& micromamba clean -afy \
 	&& conda-pack -n bda -o /tmp/bda.tar.gz
+
+# conda-pack writes the archive 0600 root. Stage 2 reads it through a bind mount
+# as the unprivileged `dockeruser`, and a bind mount preserves the source mode
+# (unlike the `COPY --chown` this replaced), so without this it fails with
+# "tar: /tmp/bda.tar.gz: Cannot open: Permission denied". Kept as its own layer
+# so the expensive env-create layer above stays cache-valid.
+RUN chmod 0644 /tmp/bda.tar.gz
 
 
 # ---------- Stage 2: Final Runtime Image ----------
@@ -64,11 +89,15 @@ RUN printf '#!/bin/bash\nexec python -m hastegeo.workflows.damage_triage_aoi_inf
 
 # Prepare conda env directory owned by the target user, then extract the packed env
 # as that user — non-root tar uses the running user's UID/GID, so no chown -R needed.
+#
+# The tarball is bind-mounted, not COPYed. A `COPY --from` writes the 4.1 GB
+# archive into its own layer and a later `rm` only deletes it in the *next*
+# layer, so those bytes stay in the image and in every push/pull forever. A bind
+# mount exists only for the duration of this RUN, so the env ships exactly once.
 RUN mkdir -p /opt/conda/envs/bda && chown dockeruser:dockeruser /opt/conda/envs/bda
-COPY --chown=dockeruser:dockeruser --from=conda-env /tmp/bda.tar.gz /tmp/bda.tar.gz
 USER dockeruser
-RUN tar -xzf /tmp/bda.tar.gz -C /opt/conda/envs/bda \
-	&& rm /tmp/bda.tar.gz \
+RUN --mount=type=bind,from=conda-env,source=/tmp/bda.tar.gz,target=/tmp/bda.tar.gz \
+	tar -xzf /tmp/bda.tar.gz -C /opt/conda/envs/bda \
 	&& /opt/conda/envs/bda/bin/conda-unpack
 
 # Set working directory (created as dockeruser since USER is already set)
@@ -118,8 +147,8 @@ RUN mkdir -p /opt/torch-hub-cache/hub \
 	&& chown -R dockeruser:dockeruser /opt/torch-hub-cache
 USER dockeruser
 RUN python -c "import torch; torch.hub.set_dir('/opt/torch-hub-cache/hub'); \
-	torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14', trust_repo=True); \
-	torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14', trust_repo=True)"
+	torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14', trust_repo=True, skip_validation=True); \
+	torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14', trust_repo=True, skip_validation=True)"
 
 # Use training-specific entrypoint wrapper to mirror imagery prep behavior
 ENTRYPOINT ["/app/scripts/entrypoint.sh"]

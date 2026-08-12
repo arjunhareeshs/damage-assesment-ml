@@ -1,8 +1,10 @@
-# Use Microsoft-hosted Python image to avoid Docker Hub authentication issues
-FROM mcr.microsoft.com/devcontainers/python:3.11
+# This container only uploads a few small JSON blobs into Azurite, so it does
+# not need the ~2.4 GB devcontainers image (full toolchain, git, node, zsh,
+# oh-my-zsh, debuggers). python:3.11-slim is ~150 MB and runs the same script.
+FROM python:3.11-slim
 
 # Install Azure Storage Blob SDK
-RUN pip install azure-storage-blob azure-storage-queue
+RUN pip install --no-cache-dir azure-storage-blob azure-storage-queue
 
 # Copy the data files from setup folder to the container
 COPY ./setup/config_admin_settings.json /data/config_admin_settings.json
