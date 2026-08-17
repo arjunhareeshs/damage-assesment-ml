@@ -1,0 +1,10 @@
+torch>=2.0.0
+torchvision
+transformers
+einops
+numpy
+pillow
+opencv-python
+fastapi
+uvicorn
+python-multipart
