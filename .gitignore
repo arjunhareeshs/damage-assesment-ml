@@ -12,5 +12,13 @@ models/
 # Environment & Python caches
 __pycache__/
 .venv/
+.venv*/
+venv/
+venv*/
+*_venv/
+*_env/
+env/
+ENV/
 *.py[cod]
 .DS_Store
+

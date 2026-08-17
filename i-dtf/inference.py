@@ -19,7 +19,11 @@ class Instance:
     class_name: str
     confidence: float
     probs: list[float]
-    mask: np.ndarray = field(repr=False)  # 2D boolean mask over full image
+    # 2D boolean mask cropped to bbox (shape == (ymax-ymin, xmax-xmin)), not
+    # a full-image array -- keeps per-instance memory O(building size) instead
+    # of O(image size). Index into the full image as:
+    #   full[ymin:ymax, xmin:xmax][mask]
+    mask: np.ndarray = field(repr=False)
 
 
 def decode_gated(damage_out) -> np.ndarray:
@@ -101,11 +105,15 @@ def predict_image(
 
             tile_rgb = rgb_img[y_min:y_max, x_min:x_max]
 
-            # Pad tile to 1024x1024 if edge tile
+            # Pad tile to 1024x1024 if edge tile. Edge-replicate rather than
+            # zero-pad: under ImageNet normalization, black padding becomes
+            # a strongly negative region abutting real pixels and can bias
+            # the segmentation head near image borders.
             if tile_h < IM_SIZE or tile_w < IM_SIZE:
-                padded_tile = np.zeros((IM_SIZE, IM_SIZE, 3), dtype=np.uint8)
-                padded_tile[:tile_h, :tile_w] = tile_rgb
-                input_tile = padded_tile
+                input_tile = cv2.copyMakeBorder(
+                    tile_rgb, 0, IM_SIZE - tile_h, 0, IM_SIZE - tile_w,
+                    borderType=cv2.BORDER_REPLICATE,
+                )
             else:
                 input_tile = tile_rgb
 
@@ -154,16 +162,18 @@ def predict_image(
                     if not valid_local_mask.any():
                         continue
 
-                    # Construct full image boolean mask
-                    full_mask = np.zeros((img_h, img_w), dtype=bool)
-                    full_mask[y_min:y_max, x_min:x_max] = valid_local_mask
-
                     # Bounding box in full image coords
                     rows, cols = np.where(valid_local_mask)
                     xmin = int(x_min + cols.min())
                     ymin = int(y_min + rows.min())
                     xmax = int(x_min + cols.max() + 1)
                     ymax = int(y_min + rows.max() + 1)
+
+                    # Mask cropped to its own bbox (not the full image) --
+                    # keeps per-instance memory O(building size).
+                    bbox_mask = valid_local_mask[
+                        ymin - y_min : ymax - y_min, xmin - x_min : xmax - x_min
+                    ]
 
                     probs_k = probs_matrix[k].tolist()
                     class_id = int(probs_matrix[k].argmax())
@@ -179,7 +189,7 @@ def predict_image(
                             class_name=CATEGORIES[class_id],
                             confidence=confidence,
                             probs=probs_k,
-                            mask=full_mask,
+                            mask=bbox_mask,
                         )
                     )
 

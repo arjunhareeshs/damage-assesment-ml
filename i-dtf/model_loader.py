@@ -2,68 +2,10 @@ import json
 import logging
 from pathlib import Path
 import torch
-import torch.nn as nn
 
 from .config import CATEGORIES, CKPT_CONFIG, CKPT_PATH, IM_SIZE
 
 logger = logging.getLogger("i-dtf.model_loader")
-
-
-def _patch_backbone_compatibility():
-    """
-    Patch DinoV3Backbone dynamically to support HuggingFace Transformers model attribute variations
-    (e.g., vit.model.layer vs vit.encoder.layer vs vit.layer).
-    """
-    try:
-        import src.model.backbone as backbone_mod
-        from transformers import AutoModel, AutoConfig
-
-        if getattr(backbone_mod, "_idtf_patched", False):
-            return
-
-        orig_init = backbone_mod.DinoV3Backbone.__init__
-
-        def patched_init(
-            self,
-            name_or_model=backbone_mod.BACKBONE,
-            frozen=True,
-            unfreeze_blocks=4,
-            unfreeze_norm=True,
-            drop_path_rate=0.0,
-        ):
-            nn.Module.__init__(self)
-            if isinstance(name_or_model, str):
-                if drop_path_rate > 0.0:
-                    config = AutoConfig.from_pretrained(name_or_model)
-                    if hasattr(config, "drop_path_rate"):
-                        config.drop_path_rate = drop_path_rate
-                    self.vit = AutoModel.from_pretrained(name_or_model, config=config)
-                else:
-                    self.vit = AutoModel.from_pretrained(name_or_model)
-            else:
-                self.vit = name_or_model
-
-            if hasattr(self.vit, "encoder") and hasattr(self.vit.encoder, "layer"):
-                self.transformer_layers = self.vit.encoder.layer
-            elif hasattr(self.vit, "layer"):
-                self.transformer_layers = self.vit.layer
-            elif hasattr(self.vit, "model") and hasattr(self.vit.model, "layer"):
-                self.transformer_layers = self.vit.model.layer
-            else:
-                raise ValueError("Could not find transformer layers in model")
-
-            self.num_blocks = len(self.transformer_layers)
-
-            if frozen:
-                for p in self.vit.parameters():
-                    p.requires_grad_(False)
-            else:
-                self._setup_partial_finetuning(unfreeze_blocks, unfreeze_norm)
-
-        backbone_mod.DinoV3Backbone.__init__ = patched_init
-        backbone_mod._idtf_patched = True
-    except Exception as e:
-        logger.warning(f"Could not apply backbone patch: {e}")
 
 
 def build_model(
@@ -96,9 +38,6 @@ def build_model(
             f"Configuration file not found at {config_path}.\n"
             "Please run 'python download_models.py' from the project root to download pre-trained config."
         )
-
-    # Patch backbone for transformers compatibility before loading Model
-    _patch_backbone_compatibility()
 
     # Import Model dynamically from DTF_REPO
     try:
@@ -147,4 +86,15 @@ def build_model(
     model.eval()
     logger.info("Model loaded successfully.")
 
-    return model, getattr(model, "use_gated_head", False)
+    use_gated = getattr(model, "use_gated_head", False)
+    if not use_gated:
+        # inference.decode_gated() only knows how to decode a
+        # (gate_list, leaf_list[, aux_list]) GatedDamageHead output. A
+        # checkpoint trained without use_gated_head would silently produce
+        # garbage predictions downstream, so fail loudly here instead.
+        raise NotImplementedError(
+            "Checkpoint config has use_gated_head=False; i-dtf's decode_gated() "
+            "only supports the gated damage head used by the released checkpoint."
+        )
+
+    return model, use_gated

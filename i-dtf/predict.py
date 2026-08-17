@@ -4,6 +4,16 @@ import logging
 import sys
 import time
 from pathlib import Path
+
+if __package__ in (None, ""):
+    sys.stderr.write(
+        "i-dtf/predict.py uses relative imports and must be run as a module:\n"
+        "  python -m i-dtf.predict --input <image_or_dir> [options]\n"
+        "(run from the repository root, or "
+        "'docker compose run --rm i-dtf python -m i-dtf.predict ...')\n"
+    )
+    sys.exit(1)
+
 import cv2
 import numpy as np
 from PIL import Image

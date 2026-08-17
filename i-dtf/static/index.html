@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>i-DTF Damage Classifier</title>
+<style>
+  :root {
+    --bg: #0f1216; --panel: #171b21; --panel2: #1e232b; --border: #2a3038;
+    --text: #e8ebef; --muted: #8891a0; --accent: #4f8cff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+    background: var(--bg); color: var(--text); min-height: 100vh;
+  }
+  header {
+    padding: 14px 20px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  #status { font-size: 12px; color: var(--muted); }
+  #status.ready { color: #5ad06a; }
+  #status.error { color: #ff5a5a; }
+  main {
+    display: grid; grid-template-columns: 300px 1fr; gap: 16px;
+    padding: 16px; align-items: start;
+  }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px;
+  }
+  #drop {
+    border: 2px dashed var(--border); border-radius: 8px; padding: 24px 12px;
+    text-align: center; cursor: pointer; color: var(--muted); font-size: 13px;
+    transition: border-color .15s;
+  }
+  #drop.drag { border-color: var(--accent); color: var(--text); }
+  #fileInput { display: none; }
+  .field { margin-top: 14px; }
+  .field label { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); }
+  .field input[type=range] { width: 100%; accent-color: var(--accent); }
+  .radio-row { display: flex; gap: 12px; margin-top: 4px; font-size: 12px; }
+  button#run {
+    width: 100%; margin-top: 18px; padding: 10px; border: none; border-radius: 8px;
+    background: var(--accent); color: white; font-weight: 600; font-size: 14px; cursor: pointer;
+  }
+  button#run:disabled { background: #3a4150; color: var(--muted); cursor: not-allowed; }
+  .spinner {
+    display: none; width: 14px; height: 14px; border: 2px solid rgba(255,255,255,.4);
+    border-top-color: #fff; border-radius: 50%; animation: spin .7s linear infinite;
+    margin-right: 8px; vertical-align: -2px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #elapsed { font-size: 11px; color: var(--muted); margin-top: 8px; text-align: center; }
+  #errorBox {
+    display: none; margin-top: 12px; background: #3a1a1a; border: 1px solid #5a2a2a;
+    color: #ffb3b3; padding: 10px; border-radius: 6px; font-size: 12px;
+  }
+  .images { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 700px) { .images { grid-template-columns: 1fr; } }
+  .imgbox { position: relative; }
+  .imgbox h3 {
+    font-size: 12px; color: var(--muted); margin: 0 0 6px 0; font-weight: 500;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .imgbox img, .imgbox .placeholder {
+    width: 100%; display: block; border-radius: 6px; background: #0a0c0f;
+    border: 1px solid var(--border);
+  }
+  .placeholder {
+    height: 220px; display: flex; align-items: center; justify-content: center;
+    color: var(--muted); font-size: 12px;
+  }
+  .toggle-btn {
+    font-size: 11px; background: var(--panel2); border: 1px solid var(--border);
+    color: var(--muted); border-radius: 4px; padding: 3px 8px; cursor: pointer;
+  }
+  .toggle-btn.on { color: var(--text); border-color: var(--accent); }
+  .summary { display: flex; gap: 10px; flex-wrap: wrap; margin: 14px 0; }
+  .chip {
+    display: flex; align-items: center; gap: 6px; background: var(--panel2);
+    border: 1px solid var(--border); border-radius: 20px; padding: 5px 12px; font-size: 12px;
+  }
+  .swatch { width: 12px; height: 12px; border-radius: 3px; border: 1px solid rgba(255,255,255,.3); }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; }
+  tr.instrow { cursor: pointer; }
+  tr.instrow:hover { background: var(--panel2); }
+  tr.instrow.selected { background: #22304a; }
+  .downloads { display: flex; gap: 8px; margin-top: 12px; }
+  .downloads button {
+    flex: 1; padding: 8px; font-size: 12px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--panel2); color: var(--text); cursor: pointer;
+  }
+  .downloads button:disabled { color: var(--muted); cursor: not-allowed; }
+  .empty { color: var(--muted); font-size: 13px; text-align: center; padding: 40px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>i-DTF &mdash; Damage Classifier</h1>
+  <span id="status">checking model status&hellip;</span>
+</header>
+<main>
+  <section class="panel">
+    <div id="drop">Drop an image here<br>or click to choose a file</div>
+    <input type="file" id="fileInput" accept=".png,.jpg,.jpeg,.tif,.tiff,.bmp,.webp">
+
+    <div class="field">
+      <label>Segmentation threshold <span id="segVal">0.50</span></label>
+      <input type="range" id="segThreshold" min="0" max="1" step="0.05" value="0.5">
+    </div>
+    <div class="field">
+      <label>Min. building area (px) <span id="areaVal">200</span></label>
+      <input type="range" id="minArea" min="0" max="3000" step="50" value="200">
+    </div>
+    <div class="field">
+      <label>Overlay opacity <span id="alphaVal">0.50</span></label>
+      <input type="range" id="alpha" min="0" max="1" step="0.05" value="0.5">
+    </div>
+    <div class="field">
+      <label>Normalization</label>
+      <div class="radio-row">
+        <label><input type="radio" name="norm" value="imagenet" checked> imagenet</label>
+        <label><input type="radio" name="norm" value="unit"> unit (/255)</label>
+      </div>
+    </div>
+
+    <button id="run" disabled><span class="spinner" id="spinner"></span><span id="runLabel">Waiting for model&hellip;</span></button>
+    <div id="elapsed"></div>
+    <div id="errorBox"></div>
+  </section>
+
+  <section>
+    <div class="panel">
+      <div class="images">
+        <div class="imgbox">
+          <h3>Original</h3>
+          <div id="origBox" class="placeholder">No image loaded</div>
+        </div>
+        <div class="imgbox">
+          <h3>
+            <span id="rightLabel">Classified</span>
+            <button class="toggle-btn" id="maskToggle">show mask</button>
+          </h3>
+          <div id="resultBox" class="placeholder">Run inference to see output</div>
+        </div>
+      </div>
+
+      <div class="summary" id="summary"></div>
+
+      <table id="table" style="display:none">
+        <thead><tr><th>#</th><th>Class</th><th>Confidence</th><th>Area (px)</th><th>Bbox</th></tr></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+      <div id="emptyMsg" class="empty" style="display:none">No buildings detected at these settings.</div>
+
+      <div class="downloads">
+        <button id="dlImage" disabled>Download classified PNG</button>
+        <button id="dlJson" disabled>Download JSON</button>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let classColors = [];
+let categories = [];
+let currentFile = null;
+let lastResult = null;
+let showingMask = false;
+let selectedRow = null;
+
+function rgbCss(rgb) { return "rgb(" + rgb[0] + "," + rgb[1] + "," + rgb[2] + ")"; }
+
+async function pollHealth() {
+  try {
+    const r = await fetch('/health');
+    const j = await r.json();
+    categories = j.categories || [];
+    classColors = j.class_colors || [];
+    const statusEl = $('status');
+    if (j.model_loaded) {
+      statusEl.textContent = 'model ready (' + j.device + ')';
+      statusEl.className = 'ready';
+      $('run').disabled = !currentFile;
+      $('runLabel').textContent = 'Run';
+    } else {
+      statusEl.textContent = 'loading model on ' + j.device + '…';
+      statusEl.className = '';
+      setTimeout(pollHealth, 2000);
+    }
+  } catch (e) {
+    $('status').textContent = 'API unreachable';
+    $('status').className = 'error';
+    setTimeout(pollHealth, 3000);
+  }
+}
+pollHealth();
+
+// Sliders
+const sliderCfg = [
+  ['segThreshold', 'segVal', function(v) { return v.toFixed(2); }],
+  ['minArea', 'areaVal', function(v) { return Math.round(v); }],
+  ['alpha', 'alphaVal', function(v) { return v.toFixed(2); }],
+];
+sliderCfg.forEach(function(cfg) {
+  const id = cfg[0], valId = cfg[1], fmt = cfg[2];
+  const el = $(id);
+  el.addEventListener('input', function() { $(valId).textContent = fmt(parseFloat(el.value)); });
+});
+
+// File handling
+const drop = $('drop'), fileInput = $('fileInput');
+drop.addEventListener('click', function() { fileInput.click(); });
+drop.addEventListener('dragover', function(e) { e.preventDefault(); drop.classList.add('drag'); });
+drop.addEventListener('dragleave', function() { drop.classList.remove('drag'); });
+drop.addEventListener('drop', function(e) {
+  e.preventDefault(); drop.classList.remove('drag');
+  if (e.dataTransfer.files.length) setFile(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', function() { if (fileInput.files.length) setFile(fileInput.files[0]); });
+
+function setFile(file) {
+  currentFile = file;
+  drop.textContent = file.name;
+  const url = URL.createObjectURL(file);
+  $('origBox').outerHTML = '<img id="origBox" src="' + url + '">';
+  resetResult();
+  if ($('status').classList.contains('ready')) $('run').disabled = false;
+}
+
+function resetResult() {
+  lastResult = null;
+  $('resultBox').outerHTML = '<div id="resultBox" class="placeholder">Run inference to see output</div>';
+  $('summary').innerHTML = '';
+  $('table').style.display = 'none';
+  $('emptyMsg').style.display = 'none';
+  $('tbody').innerHTML = '';
+  $('dlImage').disabled = true;
+  $('dlJson').disabled = true;
+  hideError();
+}
+
+function showError(msg) {
+  const box = $('errorBox');
+  box.textContent = msg;
+  box.style.display = 'block';
+}
+function hideError() { $('errorBox').style.display = 'none'; }
+
+$('maskToggle').addEventListener('click', function() {
+  if (!lastResult) return;
+  showingMask = !showingMask;
+  $('maskToggle').classList.toggle('on', showingMask);
+  $('maskToggle').textContent = showingMask ? 'show classified' : 'show mask';
+  $('rightLabel').textContent = showingMask ? 'Segmentation mask' : 'Classified';
+  renderResultImage();
+});
+
+function renderResultImage() {
+  const src = 'data:image/png;base64,' + (showingMask ? lastResult.mask_b64 : lastResult.image_b64);
+  const box = document.getElementById('resultBox');
+  if (box.tagName === 'IMG') { box.src = src; }
+  else { box.outerHTML = '<img id="resultBox" src="' + src + '">'; }
+}
+
+$('run').addEventListener('click', async function() {
+  if (!currentFile) return;
+  hideError();
+  $('run').disabled = true;
+  $('spinner').style.display = 'inline-block';
+  $('runLabel').textContent = 'Running…';
+  const t0 = performance.now();
+
+  const form = new FormData();
+  form.append('file', currentFile);
+  form.append('seg_threshold', $('segThreshold').value);
+  form.append('min_area', $('minArea').value);
+  form.append('alpha', $('alpha').value);
+  form.append('norm', document.querySelector('input[name=norm]:checked').value);
+
+  try {
+    const r = await fetch('/analyze', { method: 'POST', body: form });
+    if (!r.ok) {
+      const j = await r.json().catch(function() { return {}; });
+      throw new Error(j.detail || ('Server error (' + r.status + ')'));
+    }
+    lastResult = await r.json();
+    showingMask = false;
+    $('maskToggle').classList.remove('on');
+    $('maskToggle').textContent = 'show mask';
+    $('rightLabel').textContent = 'Classified';
+    renderResultImage();
+    renderSummaryAndTable(lastResult);
+    $('dlImage').disabled = false;
+    $('dlJson').disabled = false;
+    const roundTrip = ((performance.now() - t0) / 1000).toFixed(1);
+    $('elapsed').textContent = lastResult.total_instances + ' building(s) · ' + lastResult.elapsed_s + 's inference · ' + roundTrip + 's round trip';
+  } catch (e) {
+    showError(e.message || String(e));
+  } finally {
+    $('run').disabled = false;
+    $('spinner').style.display = 'none';
+    $('runLabel').textContent = 'Run';
+  }
+});
+
+function renderSummaryAndTable(result) {
+  const summary = $('summary');
+  summary.innerHTML = '';
+  categories.forEach(function(cat, i) {
+    const count = result.category_counts[cat] || 0;
+    const color = classColors[i] || [128, 128, 128];
+    const chip = document.createElement('div');
+    chip.className = 'chip';
+    chip.innerHTML = '<span class="swatch" style="background:' + rgbCss(color) + '"></span>' + cat + ' (' + count + ')';
+    summary.appendChild(chip);
+  });
+
+  const tbody = $('tbody');
+  tbody.innerHTML = '';
+  selectedRow = null;
+  if (!result.instances.length) {
+    $('table').style.display = 'none';
+    $('emptyMsg').style.display = 'block';
+    return;
+  }
+  $('table').style.display = 'table';
+  $('emptyMsg').style.display = 'none';
+
+  result.instances.forEach(function(inst) {
+    const color = classColors[inst.class_id] || [128, 128, 128];
+    const tr = document.createElement('tr');
+    tr.className = 'instrow';
+    tr.innerHTML = '<td>' + inst.id + '</td>' +
+      '<td><span class="swatch" style="background:' + rgbCss(color) + '"></span> ' + inst.class_name + '</td>' +
+      '<td>' + (inst.confidence * 100).toFixed(1) + '%</td>' +
+      '<td>' + inst.area + '</td>' +
+      '<td>' + inst.bbox.join(', ') + '</td>';
+    tr.addEventListener('click', function() {
+      if (selectedRow) selectedRow.classList.remove('selected');
+      tr.classList.add('selected');
+      selectedRow = tr;
+    });
+    tbody.appendChild(tr);
+  });
+}
+
+$('dlImage').addEventListener('click', function() {
+  if (!lastResult) return;
+  const a = document.createElement('a');
+  a.href = 'data:image/png;base64,' + lastResult.image_b64;
+  a.download = (currentFile.name.replace(/\.[^.]+$/, '') || 'result') + '_classified.png';
+  a.click();
+});
+$('dlJson').addEventListener('click', function() {
+  if (!lastResult) return;
+  const jsonOnly = {};
+  for (const k in lastResult) { if (k !== 'image_b64' && k !== 'mask_b64') jsonOnly[k] = lastResult[k]; }
+  const blob = new Blob([JSON.stringify(jsonOnly, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = (currentFile.name.replace(/\.[^.]+$/, '') || 'result') + '.json';
+  a.click();
+});
+</script>
+</body>
+</html>

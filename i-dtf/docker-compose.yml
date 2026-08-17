@@ -1,0 +1,29 @@
+# Standalone compose file for i-dtf. Independent of, and never referenced
+# by, Haste-DTF/haste-fork/docker/docker-compose.yml -- runs on its own
+# default network, no shared services, no shared volumes.
+#
+#   docker compose up --build      # build + run the API on :8000
+#   docker compose run --rm i-dtf python -m i-dtf.predict --input i-dtf/samples --save-json --save-mask
+#
+# Requires Docker Compose v2.17+ / BuildKit for the additional_contexts
+# feature used below (ships with Docker Desktop and modern Docker Engine).
+services:
+  i-dtf:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      additional_contexts:
+        dtf_src: ../Haste-DTF/Damage-TriageFormer/src
+    image: i-dtf:latest
+    ports:
+      - "8000:8000"
+    volumes:
+      # Existing pre-downloaded weights, read-only -- never copied into the
+      # image or duplicated anywhere under i-dtf/.
+      - ../models:/app/models:ro
+      # Drop images to classify here on the host; results land in ./out.
+      - ./samples:/app/i-dtf/samples:ro
+      - ./out:/app/i-dtf/out
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8000

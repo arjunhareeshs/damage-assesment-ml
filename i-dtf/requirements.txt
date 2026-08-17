@@ -1,10 +1,14 @@
-torch>=2.0.0
-torchvision
-transformers
-einops
+# torch is installed separately in the Dockerfile using the CPU-only wheel
+# index (https://download.pytorch.org/whl/cpu) to avoid pulling the ~2GB
+# CUDA runtime bundle that the default PyPI torch wheel drags in. For a
+# native (non-Docker) install, run this first:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# (or the matching CUDA index if you have a GPU), then this file.
+transformers>=4.56,<5
+einops==0.8.0
 numpy
 pillow
-opencv-python
+opencv-python-headless
 fastapi
-uvicorn
+uvicorn[standard]
 python-multipart

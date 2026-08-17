@@ -32,19 +32,24 @@ def render_overlay(
     # Kernel for boundary extraction (2px border outline)
     kernel = np.ones((3, 3), np.uint8)
 
-    for inst in instances:
-        color = CLASS_COLORS[inst.class_id]  # RGB tuple
+    def bbox_boundary(inst):
+        """Erode/boundary computed within the instance's own bbox, not the
+        full image -- inst.mask is already bbox-cropped (see inference.py)."""
         mask = inst.mask.astype(np.uint8)
-
-        # Fill building interior with class color
-        overlay[inst.mask] = color
-
-        # Compute 2px boundary (mask minus eroded mask)
         eroded = cv2.erode(mask, kernel, iterations=1)
         boundary = (mask > 0) & (eroded == 0)
+        xmin, ymin, xmax, ymax = inst.bbox
+        return xmin, ymin, xmax, ymax, mask, boundary
 
+    for inst in instances:
+        color = CLASS_COLORS[inst.class_id]  # RGB tuple
+        xmin, ymin, xmax, ymax, mask, boundary = bbox_boundary(inst)
+        region = overlay[ymin:ymax, xmin:xmax]
+
+        # Fill building interior with class color
+        region[mask.astype(bool)] = color
         # Draw opaque boundary outline
-        overlay[boundary] = color
+        region[boundary] = color
 
     # Blend filled interiors with original image
     blended = cv2.addWeighted(overlay, alpha, rgb_img, 1.0 - alpha, 0)
@@ -52,10 +57,8 @@ def render_overlay(
     # Redraw crisp opaque outlines over blended image
     for inst in instances:
         color = CLASS_COLORS[inst.class_id]
-        mask = inst.mask.astype(np.uint8)
-        eroded = cv2.erode(mask, kernel, iterations=1)
-        boundary = (mask > 0) & (eroded == 0)
-        blended[boundary] = color
+        xmin, ymin, xmax, ymax, mask, boundary = bbox_boundary(inst)
+        blended[ymin:ymax, xmin:xmax][boundary] = color
 
     # Convert to PIL Image for high-quality text and legend drawing
     pil_img = Image.fromarray(blended)
