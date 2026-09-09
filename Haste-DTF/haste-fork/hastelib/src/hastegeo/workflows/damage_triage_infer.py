@@ -43,6 +43,7 @@ import os
 import subprocess
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
@@ -55,6 +56,48 @@ import torch.nn.functional as F
 from hastegeo.core.utils.logs import Logger as HasteLogger
 from rasterio.features import geometry_mask
 from shapely.geometry import box
+
+def _find_local_checkpoint():
+    """Look for pre-downloaded best_model.pth and config.json in local directories."""
+    env_ckpt = os.getenv("DTF_CHECKPOINT_PATH")
+    env_cfg = os.getenv("DTF_CHECKPOINT_CONFIG_PATH")
+    if env_ckpt and env_cfg and os.path.exists(env_ckpt) and os.path.exists(env_cfg):
+        return env_ckpt, env_cfg
+
+    candidate_dirs = []
+
+    cwd = Path.cwd()
+    candidate_dirs.append(cwd / "models" / "damage_triage")
+    for parent in cwd.parents:
+        candidate_dirs.append(parent / "models" / "damage_triage")
+
+    file_dir = Path(__file__).resolve().parent
+    for parent in file_dir.parents:
+        candidate_dirs.append(parent / "models" / "damage_triage")
+        candidate_dirs.append(parent / "Damage assesment" / "damage-assesment-ml" / "models" / "damage_triage")
+
+    candidate_dirs.append(Path.home() / ".cache" / "huggingface" / "hub")
+    candidate_dirs.append(Path("/opt/dtf-checkpoint"))
+    candidate_dirs.append(Path("/app/models/damage_triage"))
+
+    for d in candidate_dirs:
+        if not d.exists():
+            continue
+        ckpt = d / "best_model.pth"
+        cfg = d / "config.json"
+        if not cfg.exists():
+            cfg = d / "dtf_config.json"
+        if ckpt.exists() and cfg.exists():
+            return str(ckpt), str(cfg)
+
+    hf_hub = Path.home() / ".cache" / "huggingface" / "hub"
+    if hf_hub.exists():
+        found_ckpts = list(hf_hub.glob("**/best_model.pth"))
+        found_cfgs = list(hf_hub.glob("**/config.json"))
+        if found_ckpts and found_cfgs:
+            return str(found_ckpts[0]), str(found_cfgs[0])
+
+    return None, None
 
 WORKDIR = os.getenv("WORKDIR", ".")
 LOG_DIR = os.path.join(WORKDIR, "logs")
@@ -527,6 +570,12 @@ def main():
             raise FileNotFoundError(f"Imagery not found: {image_path}")
         if not footprints_path or not os.path.exists(footprints_path):
             raise FileNotFoundError(f"Footprints not found: {footprints_path}")
+        if not os.path.exists(checkpoint_path) or not os.path.exists(checkpoint_config_path):
+            local_ckpt, local_cfg = _find_local_checkpoint()
+            if local_ckpt and local_cfg:
+                checkpoint_path, checkpoint_config_path = local_ckpt, local_cfg
+                logger.info(f"Resolved existing local DamageTriageFormer checkpoint: {checkpoint_path}")
+
         if not os.path.exists(checkpoint_path):
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
         if not os.path.exists(checkpoint_config_path):

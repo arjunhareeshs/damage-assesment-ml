@@ -41,6 +41,7 @@ import json
 import os
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 import rasterio  # type: ignore
@@ -75,21 +76,72 @@ DEFAULT_PAD_PX = 32
 DTF_HF_MODEL_ID = "Ymx1025/DamageTriageFormer-model"
 
 
+def _find_local_checkpoint():
+    """Look for pre-downloaded best_model.pth and config.json in local directories."""
+    env_ckpt = os.getenv("DTF_CHECKPOINT_PATH")
+    env_cfg = os.getenv("DTF_CHECKPOINT_CONFIG_PATH")
+    if env_ckpt and env_cfg and os.path.exists(env_ckpt) and os.path.exists(env_cfg):
+        return env_ckpt, env_cfg
+
+    candidate_dirs = []
+
+    # 1. Current working directory & parents
+    cwd = Path.cwd()
+    candidate_dirs.append(cwd / "models" / "damage_triage")
+    for parent in cwd.parents:
+        candidate_dirs.append(parent / "models" / "damage_triage")
+
+    # 2. File location & parents
+    file_dir = Path(__file__).resolve().parent
+    for parent in file_dir.parents:
+        candidate_dirs.append(parent / "models" / "damage_triage")
+        candidate_dirs.append(parent / "Damage assesment" / "damage-assesment-ml" / "models" / "damage_triage")
+
+    # 3. Fixed / container locations
+    candidate_dirs.append(Path.home() / ".cache" / "huggingface" / "hub")
+    candidate_dirs.append(Path("/opt/dtf-checkpoint"))
+    candidate_dirs.append(Path("/app/models/damage_triage"))
+
+    for d in candidate_dirs:
+        if not d.exists():
+            continue
+        ckpt = d / "best_model.pth"
+        cfg = d / "config.json"
+        if not cfg.exists():
+            cfg = d / "dtf_config.json"
+        if ckpt.exists() and cfg.exists():
+            return str(ckpt), str(cfg)
+
+    # 4. HF hub cache subdirectories
+    hf_hub = Path.home() / ".cache" / "huggingface" / "hub"
+    if hf_hub.exists():
+        found_ckpts = list(hf_hub.glob("**/best_model.pth"))
+        found_cfgs = list(hf_hub.glob("**/config.json"))
+        if found_ckpts and found_cfgs:
+            return str(found_ckpts[0]), str(found_cfgs[0])
+
+    return None, None
+
+
 def _ensure_checkpoint_locally(checkpoint_path: str, checkpoint_config_path: str):
     """Return a (checkpoint_path, checkpoint_config_path) pair that actually
-    exists in *this* container's filesystem, downloading from Hugging Face
-    if the given paths don't exist here (see call site: those paths are
-    commonly resolved by a different container's filesystem).
-
-    Downloads into HASTE_HF_CACHE_DIR when set — LocalRunner points this at
-    a fixed subdirectory of the azurite volume, which (unlike this
-    container's own home directory) is mounted into every task container
-    it spawns, so the checkpoint is fetched once and reused by every run
-    instead of being re-downloaded from Hugging Face each time. Falls back
-    to this container's own HF cache when the env var isn't set (e.g. run
-    outside LocalRunner)."""
-    if os.path.exists(checkpoint_path) and os.path.exists(checkpoint_config_path):
+    exists in *this* container's filesystem. Prioritizes local model files
+    over downloading from Hugging Face."""
+    if (
+        checkpoint_path
+        and checkpoint_config_path
+        and os.path.exists(checkpoint_path)
+        and os.path.exists(checkpoint_config_path)
+    ):
         return checkpoint_path, checkpoint_config_path
+
+    # Try resolving existing local model files
+    local_ckpt, local_cfg = _find_local_checkpoint()
+    if local_ckpt and local_cfg:
+        logger.info(
+            f"Resolved existing local DamageTriageFormer checkpoint: {local_ckpt}"
+        )
+        return local_ckpt, local_cfg
 
     from huggingface_hub import hf_hub_download
 
@@ -101,13 +153,20 @@ def _ensure_checkpoint_locally(checkpoint_path: str, checkpoint_config_path: str
         f"Checkpoint not found locally at {checkpoint_path!r}; downloading "
         f"{DTF_HF_MODEL_ID} into this container's own cache..."
     )
-    checkpoint_path = hf_hub_download(
-        repo_id=DTF_HF_MODEL_ID, filename="best_model.pth", cache_dir=cache_dir
-    )
-    checkpoint_config_path = hf_hub_download(
-        repo_id=DTF_HF_MODEL_ID, filename="config.json", cache_dir=cache_dir
-    )
-    return checkpoint_path, checkpoint_config_path
+    try:
+        checkpoint_path = hf_hub_download(
+            repo_id=DTF_HF_MODEL_ID, filename="best_model.pth", cache_dir=cache_dir
+        )
+        checkpoint_config_path = hf_hub_download(
+            repo_id=DTF_HF_MODEL_ID, filename="config.json", cache_dir=cache_dir
+        )
+        return checkpoint_path, checkpoint_config_path
+    except Exception as err:
+        raise FileNotFoundError(
+            f"Failed to download checkpoint from Hugging Face ({err}) and no local "
+            "checkpoint was found. Ensure 'models/damage_triage/best_model.pth' and 'config.json' "
+            "exist locally (run 'python download_models.py')."
+        ) from err
 
 
 def crop_class_mask_to_png(class_idx: int, crop_size: int) -> np.ndarray:
