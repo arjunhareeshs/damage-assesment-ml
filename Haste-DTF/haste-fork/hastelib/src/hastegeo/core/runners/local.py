@@ -384,39 +384,38 @@ class LocalRunner(BaseRunner):
                     f"[PIPELINE-TRACE] No storage_config found - config exists: {self.config is not None}"
                 )
 
-            # Pass through HuggingFace auth so spawned containers can fetch
-            # gated models (e.g. facebook/dinov3-vitl16-pretrain-lvd1689m,
-            # used by DamageTriageFormer's backbone) — without this, the
-            # DTF/DTF-AOI inference container fails with GatedRepoError even
-            # though the operator has already been granted access on
-            # huggingface.co, because the container has no credentials.
+            # Both DamageTriageFormer models (the DTF checkpoint and the
+            # DINOv3 backbone) are already downloaded on the host under
+            # <repo_root>/models/. data-init copies them into the azurite
+            # named volume at container start (see
+            # docker/docker-compose.yml's data-init command), which is the
+            # only volume every spawned sibling task container already has
+            # mounted (see azurite_volume_name above) — spawned containers
+            # are siblings launched via the Docker socket, not descendants,
+            # so they can't reach a host path or hastefuncqueues' own bind
+            # mounts directly; the shared named volume is the one thing
+            # already wired to reach them. Pointing these env vars at that
+            # copy makes _find_local_checkpoint()/_find_local_backbone()
+            # (damage_triage.py, damage_triage_infer.py, external/
+            # damage-triage-former/src/config.py) resolve everything
+            # locally, so the task container never needs to talk to
+            # Hugging Face at all.
+            task_env["DTF_CHECKPOINT_PATH"] = "/shared/azurite/models/damage_triage/best_model.pth"
+            task_env["DTF_CHECKPOINT_CONFIG_PATH"] = "/shared/azurite/models/damage_triage/config.json"
+            task_env["DTF_BACKBONE_DIR"] = "/shared/azurite/models/backbone/dinov3-vitl16"
+
+            # Hugging Face fallback, kept only in case the host copy under
+            # models/ is ever missing or incomplete (e.g. a fresh clone that
+            # hasn't run download_models.py yet). Not exercised in normal
+            # operation now that the env vars above resolve everything
+            # locally.
             hf_token = os.environ.get("HF_TOKEN") or os.environ.get(
                 "HUGGING_FACE_HUB_TOKEN"
             )
             if hf_token:
                 task_env["HF_TOKEN"] = hf_token
                 task_env["HUGGING_FACE_HUB_TOKEN"] = hf_token
-
-            # Spawned task containers are siblings (launched via the Docker
-            # socket), not descendants — they don't inherit hastefuncqueues'
-            # own HF cache bind mount, so each one would otherwise start
-            # with an empty ~/.cache and re-download the checkpoint from
-            # Hugging Face on every single run. The azurite volume is
-            # already mounted into every task container (see above), so
-            # point the HF cache at a fixed subdirectory of it instead —
-            # one persistent cache shared across all task runs, no extra
-            # host-path plumbing required.
             task_env["HASTE_HF_CACHE_DIR"] = "/shared/azurite/hf_cache"
-            # HASTE_HF_CACHE_DIR only reaches the two explicit
-            # hf_hub_download() calls in _ensure_checkpoint_locally (the DTF
-            # checkpoint + its config). The model *also* builds a DINOv3
-            # ViT-L/16 backbone via AutoModel.from_pretrained() deep inside
-            # DTFModel.__init__ (src/model/backbone.py), which knows nothing
-            # about that variable and would fall back to the container's own
-            # empty ~/.cache — a second 1.2 GB download on every single run.
-            # HF_HUB_CACHE is the variable huggingface_hub/transformers both
-            # honour, so point it at the same shared azurite directory and
-            # both models resolve from one persistent cache.
             task_env["HF_HUB_CACHE"] = "/shared/azurite/hf_cache"
 
             if env_vars:

@@ -40,15 +40,13 @@ RUN sed -i "s/+cu124/+${TORCH_VARIANT}/g; s#/whl/cu124#/whl/${TORCH_VARIANT}#g" 
 
 # Create environment using micromamba and pack it for reuse.
 # Force-reinstall setuptools after pip to restore conda-managed files pip may clobber.
-# The pip download cache lives on a BuildKit cache mount instead of in the layer:
-# editing env.yml then re-resolves without re-fetching ~4 GB of torch/CUDA wheels,
-# and those downloads never become immutable build-cache layers.
-# Do NOT also mount /opt/miniconda/pkgs as a cache: `micromamba clean -afy` below
-# removes that directory outright and fails on a mount point with
-# "filesystem error: cannot remove: Device or resource busy". The conda-side
-# tarballs are only ~185 MB anyway; the pip wheels are what actually cost.
-RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
-	micromamba create -f /tmp/env.yml -y \
+# No BuildKit cache mount here: `az acr build` (ACR Tasks quick build) runs the
+# classic Docker builder, which rejects `RUN --mount=type=cache` outright
+# ("the --mount option requires BuildKit"). A local `docker build`/`docker
+# compose build` with BuildKit enabled would benefit from one, but ACR is the
+# build path this image actually ships through, so plain RUN is what works
+# everywhere.
+RUN micromamba create -f /tmp/env.yml -y \
 	&& micromamba install -n bda -c conda-forge setuptools --force-reinstall -y \
 	&& micromamba clean -afy \
 	&& conda-pack -n bda -o /tmp/bda.tar.gz
@@ -90,15 +88,21 @@ RUN printf '#!/bin/bash\nexec python -m hastegeo.workflows.damage_triage_aoi_inf
 # Prepare conda env directory owned by the target user, then extract the packed env
 # as that user — non-root tar uses the running user's UID/GID, so no chown -R needed.
 #
-# The tarball is bind-mounted, not COPYed. A `COPY --from` writes the 4.1 GB
-# archive into its own layer and a later `rm` only deletes it in the *next*
-# layer, so those bytes stay in the image and in every push/pull forever. A bind
-# mount exists only for the duration of this RUN, so the env ships exactly once.
+# A bind mount would let the 4.1 GB tarball exist only for the duration of this
+# RUN instead of landing in a permanent layer, but `az acr build` (ACR Tasks
+# quick build) runs the classic Docker builder, which rejects `RUN
+# --mount=type=bind` the same way it rejects `--mount=type=cache` above
+# ("the --mount option requires BuildKit"). So this uses a plain COPY --from
+# instead: it does cost one extra ~4 GB layer in the pushed image (the
+# tarball's bytes stay in that layer even after the `rm` below deletes it from
+# the final filesystem view), but it's what actually builds on the path this
+# image ships through.
 RUN mkdir -p /opt/conda/envs/bda && chown dockeruser:dockeruser /opt/conda/envs/bda
+COPY --from=conda-env --chown=dockeruser:dockeruser /tmp/bda.tar.gz /tmp/bda.tar.gz
 USER dockeruser
-RUN --mount=type=bind,from=conda-env,source=/tmp/bda.tar.gz,target=/tmp/bda.tar.gz \
-	tar -xzf /tmp/bda.tar.gz -C /opt/conda/envs/bda \
-	&& /opt/conda/envs/bda/bin/conda-unpack
+RUN tar -xzf /tmp/bda.tar.gz -C /opt/conda/envs/bda \
+	&& /opt/conda/envs/bda/bin/conda-unpack \
+	&& rm -f /tmp/bda.tar.gz
 
 # Set working directory (created as dockeruser since USER is already set)
 WORKDIR /app

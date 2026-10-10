@@ -3,15 +3,21 @@
 # developers could never produce the same image.
 FROM mcr.microsoft.com/azure-functions/python:4.30.0-python3.11-slim
 
-RUN apt-get update && apt-get install -y \
-    vim \
-    curl \
-    libgl1 \
-    libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender-dev \
-    libgomp1 \
+# Retry loop: security.debian.org's CDN occasionally 404s a package version
+# transiently across edge nodes (seen with libglib2.0-0 on bullseye-security);
+# retrying a fresh apt-get update usually lands on a consistent mirror.
+RUN for i in 1 2 3 4 5; do \
+        apt-get update && apt-get install -y \
+            vim \
+            curl \
+            libgl1 \
+            libglib2.0-0 \
+            libsm6 \
+            libxext6 \
+            libxrender-dev \
+            libgomp1 \
+        && break || sleep 15; \
+    done \
     && rm -rf /var/lib/apt/lists/*
 
 # Set the working directory
@@ -26,6 +32,9 @@ RUN groupadd -r appgroup && useradd -r -g appgroup -m -s /bin/bash appuser
 COPY --chown=appuser:appgroup hastelib/src/hastegeo /app/hastegeo
 COPY --chown=appuser:appgroup docker/imageryprep/scripts /app/scripts/
 COPY --chown=appuser:appgroup docker/imageryprep/requirements.txt /app/
+
+# CUDA 12.4 torch wheel first (own layer, own index), matching training's TORCH_VARIANT default.
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu124
 
 # Install dependencies (no need to install haste package since we copy source directly)
 # --no-cache-dir: without it the downloaded wheels (~500 MB, incl. the GDAL

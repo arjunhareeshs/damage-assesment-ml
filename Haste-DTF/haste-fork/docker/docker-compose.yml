@@ -49,8 +49,23 @@ services:
       # services start; otherwise chunked uploads fail with
       # `PermissionError: '/app/data/<project>'`.
       - ../data:/shared/app-data
+      # Pre-downloaded DTF checkpoint + DINOv3 backbone from the host
+      # (see download_models.py at the repo root). Copied into the
+      # azurite named volume below so that spawned sibling task
+      # containers (LocalRunner, runners/local.py) can see them too —
+      # those are launched via the Docker socket as siblings, not
+      # descendants, so they can't reach this host bind mount directly,
+      # but they do already share the azurite volume.
+      - ../../../models:/shared/models-src:ro
     command: >
-      sh -c 'chmod -R 777 /shared/azurite /shared/app-data && python /upload_data.py'
+      sh -c 'chmod -R 777 /shared/azurite /shared/app-data &&
+             if [ ! -f /shared/azurite/models/damage_triage/best_model.pth ]; then
+               mkdir -p /shared/azurite/models &&
+               cp -r /shared/models-src/damage_triage /shared/azurite/models/ &&
+               cp -r /shared/models-src/backbone /shared/azurite/models/ &&
+               chmod -R 777 /shared/azurite/models;
+             fi &&
+             python /upload_data.py'
     depends_on:
       - azurite
     restart: "no"  # Run once and exit
@@ -148,16 +163,24 @@ services:
       # The local postgis image has no TLS; hastegeo defaults to
       # sslmode=require for production safety, so dev opts out here.
       POSTGRES_SSLMODE: "disable"
+      # Pre-downloaded DamageTriageFormer checkpoint paths (skip HuggingFace download)
+      DTF_CHECKPOINT_PATH: "/app/models/damage_triage/best_model.pth"
+      DTF_CHECKPOINT_CONFIG_PATH: "/app/models/damage_triage/config.json"
     volumes:
       - ../data:/app/data
       - /var/run/docker.sock:/var/run/docker.sock
+      - ../../../models/damage_triage:/app/models/damage_triage:ro  # Pre-downloaded DTF checkpoint
     group_add:
       - "${DOCKER_GID:-1001}"
     depends_on:
-      - azurite
-      - data-init
-      - titiler
-      - postgis
+      azurite:
+        condition: service_started
+      data-init:
+        condition: service_completed_successfully
+      titiler:
+        condition: service_started
+      postgis:
+        condition: service_healthy
 
   hastefuncqueues:
     build:
@@ -178,10 +201,13 @@ services:
       AzureFunctionsJobHost__logging__logLevel__Function: "Information"
       AzureFunctionsJobHost__logging__logLevel__Worker: "Information"
       AzureFunctionsJobHost__logging__logLevel__haste: "Information"
-      # Passed through to spawned training containers (LocalRunner,
-      # local.py) so DamageTriageFormer's gated DINOv3 backbone can
-      # authenticate. Set HF_TOKEN in your shell before `docker compose up`
-      # once you have huggingface.co access to facebook/dinov3-vitl16-pretrain-lvd1689m.
+      # Hugging Face fallback only. local.py now points spawned task
+      # containers at the pre-downloaded models under /shared/azurite/models
+      # (copied there by data-init from the host's models/ dir) via
+      # DTF_CHECKPOINT_PATH / DTF_CHECKPOINT_CONFIG_PATH / DTF_BACKBONE_DIR,
+      # so this is only used if that local copy is ever missing. Set
+      # HF_TOKEN in your shell before `docker compose up` if you need the
+      # fallback against facebook/dinov3-vitl16-pretrain-lvd1689m.
       HF_TOKEN: "${HF_TOKEN:-}"
       BLOB_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;QueueEndpoint=http://azurite:10001/devstoreaccount1;"  # pragma: allowlist secret # gitleaks:allow
       QUEUE_ACCOUNT_URL: "http://azurite:10001/devstoreaccount1"
@@ -245,27 +271,31 @@ services:
       # Memory settings for training containers (increase for large VMs)
       HASTE_DOCKER_SHM_SIZE: "${HASTE_DOCKER_SHM_SIZE:-64g}"
       HASTE_DOCKER_MEM_LIMIT: "${HASTE_DOCKER_MEM_LIMIT:-256g}"
+      # Pre-downloaded DamageTriageFormer checkpoint paths (skip HuggingFace download)
+      DTF_CHECKPOINT_PATH: "/app/models/damage_triage/best_model.pth"
+      DTF_CHECKPOINT_CONFIG_PATH: "/app/models/damage_triage/config.json"
     volumes:
       - ../data:/app/data
       - azurite-data:/shared/azurite  # Mount azurite blob storage for LocalRunner access
       - /var/run/docker.sock:/var/run/docker.sock  # Enable Docker access for LocalRunner
-      # HF checkpoint cache for DTF inference. Must land on the path
-      # _download_hf_checkpoint() actually uses: it hardcodes
-      # Path.home()/".cache"/"huggingface"/"hub", and HOME is "/home" for
-      # appuser in this image -- so mounting at /root/... left the cache
-      # unreadable (appuser got EACCES) and the checkpoint re-downloaded
-      # into a non-writable dir. Mounting at /home/... instead avoids
-      # overriding HOME, which the Functions host also relies on.
+      - ../../../models/damage_triage:/app/models/damage_triage:ro  # Pre-downloaded DTF checkpoint
+      # HF checkpoint cache for DTF inference (fallback).
       - ~/.cache/huggingface/hub:/home/.cache/huggingface/hub
     group_add:
       - "${DOCKER_GID:-1001}"
     depends_on:
-      - azurite
-      - data-init
-      - training_image
-      - imageryprep_image
-      - titiler
-      - postgis
+      azurite:
+        condition: service_started
+      data-init:
+        condition: service_completed_successfully
+      training_image:
+        condition: service_started
+      imageryprep_image:
+        condition: service_started
+      titiler:
+        condition: service_started
+      postgis:
+        condition: service_healthy
 
   # ==============================================================================
   # UI SERVICE

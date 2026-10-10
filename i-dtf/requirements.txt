@@ -1,9 +1,10 @@
-# torch is installed separately in the Dockerfile using the CPU-only wheel
-# index (https://download.pytorch.org/whl/cpu) to avoid pulling the ~2GB
-# CUDA runtime bundle that the default PyPI torch wheel drags in. For a
-# native (non-Docker) install, run this first:
-#   pip install torch --index-url https://download.pytorch.org/whl/cpu
-# (or the matching CUDA index if you have a GPU), then this file.
+# torch is installed separately in the Dockerfile using the CUDA 12.1 wheel
+# index (https://download.pytorch.org/whl/cu121), matching the driver on the
+# Batch GPU nodes this image runs on. For a native (non-Docker) install, run
+# this first:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+# (or the matching CPU/other-CUDA index for local dev without a GPU), then
+# this file.
 transformers>=4.56,<5
 einops==0.8.0
 numpy

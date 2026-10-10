@@ -15,15 +15,21 @@
 #     the repo -- the image itself is a build artifact, not a modification
 #     of anything else in the tree.
 #
-# Build (from this directory, with a modern Docker Buildx that supports
-# --build-context / Compose "additional_contexts"):
-#   docker compose build
+# Build from the REPO ROOT (needs both i-dtf/ and Haste-DTF/.../src in one
+# context) with any plain Docker CLI or ACR/CI builder -- no BuildKit
+# named-build-context / Compose "additional_contexts" support required:
+#   docker build -f i-dtf/Dockerfile -t i-dtf:latest .
+#   az acr build --registry <name> --image i-dtf:latest -f i-dtf/Dockerfile .
 #
-# Fallback for older Docker CLIs without additional-context support (run
-# from the REPO ROOT instead, since it needs both folders in one context):
-#   docker build -f i-dtf/Dockerfile \
-#     --build-context dtf_src=Haste-DTF/Damage-TriageFormer/src \
-#     -t i-dtf:latest .
+# docker compose build (from this directory) works the same way -- see
+# docker-compose.yml, which points its build context at the repo root.
+
+# Damage-TriageFormer's model source, imported in place as the `src`
+# package (unmodified, read-only). Pulled into its own stage so it can be
+# COPY --from=... below instead of copying the whole repo into the final
+# image.
+FROM scratch AS dtf_src
+COPY Haste-DTF/Damage-TriageFormer/src /src
 
 FROM python:3.11-slim
 
@@ -36,21 +42,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# CPU-only torch wheel first (own layer, own index) -- see requirements.txt
-# for why this is split out.
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+# CUDA 12.1 torch wheel first (own layer, own index) -- see requirements.txt
+# for why this is split out. Targets the CUDA 12.1 driver on the Batch GPU
+# nodes; bump the cuXXX suffix here if the pool's driver changes.
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu121
 
-COPY requirements.txt /app/i-dtf/requirements.txt
+COPY i-dtf/requirements.txt /app/i-dtf/requirements.txt
 RUN pip install --no-cache-dir -r /app/i-dtf/requirements.txt
 
-# Damage-TriageFormer's model source, imported in place as the `src`
-# package (unmodified, read-only). Brought in from a secondary build
-# context so the primary context stays this small i-dtf/ folder instead of
-# the whole (multi-GB) repository.
-COPY --from=dtf_src . /app/Haste-DTF/Damage-TriageFormer/src
+COPY --from=dtf_src /src /app/Haste-DTF/Damage-TriageFormer/src
 
 # i-dtf application code.
-COPY . /app/i-dtf
+COPY i-dtf/ /app/i-dtf
 
 ENV PYTHONPATH=/app \
     PYTHONUNBUFFERED=1 \
