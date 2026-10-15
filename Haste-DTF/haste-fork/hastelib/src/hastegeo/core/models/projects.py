@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 from enum import Enum
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -887,3 +887,77 @@ class Projects(BaseModel):
     """
 
     root: List[Project] = Field(default_factory=list)
+
+
+class AoiAssessmentStatus(str, Enum):
+    """Lifecycle status for a Large-AOI assessment job."""
+
+    SUBMITTED = "submitted"
+    VALIDATING = "validating"
+    REJECTED = "rejected"
+    DISCOVERING = "discovering"
+    TILING = "tiling"
+    QUEUED = "queued"
+    RUNNING = "running"
+    AGGREGATING = "aggregating"
+    COMPLETED = "completed"
+    COMPLETED_WITH_ERRORS = "completed_with_errors"
+    FAILED = "failed"
+    CANCELLING = "cancelling"
+    CANCELLED = "cancelled"
+
+
+class ProcessingUnitStatus(str, Enum):
+    """Status for an individual 1024x1024 tile window processing unit."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+class BatchStatus(str, Enum):
+    """Status for an execution batch grouping one or more processing units."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+class BuildingResultStatus(str, Enum):
+    """Status for an individual building's final aggregated damage result."""
+
+    COMPLETED = "completed"
+    UNCERTAIN = "uncertain"
+    INSUFFICIENT_DATA = "insufficient_data"
+    FAILED = "failed"
+
+
+class AoiAssessment(BaseModel):
+    """Large-AOI Batched Assessment model representing an AOI-first job."""
+
+    assessmentId: str = Field(default="")
+    projectId: str = Field(default="")
+    imageLayerId: str = Field(default="")
+    eventId: Optional[str] = Field(default=None)
+    name: Optional[str] = Field(default=None)
+    aoiGeometry: Dict[str, Any] = Field(default_factory=dict)
+    aoiAreaKm2: float = Field(default=0.0)
+    inclusionPolicy: str = Field(default="intersects_aoi")
+    status: str = Field(default=AoiAssessmentStatus.SUBMITTED.value)
+    config: Dict[str, Any] = Field(default_factory=dict)
+    modelRepo: Optional[str] = Field(default=None)
+    modelDigest: Optional[str] = Field(default=None)
+    preprocessingVersion: Optional[str] = Field(default="1.0.0")
+    eligibleBuildings: Optional[int] = Field(default=None)
+    totalUnits: Optional[int] = Field(default=None)
+    completedUnits: int = Field(default=0)
+    failedUnits: int = Field(default=0)
+    submittedBy: Optional[str] = Field(default=None)
+    error: Optional[str] = Field(default=None)
+    createdAt: Optional[str] = Field(default=None)
+    updatedAt: Optional[str] = Field(default=None)
+    completedAt: Optional[str] = Field(default=None)

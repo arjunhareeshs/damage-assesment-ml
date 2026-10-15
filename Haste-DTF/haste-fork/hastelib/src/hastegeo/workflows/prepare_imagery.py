@@ -120,6 +120,7 @@ class ImageryWorkflow:
 
         self.normalization_means = []
         self.normalization_stds = []
+        self.catalog_records = []
         self.building_footprints_path = ""
         # Human-readable error captured when the building-footprint step
         # fails — applies equally to the Overture download path and the
@@ -284,6 +285,34 @@ class ImageryWorkflow:
             self.mosaic_post_event_tif_filepath,
             source_type=self.source_type_post_event,
         )
+
+    def process_catalog_post_event(self):
+        """Catalogue mode for the large-AOI assessment workflow.
+
+        Writes one COG per source post-event TIF (same warp settings as the
+        mosaic, so the model sees the same pixels as the mosaic-based
+        workflows) and records each file's header metadata. Registration in
+        ``hg_imagery`` happens later in ``ImageryPostprocessor``, which has
+        database access and the uploaded files' storage URLs; this task
+        container has neither.
+        """
+        from hastegeo.core.utils.imagery_catalog import describe_raster
+
+        self.catalog_records = []
+        prefix = self.generate_prefix(POST_EVENT_MOSAIC_PREFIX)
+        for i, raw_path in enumerate(self.post_event_raw_paths):
+            cog_path = _create_mosaic_cog(
+                [raw_path],
+                dst_directory=self.dst_directory,
+                save_as_prefix=f"{prefix}_part{i:04d}",
+            )
+            self.catalog_records.append(
+                {
+                    "filename": os.path.basename(cog_path),
+                    "source_filename": os.path.basename(raw_path),
+                    "meta": describe_raster(cog_path),
+                }
+            )
 
     def download_building_footprints(self):
         """Download Overture Maps building footprints for this layer's AOI.
@@ -897,6 +926,11 @@ def main():
     parser.add_argument(
         "--config", type=str, required=True, help="Path to config file"
     )
+    parser.add_argument(
+        "--catalog",
+        action="store_true",
+        help="Run in catalogue mode (individual COGs registered in hg_imagery)",
+    )
 
     args = parser.parse_args()
 
@@ -910,6 +944,8 @@ def main():
     if not config:
         logger.error("Config file is empty")
         sys.exit(1)
+
+    is_catalog = args.catalog or config.get("catalog_mode", False) or config.get("catalogue_mode", False)
 
     output_dir = os.path.join(WORKDIR, config.get("output_dir", "outputs"))
     os.makedirs(output_dir, exist_ok=True)
@@ -966,6 +1002,29 @@ def main():
         )
         config["normalization_means"] = imagery_workflow.normalization_means
         config["normalization_stds"] = imagery_workflow.normalization_stds
+
+        # Imagery catalogue (hg_imagery) for the large-AOI assessment
+        # workflow. Default: the post-event mosaic is the one catalogued
+        # raster. Catalogue mode additionally writes one COG per source TIF
+        # and catalogues those instead. The mosaic is still produced either
+        # way, because the map, the whole-layer and AOI-scoped DTF paths and
+        # the footprint download all read it.
+        from hastegeo.core.utils.imagery_catalog import describe_raster
+
+        if is_catalog:
+            log_progress("Writing per-TIF COGs for the imagery catalogue")
+            imagery_workflow.process_catalog_post_event()
+            config["catalog_records"] = imagery_workflow.catalog_records
+        else:
+            config["catalog_records"] = [
+                {
+                    "filename": config["post_event_mosaic_filename"],
+                    "source_filename": None,
+                    "meta": describe_raster(
+                        imagery_workflow.mosaic_post_event_tif_filepath
+                    ),
+                }
+            ]
 
         log_progress("Downloading building footprints")
         if imagery_workflow.user_building_footprints_url:

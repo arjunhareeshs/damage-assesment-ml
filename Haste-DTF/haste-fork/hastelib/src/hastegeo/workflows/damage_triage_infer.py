@@ -44,6 +44,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 import geopandas as gpd
 import numpy as np
@@ -53,6 +54,14 @@ import rasterio.features
 import rasterio.windows
 import torch
 import torch.nn.functional as F
+from hastegeo.core.utils.dtf_constants import (  # noqa: F401 (re-exported)
+    DTF_CATEGORIES,
+    DTF_IM_SIZE,
+    UNCLASSIFIED,
+    compute_model_digest,
+    compute_tile_windows,
+)
+from hastegeo.core.utils.dtf_preprocess import normalize_tile
 from hastegeo.core.utils.logs import Logger as HasteLogger
 from rasterio.features import geometry_mask
 from shapely.geometry import box
@@ -109,19 +118,10 @@ logger = HasteLogger.get_logger(
 )
 logger.info("Executing %s", __file__)
 
-# Must match Damage-TriageFormer/src/config.py CATEGORIES exactly (checkpoint
-# class-index order). Kept as a local constant so this workflow doesn't need
-# the training repo's config module importable at runtime — only its
-# `src.model.net.Model` class (see build_dtf_model below).
-DTF_CATEGORIES = [
-    "Undamaged",
-    "Partial Roof Damage",
-    "Total Roof Damage",
-    "Partial Structural Collapse",
-    "Total Structural Collapse",
-]
-DTF_IM_SIZE = 1024
-UNCLASSIFIED = -1
+# DTF_CATEGORIES / DTF_IM_SIZE / UNCLASSIFIED (checkpoint class-index order,
+# must match Damage-TriageFormer/src/config.py CATEGORIES exactly) live in
+# hastegeo.core.utils.dtf_constants so torch-free code (the Functions apps)
+# can import them; they are re-exported from this module unchanged.
 
 # Where the training docker image bakes the cloned Damage-TriageFormer repo
 # (its `src` package must be importable to reconstruct the model + load the
@@ -146,7 +146,12 @@ DTF_IDX_TO_COLOR = np.array(
 )
 
 
-def build_dtf_model(checkpoint_path: str, config_path: str, device: torch.device):
+def build_dtf_model(
+    checkpoint_path: str,
+    config_path: str,
+    device: torch.device,
+    strict_region_check: bool = False,
+):
     """Load Damage-TriageFormer's Model class and checkpoint weights.
 
     IMPORTANT: the released checkpoint (Ymx1025/DamageTriageFormer-model,
@@ -163,6 +168,10 @@ def build_dtf_model(checkpoint_path: str, config_path: str, device: torch.device
     Mirrors main.py's checkpoint-loading branch (Damage-TriageFormer/main.py):
     a saved ``last_checkpoint.pth`` is a dict with a ``model_state_dict`` key;
     a bare ``best_model.pth`` (what the HF repo ships) is a raw state_dict.
+
+    ``strict_region_check`` (large-AOI region workflow only) raises if any
+    ``backbone.*`` or ``damage_head.*`` weight is missing from the
+    checkpoint instead of only logging the count.
     """
     if DTF_REPO_ROOT not in sys.path:
         sys.path.insert(0, DTF_REPO_ROOT)
@@ -196,22 +205,24 @@ def build_dtf_model(checkpoint_path: str, config_path: str, device: torch.device
             f"{len(unexpected)} unexpected keys "
             f"(architecture derived from {config_path})"
         )
+    if strict_region_check:
+        critical_missing = [
+            k for k in missing
+            if k.startswith("backbone.") or k.startswith("damage_head.")
+        ]
+        if critical_missing:
+            raise RuntimeError(
+                f"Checkpoint failed critical validation for region inference: "
+                f"missing {len(critical_missing)} essential weights starting with backbone./damage_head."
+            )
+
     model.to(device)
     model.eval()
     return model, model.use_gated_head
 
 
-def compute_tile_windows(raster_width: int, raster_height: int, tile_size: int):
-    """Non-overlapping tile windows covering the raster, row-major order."""
-    windows = []
-    for row_off in range(0, raster_height, tile_size):
-        h = min(tile_size, raster_height - row_off)
-        for col_off in range(0, raster_width, tile_size):
-            w = min(tile_size, raster_width - col_off)
-            windows.append(
-                rasterio.windows.Window(col_off, row_off, w, h)
-            )
-    return windows
+
+
 
 
 def rasterize_instance_masks(
@@ -300,6 +311,111 @@ def read_tile(raster, window: rasterio.windows.Window, tile_size: int) -> np.nda
     padded = np.zeros((3, tile_size, tile_size), dtype=data.dtype)
     padded[:, :h, :w] = data
     return padded
+
+
+def score_window(
+    model: torch.nn.Module,
+    use_gated: bool,
+    tile: np.ndarray,
+    masks: np.ndarray,
+    device: torch.device,
+    normalization: str = "unit",
+    masks_per_forward: Optional[int] = None,
+) -> np.ndarray:
+    """Score building masks on a single tile window with DamageTriageFormer.
+
+    Args:
+        model: Evaluated PyTorch DTF model.
+        use_gated: True if model uses gated head, False if severity head.
+        tile: (3, H, W) numpy array, uint8 [0..255] or float32.
+        masks: (N, H, W) numpy array of binary float masks.
+        device: torch.device ('cuda' or 'cpu').
+        normalization: 'unit' (/255.0) or 'imagenet' (standard mean/std).
+        masks_per_forward: Optional maximum masks per forward pass.
+
+    Returns:
+        np.ndarray: Probabilities array of shape (N, 5).
+    """
+    if len(masks) == 0:
+        return np.empty((0, len(DTF_CATEGORIES)), dtype=np.float32)
+
+    # Normalize tile
+    if normalization == "imagenet":
+        if tile.dtype == np.uint8:
+            tile_norm = normalize_tile(tile, mode="imagenet")
+        else:
+            t_uint8 = np.clip(
+                tile * 255.0 if tile.max() <= 1.0 else tile, 0, 255
+            ).astype(np.uint8)
+            tile_norm = normalize_tile(t_uint8, mode="imagenet")
+    else:
+        # 'unit' normalization (/255.0)
+        if tile.dtype == np.uint8:
+            tile_norm = tile.astype(np.float32) / 255.0
+        else:
+            tile_norm = tile.astype(np.float32)
+            if tile_norm.max() > 1.0:
+                tile_norm = tile_norm / 255.0
+
+    tile_t = torch.from_numpy(tile_norm).unsqueeze(0).to(device)
+
+    chunk_size = (
+        masks_per_forward
+        if (masks_per_forward and masks_per_forward > 0)
+        else len(masks)
+    )
+    all_probs = []
+    idx = 0
+
+    while idx < len(masks):
+        current_chunk_size = min(chunk_size, len(masks) - idx)
+        chunk_masks = masks[idx : idx + current_chunk_size]
+        masks_t = torch.from_numpy(chunk_masks).to(device)
+
+        try:
+            with torch.inference_mode():
+                _, damage_out = model(tile_t, [masks_t])
+                p = (
+                    decode_gated_predictions(damage_out)
+                    if use_gated
+                    else decode_severity_predictions(damage_out)
+                )
+                all_probs.append(p)
+                idx += current_chunk_size
+        except torch.cuda.OutOfMemoryError:
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            if current_chunk_size > 1:
+                chunk_size = max(1, current_chunk_size // 2)
+                logger.warning(
+                    "CUDA OOM on tile; reducing mask chunk size to %d and retrying",
+                    chunk_size,
+                )
+                continue
+            else:
+                logger.warning(
+                    "CUDA OOM at mask chunk size 1; retrying on CPU"
+                )
+                orig_device = next(model.parameters()).device
+                model.to("cpu")
+                try:
+                    with torch.inference_mode():
+                        _, damage_out = model(tile_t.cpu(), [masks_t.cpu()])
+                        p = (
+                            decode_gated_predictions(damage_out)
+                            if use_gated
+                            else decode_severity_predictions(damage_out)
+                        )
+                        all_probs.append(p)
+                        idx += current_chunk_size
+                finally:
+                    model.to(orig_device)
+
+    return (
+        np.vstack(all_probs)
+        if all_probs
+        else np.empty((0, len(DTF_CATEGORIES)), dtype=np.float32)
+    )
 
 
 def write_visualizer_rasters(
@@ -436,26 +552,15 @@ def run_damage_triage(
         if len(row_indices) == 0:
             continue
 
-        tile = read_tile(raster, window, tile_size).astype(np.float32) / 255.0
-        tile_t = torch.from_numpy(tile).unsqueeze(0).to(device)
-        masks_t = torch.from_numpy(masks).to(device)
-
-        with torch.inference_mode():
-            try:
-                _, damage_out = model(tile_t, [masks_t])
-            except torch.cuda.OutOfMemoryError:
-                torch.cuda.empty_cache()
-                logger.warning(
-                    f"CUDA OOM on tile {t_idx}; retrying on CPU"
-                )
-                model.to("cpu")
-                _, damage_out = model(tile_t.cpu(), [masks_t.cpu()])
-                model.to(device)
-            probs = (
-                decode_gated_predictions(damage_out)
-                if use_gated
-                else decode_severity_predictions(damage_out)
-            )
+        tile = read_tile(raster, window, tile_size)
+        probs = score_window(
+            model=model,
+            use_gated=use_gated,
+            tile=tile,
+            masks=masks,
+            device=device,
+            normalization="unit",
+        )
 
         classes = probs.argmax(axis=1)
         confs = probs.max(axis=1)

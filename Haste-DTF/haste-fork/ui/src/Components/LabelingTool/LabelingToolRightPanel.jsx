@@ -13,6 +13,7 @@ import { saveLabels, checkLabelsState } from "./LabelingToolHelper";
 import DrawingToolbar from "./DrawingToolbar";
 import AoiDrawTool from "./AoiDrawTool";
 import RunDtfAoiButton from "./RunDtfAoiButton";
+import AoiAssessmentModal from "./AoiAssessmentModal";
 import PropType from "prop-types";
 import { updateShape } from "./LabelingToolHelper";
 import ImportLabelsModal from "./ImportLabelsModal";
@@ -44,6 +45,9 @@ const LabelingToolRightPanel = ({
   setBuildingSelectActive,
   selectedBuildingIds,
   setSelectedBuildingIds,
+  assessmentId,
+  onAssessmentCreated,
+  setShowAssessmentDashboard,
 }) => {
   LabelingToolRightPanel.propTypes = {
     primaryClasses: PropType.array.isRequired,
@@ -70,6 +74,9 @@ const LabelingToolRightPanel = ({
     setBuildingSelectActive: PropType.func.isRequired,
     selectedBuildingIds: PropType.array.isRequired,
     setSelectedBuildingIds: PropType.func.isRequired,
+    assessmentId: PropType.string,
+    onAssessmentCreated: PropType.func,
+    setShowAssessmentDashboard: PropType.func,
   };
 
   function handleRunDtfAoi() {
@@ -81,6 +88,22 @@ const LabelingToolRightPanel = ({
         aoiGeoJson={aoiGeoJson}
         selectedBuildingIds={selectedBuildingIds}
         fetchProjectDetails={() => {}}
+      />
+    );
+  }
+
+  function handleRunLargeAoiAssessment() {
+    setModalComponent(
+      <AoiAssessmentModal
+        onClose={() => setModalComponent(null)}
+        projectId={projectId}
+        imageLayerId={imageLayerId}
+        aoiGeoJson={aoiGeoJson}
+        onAssessmentCreated={(newAssessmentId) => {
+          if (onAssessmentCreated) {
+            onAssessmentCreated(newAssessmentId);
+          }
+        }}
       />
     );
   }
@@ -442,6 +465,35 @@ const LabelingToolRightPanel = ({
             }
             onClick={handleRunDtfAoi}
           />
+
+          <PrimaryButton
+            id="runLargeAoiAssessmentButton"
+            className="w-100 mt-2"
+            text="Run Large-AOI Assessment"
+            disabled={!aoiGeoJson}
+            title={
+              !aoiGeoJson
+                ? "Draw an AOI polygon or rectangle first"
+                : "Launch batched large-AOI assessment"
+            }
+            onClick={handleRunLargeAoiAssessment}
+            styles={{
+              root: {
+                backgroundColor: "#0078d4",
+                borderColor: "#0078d4",
+              },
+            }}
+          />
+
+          {assessmentId ? (
+            <DefaultButton
+              id="viewAssessmentDashboardButton"
+              className="w-100 mt-2"
+              text="View Active Assessment"
+              iconProps={{ iconName: "BIDashboard" }}
+              onClick={() => setShowAssessmentDashboard && setShowAssessmentDashboard(true)}
+            />
+          ) : null}
         </div>
       </div>
       <input type="file" id="importGeoJSON" className="d-none" accept=".geojson" />

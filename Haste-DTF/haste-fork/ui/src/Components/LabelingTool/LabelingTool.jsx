@@ -12,7 +12,7 @@ import {
   AOI_DRAWING_MODE,
 } from "./LabelingToolHelper.js";
 import { getAzureMapsAuthOptions, isAzureMapsPlaceholder } from "../../util/azureMapsAuth";
-import { useParams } from "react-router-dom";
+import { useParams, useSearchParams } from "react-router-dom";
 import LabelingToolLeftPanel from "./LabelingToolLeftPanel.jsx";
 import LabelingToolRightPanel from "./LabelingToolRightPanel.jsx";
 import { setGuidedTourState, initGuidedTourState } from "../GuidedTourHelper.js";
@@ -21,6 +21,9 @@ import { AppContext } from "../../AppContext.jsx";
 import { useDrawingUndoRedo } from "./UndoRedo.jsx";
 import { splitShape } from "./SplitShape.jsx";
 import BuildingSelectTool from "./BuildingSelectTool.jsx";
+import AoiAssessmentDashboard from "./AoiAssessmentDashboard.jsx";
+import AoiAssessmentMapLayer from "./AoiAssessmentMapLayer.jsx";
+import BuildingAssessmentResultPanel from "./BuildingAssessmentResultPanel.jsx";
 
 const LabelingTool = ({ setModalComponent }) => {
   LabelingTool.propTypes = {
@@ -28,6 +31,8 @@ const LabelingTool = ({ setModalComponent }) => {
   };
 
   const { projectId, imageLayerId } = useParams();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const urlAssessmentId = searchParams.get("assessmentId");
 
   const {
     setDialog,
@@ -62,6 +67,26 @@ const LabelingTool = ({ setModalComponent }) => {
   const [selectedBuildingIds, setSelectedBuildingIds] = useState([]);
   const { undo, redo } = useDrawingUndoRedo(drawingManager, mapRef);
 
+  // Large-AOI Assessment workflow state
+  const [assessmentId, setAssessmentId] = useState(urlAssessmentId || null);
+  const [showAssessmentDashboard, setShowAssessmentDashboard] = useState(Boolean(urlAssessmentId));
+  const [selectedAssessmentBuilding, setSelectedAssessmentBuilding] = useState(null);
+  const [assessmentRefreshTrigger, setAssessmentRefreshTrigger] = useState(0);
+
+  const handleAssessmentCreated = (newId) => {
+    setAssessmentId(newId);
+    setShowAssessmentDashboard(true);
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.set("assessmentId", newId);
+      return next;
+    });
+  };
+
+  const handleCloseAssessment = () => {
+    setShowAssessmentDashboard(false);
+  };
+
   useEffect(() => {
     const initializeMap = async () => {
       if (window.atlas) {
@@ -94,8 +119,10 @@ const LabelingTool = ({ setModalComponent }) => {
     const handleDrawingChanged = (e) => {
       const mode = drawingManager.getOptions().mode;
       if (mode === "draw-polygon") {
-        createShape(drawingManager, selectedPrimaryClass, setDrawingCount);
-        setHasUnsavedChanges(true);
+        if (!drawingManager.isAoiDrawing) {
+          createShape(drawingManager, selectedPrimaryClass, setDrawingCount);
+          setHasUnsavedChanges(true);
+        }
       }
     };
 
@@ -138,13 +165,14 @@ const LabelingTool = ({ setModalComponent }) => {
         return;
       }
 
-      if (mode === AOI_DRAWING_MODE) {
-        // AOI is a spatial filter, not a damage label (plan.pdf Module 5):
+      if (mode === AOI_DRAWING_MODE || (mode === "draw-polygon" && drawingManager.isAoiDrawing)) {
+        // AOI is a spatial filter, not a damage label:
         // capture its geometry for the AOI-scoped DamageTriageFormer run
         // and remove it from the labeling shape source immediately so it
         // never gets saved/trained as a label, then hand the pointer back.
         setAoiGeoJson(e.toJson().geometry);
         drawingManager.source.remove(e);
+        drawingManager.isAoiDrawing = false;
         drawingManager.setOptions({ mode: "none" });
         return;
       }
@@ -340,6 +368,9 @@ const LabelingTool = ({ setModalComponent }) => {
               setBuildingSelectActive={setBuildingSelectActive}
               selectedBuildingIds={selectedBuildingIds}
               setSelectedBuildingIds={setSelectedBuildingIds}
+              assessmentId={assessmentId}
+              onAssessmentCreated={handleAssessmentCreated}
+              setShowAssessmentDashboard={setShowAssessmentDashboard}
             />
             <BuildingSelectTool
               mapRef={mapRef}
@@ -348,6 +379,26 @@ const LabelingTool = ({ setModalComponent }) => {
               active={buildingSelectActive}
               setSelectedBuildingIds={setSelectedBuildingIds}
             />
+            <AoiAssessmentMapLayer
+              mapRef={mapRef}
+              assessmentId={assessmentId}
+              onBuildingClick={(props) => setSelectedAssessmentBuilding(props)}
+              refreshTrigger={assessmentRefreshTrigger}
+            />
+            {showAssessmentDashboard && assessmentId ? (
+              <AoiAssessmentDashboard
+                assessmentId={assessmentId}
+                onClose={handleCloseAssessment}
+                onRefreshMap={() => setAssessmentRefreshTrigger((t) => t + 1)}
+              />
+            ) : null}
+            {selectedAssessmentBuilding ? (
+              <BuildingAssessmentResultPanel
+                imageLayerId={imageLayerId}
+                buildingProperties={selectedAssessmentBuilding}
+                onClose={() => setSelectedAssessmentBuilding(null)}
+              />
+            ) : null}
           </>
         ) : null}
       </div>

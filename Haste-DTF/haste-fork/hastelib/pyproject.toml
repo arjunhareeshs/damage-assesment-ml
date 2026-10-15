@@ -67,6 +67,7 @@ prepare-imagery = "hastegeo.workflows.prepare_imagery:main"
 zip-artifacts = "hastegeo.workflows.zip_artifacts:main"
 damage-triage-infer = "hastegeo.workflows.damage_triage_infer:main"
 damage-triage-aoi-infer = "hastegeo.workflows.damage_triage_aoi_infer:main"
+damage-triage-region-infer = "hastegeo.workflows.damage_triage_region_infer:main"
 
 [tool.hatch.version]
 path = "src/hastegeo/__about__.py"

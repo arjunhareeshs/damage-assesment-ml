@@ -4,7 +4,7 @@ import { useState } from "react";
 import PropTypes from "prop-types";
 import { FontIcon } from "@fluentui/react/lib/Icon";
 import "../../assets/css/drawingToolbar.css";
-import { AOI_DRAWING_MODE } from "./LabelingToolHelper.js";
+import { AOI_DRAWING_MODE, AOI_POLYGON_MODE } from "./LabelingToolHelper.js";
 
 const DrawingToolbar = ({ drawingManager, setDrawingManager, undo, redo }) => {
   DrawingToolbar.propTypes = {
@@ -65,16 +65,20 @@ const DrawingToolbar = ({ drawingManager, setDrawingManager, undo, redo }) => {
       id: "erase-geometry",
     },
     {
-      // AOI-scoped DamageTriageFormer (Option B, AOI-scoped —
-      // docs/OptionB_AOI_Integration_Plan.md Module 5). LabelingTool.jsx's
-      // handleDrawingComplete diverts this mode's resulting shape into
-      // aoiGeoJson instead of the labeling shape source, so it never gets
-      // saved/trained as a damage label.
+      // AOI-scoped DamageTriageFormer rectangle
       mode: AOI_DRAWING_MODE,
       label: <FontIcon iconName="MapLayers" />,
       disabled: false,
-      title: "Draw AOI (for DamageTriageFormer)",
+      title: "Draw AOI Rectangle (for DamageTriageFormer)",
       id: "draw-aoi",
+    },
+    {
+      // AOI-scoped DamageTriageFormer polygon
+      mode: AOI_POLYGON_MODE,
+      label: <FontIcon iconName="PolygonalShape" />,
+      disabled: false,
+      title: "Draw AOI Polygon (for DamageTriageFormer)",
+      id: "draw-aoi-polygon",
     },
   ];
 
@@ -82,6 +86,23 @@ const DrawingToolbar = ({ drawingManager, setDrawingManager, undo, redo }) => {
     if (isDisabled) return;
     if (!drawingManager) return;
 
+    if (mode === AOI_POLYGON_MODE) {
+      drawingManager.isAoiDrawing = true;
+      drawingManager.setOptions({ mode: "draw-polygon" });
+      setDrawingManager(drawingManager);
+      setActiveMode(mode);
+      return;
+    }
+
+    if (mode === AOI_DRAWING_MODE) {
+      drawingManager.isAoiDrawing = true;
+      drawingManager.setOptions({ mode: AOI_DRAWING_MODE });
+      setDrawingManager(drawingManager);
+      setActiveMode(mode);
+      return;
+    }
+
+    drawingManager.isAoiDrawing = false;
     drawingManager.setOptions({ mode });
     setDrawingManager(drawingManager);
     setActiveMode(mode);

@@ -85,6 +85,10 @@ RUN printf '#!/bin/bash\nexec python -m hastegeo.workflows.damage_triage_infer "
 RUN printf '#!/bin/bash\nexec python -m hastegeo.workflows.damage_triage_aoi_infer "$@"\n' > /usr/local/bin/damage-triage-aoi-infer \
 	&& chmod +x /usr/local/bin/damage-triage-aoi-infer
 
+# CLI shim for the batched Large-AOI DamageTriageFormer region inference workflow.
+RUN printf '#!/bin/bash\nexec python -m hastegeo.workflows.damage_triage_region_infer "$@"\n' > /usr/local/bin/damage-triage-region-infer \
+	&& chmod +x /usr/local/bin/damage-triage-region-infer
+
 # Prepare conda env directory owned by the target user, then extract the packed env
 # as that user — non-root tar uses the running user's UID/GID, so no chown -R needed.
 #

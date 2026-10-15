@@ -324,6 +324,22 @@ class LocalRunner(BaseRunner):
             for passthrough_key in (
                 "HASTE_USER_FOOTPRINTS_MAX_BYTES",
                 "HASTE_MAX_IMAGERY_DOWNLOAD_BYTES",
+                "HASTE_AOI_MAX_AREA_KM2",
+                "HASTE_AOI_MAX_UNITS",
+                "HASTE_DTF_NORMALIZATION",
+                "HASTE_REGION_WINDOWS_PER_BATCH",
+                "HASTE_REGION_MASKS_PER_FORWARD",
+                "HASTE_REGION_MAX_CONCURRENT_BATCHES",
+                "HASTE_REGION_MAX_ATTEMPTS",
+                "HASTE_REGION_LEASE_SECONDS",
+                "HASTE_REGION_MIN_VALID_FRACTION",
+                "HASTE_REGION_UNCERTAIN_CONFIDENCE",
+                "HASTE_FOOTPRINT_LOAD_CHUNK",
+                "HASTE_MAP_MAX_FEATURES",
+                "HASTE_MAP_FEATURE_MIN_ZOOM",
+                "DTF_CHECKPOINT_PATH",
+                "DTF_CHECKPOINT_CONFIG_PATH",
+                "DTF_BACKBONE_DIR",
             ):
                 passthrough_value = os.getenv(passthrough_key)
                 if passthrough_value:

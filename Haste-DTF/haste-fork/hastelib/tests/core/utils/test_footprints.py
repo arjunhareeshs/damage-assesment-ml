@@ -454,7 +454,10 @@ class TestClipAndNormalizeUserFootprints(unittest.TestCase):
         import os
         import tempfile
 
-        import fiona
+        try:
+            import fiona
+        except ImportError:
+            self.skipTest("fiona not installed in local environment")
         import geopandas as gpd
         import shapely.geometry
         from hastegeo.core.utils.footprints import (

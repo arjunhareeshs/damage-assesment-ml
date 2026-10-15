@@ -798,6 +798,41 @@ async def GetRunDTFAoiInferenceQueueMessage(msg: func.QueueMessage) -> None:
                 )
 
 
+@app.function_name(name="GetRunAoiAssessmentQueueTrigger")
+@app.queue_trigger(
+    arg_name="msg",
+    queue_name=config.get_queue_config()["assessment_queue_name"],
+    connection="AzureWebJobsStorage",
+)
+async def GetRunAoiAssessmentQueueMessage(msg: func.QueueMessage) -> None:
+    """Execute a batched large-AOI damage assessment cycle."""
+    logger.info(
+        "GetRunAoiAssessmentQueueTrigger function processed a message: "
+        f'{msg.get_body().decode("utf-8")}'
+    )
+    try:
+        body = json.loads(msg.get_body().decode("utf-8"))
+        assessment_id = body.get("assessment_id")
+        if not assessment_id:
+            logger.error("Missing assessment_id in queue message")
+            return
+
+        from hastegeo.core.processors.aoi_assessment import (
+            AoiAssessmentPostprocessor,
+        )
+
+        await asyncio.to_thread(
+            AoiAssessmentPostprocessor(
+                assessment_id=assessment_id, config=config
+            ).process
+        )
+    except Exception as e:
+        logger.error(
+            f"GetRunAoiAssessmentQueueTrigger error: {e}\n{traceback.format_exc()}",
+            stack_info=True,
+        )
+
+
 @app.function_name(name="GetRunInferenceQueueTrigger")
 @app.queue_trigger(
     arg_name="msg",

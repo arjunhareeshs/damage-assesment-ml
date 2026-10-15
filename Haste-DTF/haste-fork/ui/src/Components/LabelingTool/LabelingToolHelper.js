@@ -14,6 +14,31 @@ import { getAzureMapsAuthOptions, isAzureMapsPlaceholder } from "../../util/azur
 // mode) and DrawingToolbar.jsx (which offers the toolbar button) so the
 // two never drift out of sync.
 export const AOI_DRAWING_MODE = "draw-rectangle";
+export const AOI_POLYGON_MODE = "draw-polygon-aoi";
+
+// DamageTriageFormer 5-class damage classification scale and colors
+export const DTF_CATEGORIES = [
+  "Undamaged",
+  "Partial Roof Damage",
+  "Total Roof Damage",
+  "Partial Structural Collapse",
+  "Total Structural Collapse",
+];
+
+export const DTF_CLASS_COLORS = [
+  "#ffffff", // 0: Undamaged
+  "#fcbea5", // 1: Partial Roof Damage
+  "#fb7050", // 2: Total Roof Damage
+  "#d32020", // 3: Partial Structural Collapse
+  "#67000d", // 4: Total Structural Collapse
+];
+
+export const RESULT_STATUS_COLORS = {
+  completed: "#4caf50",
+  uncertain: "#ff9800",
+  insufficient_data: "#9e9e9e",
+  failed: "#e53935",
+};
 
 export function createShape(drawingManager, selectedPrimaryClass, setDrawingCount) {
   const source = drawingManager.getSource();

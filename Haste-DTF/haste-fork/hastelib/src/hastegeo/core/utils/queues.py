@@ -1,11 +1,20 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
-from azure.identity import DefaultAzureCredential  # type: ignore
-from azure.storage.queue import QueueServiceClient  # type: ignore
+try:
+    from azure.identity import DefaultAzureCredential  # type: ignore
+    from azure.storage.queue import QueueServiceClient  # type: ignore
+except ImportError:
+    DefaultAzureCredential = None
+    QueueServiceClient = None
 
 
 class AzureQueueHandler:
     def __init__(self, connection_string, queue_name, account_url):
+        if QueueServiceClient is None:
+            raise ImportError(
+                "azure-storage-queue / azure-identity are not installed; "
+                "AzureQueueHandler cannot connect to a queue."
+            )
         if connection_string:
             self.queue_service_client = (
                 QueueServiceClient.from_connection_string(connection_string)

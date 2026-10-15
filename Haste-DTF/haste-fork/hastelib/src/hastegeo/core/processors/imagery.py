@@ -294,6 +294,10 @@ class ImageryPostProcessor:
             "user_building_footprints_url": (
                 self.image_data.userBuildingFootprintsUrl
             ),
+            # One COG per source TIF in the imagery catalogue (large-AOI
+            # assessments) instead of only the mosaic. Off by default.
+            "catalog_mode": os.getenv("HASTE_IMAGERY_CATALOG_MODE", "").lower()
+            in ("1", "true", "yes"),
         }
         self.storage.save(
             identifier=self.image_data.imageLayerId,
@@ -496,6 +500,7 @@ class ImageryPostProcessor:
         )
         if building_footprints_filename and not building_footprints_error:
             self._load_footprints_into_postgis(building_footprints_filename)
+        self._register_imagery_catalog(processed_manifest.get("catalog_records", []))
         if building_footprints_error:
             self.image_data.status = (
                 self.config.get_status_types().FAILED.value
@@ -568,6 +573,45 @@ class ImageryPostProcessor:
                 "Failed loading building footprints into PostGIS for "
                 "image layer %s (AOI-scoped DamageTriageFormer runs will "
                 "see no buildings until this is retried): %s",
+                self.image_data.imageLayerId,
+                exc,
+                exc_info=True,
+            )
+
+    def _register_imagery_catalog(self, catalog_records):
+        """Register this layer's catalogued rasters in ``hg_imagery``.
+
+        ``catalog_records`` come from ``imagery_manifest.json``: header
+        metadata written by the imageryprep task, which cannot reach the
+        database. Like the footprints load above, a failure is logged and
+        does not fail the image layer; only large-AOI assessments need the
+        catalogue.
+        """
+        if not catalog_records:
+            return
+        try:
+            from ..utils.imagery_catalog import register_imagery_record
+
+            for rec in catalog_records:
+                url = self._generate_imagery_url(
+                    filename=rec["filename"],
+                    imagery_type=self.config.get_artifact_types().POST_EVENT_MOSAIC,
+                )
+                register_imagery_record(
+                    image_layer_id=self.image_data.imageLayerId,
+                    project_id=self.image_data.projectId,
+                    file_uri=url,
+                    meta=rec["meta"],
+                )
+            self.logger.info(
+                "Registered %d raster(s) in hg_imagery for image layer %s",
+                len(catalog_records),
+                self.image_data.imageLayerId,
+            )
+        except Exception as exc:
+            self.logger.error(
+                "Failed registering imagery catalogue for image layer %s "
+                "(large-AOI assessments will find no imagery): %s",
                 self.image_data.imageLayerId,
                 exc,
                 exc_info=True,

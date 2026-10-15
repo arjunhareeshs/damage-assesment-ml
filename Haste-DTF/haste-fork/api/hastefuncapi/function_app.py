@@ -4627,3 +4627,425 @@ async def GetAssessmentReport(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse(
             "Error generating assessment report.", status_code=500
         )
+
+
+# ==============================================================================
+# LARGE-AOI DAMAGE ASSESSMENT ENDPOINTS (Option B)
+# ==============================================================================
+# AOI-first, batched assessment (docs/haste-advancement/). Submitting
+# creates an hg_assessments row and queues it for
+# AoiAssessmentPostprocessor (hastefuncqueues); every other route only
+# reads stored results and never starts inference.
+
+_ASSESSMENT_ID_RE = re.compile(r"^ast-[0-9a-fA-F-]{1,64}$")
+_MAX_PAGE_SIZE = 500
+
+
+def _assessment_id_param(req: func.HttpRequest) -> str:
+    """assessmentId from the query string, validated, or raise ValueError."""
+    value = req.params.get("assessmentId")
+    if not value or not _ASSESSMENT_ID_RE.match(value):
+        raise ValueError("assessmentId is missing or malformed.")
+    return value
+
+
+def _bbox_param(req: func.HttpRequest):
+    """Optional bbox=minx,miny,maxx,maxy (EPSG:4326), or raise ValueError."""
+    raw = req.params.get("bbox")
+    if not raw:
+        return None
+    parts = [float(x.strip()) for x in raw.split(",")]
+    if len(parts) != 4:
+        raise ValueError("bbox must be minx,miny,maxx,maxy.")
+    minx, miny, maxx, maxy = parts
+    if not (-180 <= minx < maxx <= 180 and -90 <= miny < maxy <= 90):
+        raise ValueError("bbox is out of range or inverted.")
+    return (minx, miny, maxx, maxy)
+
+
+def _aoi_max_area_km2() -> float:
+    raw = os.getenv("HASTE_AOI_MAX_AREA_KM2")
+    if not raw:
+        raise RuntimeError(
+            "HASTE_AOI_MAX_AREA_KM2 is not configured on the API; set it in "
+            "docker/.env (see .env.example)."
+        )
+    return float(raw)
+
+
+def _json_response(payload, status_code: int = 200) -> func.HttpResponse:
+    return func.HttpResponse(
+        json.dumps(payload), status_code=status_code, mimetype="application/json"
+    )
+
+
+@app.route(
+    route="PutAoiAssessment",
+    auth_level=AUTH_LEVEL,
+    methods=["PUT"],
+)
+async def PutAoiAssessment(req: func.HttpRequest) -> func.HttpResponse:
+    """Submit a large-AOI batched building damage assessment.
+
+    Body: { projectId, imageLayerId, aoi, eventId?, name? }
+    ``aoi`` is a GeoJSON Polygon/MultiPolygon (or a Feature wrapping one)
+    in EPSG:4326. Returns the new assessment id with unknown (null) counts;
+    discovery and processing run asynchronously.
+    """
+    logger.info("PutAoiAssessment HTTP trigger function processed a request.")
+    from hastegeo.core.processors.aoi_assessment import AoiAssessmentPreprocessor
+    from hastegeo.core.utils import assessment_store
+    from hastegeo.core.utils.aoi_validate import validate_aoi
+    from hastegeo.core.utils.dtf_constants import DTF_HF_MODEL_ID
+    from hastegeo.core.utils.dtf_preprocess import PREPROCESSING_VERSION
+    from shapely.geometry import mapping
+
+    try:
+        body = req.get_json()
+    except ValueError:
+        return func.HttpResponse("Invalid JSON in request body.", status_code=400)
+
+    project_id = body.get("projectId")
+    image_layer_id = body.get("imageLayerId")
+    aoi = body.get("aoi")
+    if not project_id or not image_layer_id:
+        return func.HttpResponse(
+            "projectId and imageLayerId are required.", status_code=400
+        )
+    if not aoi:
+        return func.HttpResponse("aoi GeoJSON is required.", status_code=400)
+
+    try:
+        max_area_km2 = _aoi_max_area_km2()
+        try:
+            aoi_geom, area_km2 = validate_aoi(aoi, max_area_km2=max_area_km2)
+        except ValueError as val_err:
+            return func.HttpResponse(f"Invalid AOI: {val_err}", status_code=400)
+
+        # Resolved parameters are frozen into the assessment so a later
+        # environment change cannot alter a running job.
+        ast_config = {
+            "max_units": config.aoi_max_units,
+            "windows_per_batch": config.region_windows_per_batch,
+            "masks_per_forward": config.region_masks_per_forward,
+            "max_concurrent_batches": config.region_max_concurrent_batches,
+            "max_attempts": config.region_max_attempts,
+            "lease_seconds": config.region_lease_seconds,
+            "min_valid_pixel_fraction": config.region_min_valid_fraction,
+            "uncertain_confidence_threshold": config.region_uncertain_confidence,
+            "normalization": config.dtf_normalization,
+            "inclusion_policy": "intersects_aoi",
+        }
+        principal = _decode_client_principal(req) or {}
+        assessment_id = f"ast-{MetadataUtils.generate_id()}"
+        record = {
+            "assessment_id": assessment_id,
+            "project_id": project_id,
+            "image_layer_id": image_layer_id,
+            "event_id": body.get("eventId"),
+            "name": body.get("name") or f"Assessment {assessment_id}",
+            # Store the validated geometry itself (never a Feature wrapper).
+            "aoi_geometry": mapping(aoi_geom),
+            "aoi_area_km2": area_km2,
+            "inclusion_policy": "intersects_aoi",
+            "status": "submitted",
+            "config": ast_config,
+            "model_repo": DTF_HF_MODEL_ID,
+            "model_digest": None,
+            "preprocessing_version": PREPROCESSING_VERSION,
+            "submitted_by": principal.get("userDetails") or principal.get("userId"),
+        }
+        await asyncio.to_thread(assessment_store.create_assessment, record)
+        await asyncio.to_thread(AoiAssessmentPreprocessor(assessment_id).send_to_queue)
+
+        return _json_response(
+            {
+                "assessmentId": assessment_id,
+                "status": "submitted",
+                "eligibleBuildings": None,
+                "totalUnits": None,
+                "completedUnits": 0,
+                "failedUnits": 0,
+            }
+        )
+    except Exception as e:
+        logger.error(
+            f"PutAoiAssessment error: {e}\n{traceback.format_exc()}", stack_info=True
+        )
+        return func.HttpResponse("Error submitting assessment.", status_code=500)
+
+
+@app.route(
+    route="GetAoiAssessment",
+    auth_level=AUTH_LEVEL,
+    methods=["GET"],
+)
+async def GetAoiAssessment(req: func.HttpRequest) -> func.HttpResponse:
+    """Status, counts, error and versions of one assessment."""
+    from hastegeo.core.utils import assessment_store
+
+    try:
+        assessment_id = _assessment_id_param(req)
+    except ValueError as e:
+        return func.HttpResponse(str(e), status_code=400)
+
+    try:
+        ast = await asyncio.to_thread(assessment_store.get_assessment, assessment_id)
+        if not ast:
+            return func.HttpResponse("Assessment not found.", status_code=404)
+        return _json_response(
+            {
+                "assessmentId": ast["assessment_id"],
+                "projectId": ast["project_id"],
+                "imageLayerId": ast["image_layer_id"],
+                "eventId": ast.get("event_id"),
+                "name": ast.get("name"),
+                "status": ast["status"],
+                "aoiAreaKm2": ast.get("aoi_area_km2"),
+                "eligibleBuildings": ast.get("eligible_buildings"),
+                "totalUnits": ast.get("total_units"),
+                "completedUnits": ast.get("completed_units", 0),
+                "failedUnits": ast.get("failed_units", 0),
+                "error": ast.get("error"),
+                "config": ast.get("config"),
+                "versions": {
+                    "modelRepo": ast.get("model_repo"),
+                    "modelDigest": ast.get("model_digest"),
+                    "preprocessingVersion": ast.get("preprocessing_version"),
+                },
+                # get_assessment already returns ISO-8601 strings
+                "createdAt": ast.get("created_at"),
+                "updatedAt": ast.get("updated_at"),
+                "completedAt": ast.get("completed_at"),
+            }
+        )
+    except Exception as e:
+        logger.error(
+            f"GetAoiAssessment error: {e}\n{traceback.format_exc()}", stack_info=True
+        )
+        return func.HttpResponse("Error retrieving assessment.", status_code=500)
+
+
+@app.route(
+    route="PutCancelAoiAssessment",
+    auth_level=AUTH_LEVEL,
+    methods=["PUT"],
+)
+async def PutCancelAoiAssessment(req: func.HttpRequest) -> func.HttpResponse:
+    """Request cancellation. No new batches start; running tasks are stopped
+    by the queue worker; stored rows are kept."""
+    from hastegeo.core.processors.aoi_assessment import AoiAssessmentPreprocessor
+    from hastegeo.core.utils import assessment_store
+
+    try:
+        body = req.get_json()
+    except ValueError:
+        return func.HttpResponse("Invalid JSON in request body.", status_code=400)
+    assessment_id = body.get("assessmentId")
+    if not assessment_id or not _ASSESSMENT_ID_RE.match(str(assessment_id)):
+        return func.HttpResponse("assessmentId is missing or malformed.", status_code=400)
+
+    try:
+        ast = await asyncio.to_thread(assessment_store.get_assessment, assessment_id)
+        if not ast:
+            return func.HttpResponse("Assessment not found.", status_code=404)
+        if ast["status"] in assessment_store.TERMINAL_STATUSES:
+            return func.HttpResponse(
+                f"Assessment already finished with status {ast['status']}.",
+                status_code=409,
+            )
+        await asyncio.to_thread(
+            assessment_store.update_assessment_status, assessment_id, "cancelling"
+        )
+        await asyncio.to_thread(AoiAssessmentPreprocessor(assessment_id).send_to_queue)
+        return _json_response({"assessmentId": assessment_id, "status": "cancelling"})
+    except Exception as e:
+        logger.error(
+            f"PutCancelAoiAssessment error: {e}\n{traceback.format_exc()}",
+            stack_info=True,
+        )
+        return func.HttpResponse("Error cancelling assessment.", status_code=500)
+
+
+@app.route(
+    route="GetAoiAssessmentPreview",
+    auth_level=AUTH_LEVEL,
+    methods=["POST"],
+)
+async def GetAoiAssessmentPreview(req: func.HttpRequest) -> func.HttpResponse:
+    """Area, catalogued TIF count and building count for an AOI. Read-only."""
+    from hastegeo.core.utils.aoi_validate import validate_aoi
+    from hastegeo.core.utils.imagery_catalog import imagery_for_aoi
+    from shapely.geometry import mapping
+
+    try:
+        body = req.get_json()
+    except ValueError:
+        return func.HttpResponse("Invalid JSON in request body.", status_code=400)
+    image_layer_id = body.get("imageLayerId")
+    aoi = body.get("aoi")
+    if not image_layer_id or not aoi:
+        return func.HttpResponse("imageLayerId and aoi are required.", status_code=400)
+
+    try:
+        try:
+            aoi_geom, area_km2 = validate_aoi(aoi, max_area_km2=_aoi_max_area_km2())
+        except ValueError as val_err:
+            return func.HttpResponse(f"Invalid AOI: {val_err}", status_code=400)
+        aoi_json = mapping(aoi_geom)
+        imagery = await asyncio.to_thread(imagery_for_aoi, image_layer_id, aoi_json)
+        bldg_count = await asyncio.to_thread(
+            postgis_query.count_buildings_in_aoi, image_layer_id, aoi_json
+        )
+        return _json_response(
+            {
+                "areaKm2": round(area_km2, 4),
+                "imageryCount": len(imagery),
+                "buildingCount": bldg_count,
+            }
+        )
+    except Exception as e:
+        logger.error(
+            f"GetAoiAssessmentPreview error: {e}\n{traceback.format_exc()}",
+            stack_info=True,
+        )
+        return func.HttpResponse("Error computing preview.", status_code=500)
+
+
+@app.route(
+    route="GetAoiAssessmentBuildings",
+    auth_level=AUTH_LEVEL,
+    methods=["GET"],
+)
+async def GetAoiAssessmentBuildings(req: func.HttpRequest) -> func.HttpResponse:
+    """Paged building results (with geometry) for one assessment."""
+    from hastegeo.core.utils import assessment_store
+
+    try:
+        assessment_id = _assessment_id_param(req)
+        bbox = _bbox_param(req)
+        page = int(req.params.get("page", "1"))
+        page_size = int(req.params.get("pageSize", "50"))
+        if page < 1 or not 1 <= page_size <= _MAX_PAGE_SIZE:
+            raise ValueError(f"page >= 1 and 1 <= pageSize <= {_MAX_PAGE_SIZE} required.")
+    except ValueError as e:
+        return func.HttpResponse(str(e), status_code=400)
+
+    try:
+        total, buildings = await asyncio.to_thread(
+            assessment_store.get_assessment_buildings_paged,
+            assessment_id,
+            bbox=bbox,
+            page=page,
+            page_size=page_size,
+        )
+        return _json_response(
+            {
+                "assessmentId": assessment_id,
+                "page": page,
+                "pageSize": page_size,
+                "total": total,
+                "buildings": buildings,
+            }
+        )
+    except Exception as e:
+        logger.error(
+            f"GetAoiAssessmentBuildings error: {e}\n{traceback.format_exc()}",
+            stack_info=True,
+        )
+        return func.HttpResponse("Error retrieving buildings.", status_code=500)
+
+
+@app.route(
+    route="GetAoiAssessmentStatistics",
+    auth_level=AUTH_LEVEL,
+    methods=["GET"],
+)
+async def GetAoiAssessmentStatistics(req: func.HttpRequest) -> func.HttpResponse:
+    """Counts per damage class and per result status."""
+    from hastegeo.core.utils import assessment_store
+
+    try:
+        assessment_id = _assessment_id_param(req)
+    except ValueError as e:
+        return func.HttpResponse(str(e), status_code=400)
+
+    try:
+        stats = await asyncio.to_thread(
+            assessment_store.get_assessment_statistics, assessment_id
+        )
+        return _json_response(stats)
+    except Exception as e:
+        logger.error(
+            f"GetAoiAssessmentStatistics error: {e}\n{traceback.format_exc()}",
+            stack_info=True,
+        )
+        return func.HttpResponse("Error calculating statistics.", status_code=500)
+
+
+@app.route(
+    route="GetAoiAssessmentMapData",
+    auth_level=AUTH_LEVEL,
+    methods=["GET"],
+)
+async def GetAoiAssessmentMapData(req: func.HttpRequest) -> func.HttpResponse:
+    """Viewport map data: grid aggregates below HASTE_MAP_FEATURE_MIN_ZOOM,
+    building features (capped at HASTE_MAP_MAX_FEATURES) at or above it."""
+    from hastegeo.core.utils import assessment_store
+
+    try:
+        assessment_id = _assessment_id_param(req)
+        bbox = _bbox_param(req)
+        if bbox is None:
+            raise ValueError("bbox is required.")
+        zoom = int(float(req.params.get("zoom", "")))
+    except ValueError as e:
+        return func.HttpResponse(str(e) or "zoom is required.", status_code=400)
+
+    try:
+        map_data = await asyncio.to_thread(
+            assessment_store.get_assessment_map_data,
+            assessment_id,
+            bbox=bbox,
+            zoom=zoom,
+            min_zoom=config.map_feature_min_zoom,
+            max_features=config.map_max_features,
+        )
+        return _json_response(map_data)
+    except Exception as e:
+        logger.error(
+            f"GetAoiAssessmentMapData error: {e}\n{traceback.format_exc()}",
+            stack_info=True,
+        )
+        return func.HttpResponse("Error retrieving map data.", status_code=500)
+
+
+@app.route(
+    route="GetBuildingAssessmentHistory",
+    auth_level=AUTH_LEVEL,
+    methods=["GET"],
+)
+async def GetBuildingAssessmentHistory(req: func.HttpRequest) -> func.HttpResponse:
+    """One building's stored results across all assessments, newest first."""
+    from hastegeo.core.utils import assessment_store
+
+    image_layer_id = req.params.get("imageLayerId")
+    building_id = req.params.get("buildingId")
+    if not image_layer_id or not building_id:
+        return func.HttpResponse(
+            "imageLayerId and buildingId parameters are required.", status_code=400
+        )
+
+    try:
+        history = await asyncio.to_thread(
+            assessment_store.get_building_history, image_layer_id, building_id
+        )
+        return _json_response(
+            {"imageLayerId": image_layer_id, "buildingId": building_id, "history": history}
+        )
+    except Exception as e:
+        logger.error(
+            f"GetBuildingAssessmentHistory error: {e}\n{traceback.format_exc()}",
+            stack_info=True,
+        )
+        return func.HttpResponse("Error retrieving building history.", status_code=500)

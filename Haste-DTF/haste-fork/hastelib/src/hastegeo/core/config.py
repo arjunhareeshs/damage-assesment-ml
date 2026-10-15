@@ -229,6 +229,64 @@ class Config:
             self.artifact_storage_type
         )
 
+    @property
+    def aoi_max_area_km2(self) -> float | None:
+        val = os.getenv("HASTE_AOI_MAX_AREA_KM2")
+        return float(val) if val else None
+
+    @property
+    def aoi_max_units(self) -> int | None:
+        val = os.getenv("HASTE_AOI_MAX_UNITS")
+        return int(val) if val else None
+
+    @property
+    def dtf_normalization(self) -> str:
+        return os.getenv("HASTE_DTF_NORMALIZATION", "imagenet")
+
+    @property
+    def region_windows_per_batch(self) -> int | None:
+        val = os.getenv("HASTE_REGION_WINDOWS_PER_BATCH")
+        return int(val) if val else None
+
+    @property
+    def region_masks_per_forward(self) -> int | None:
+        val = os.getenv("HASTE_REGION_MASKS_PER_FORWARD")
+        return int(val) if val else None
+
+    @property
+    def region_max_concurrent_batches(self) -> int:
+        return int(os.getenv("HASTE_REGION_MAX_CONCURRENT_BATCHES", "1"))
+
+    @property
+    def region_max_attempts(self) -> int:
+        return int(os.getenv("HASTE_REGION_MAX_ATTEMPTS", "3"))
+
+    @property
+    def region_lease_seconds(self) -> int | None:
+        val = os.getenv("HASTE_REGION_LEASE_SECONDS")
+        return int(val) if val else None
+
+    @property
+    def region_min_valid_fraction(self) -> float:
+        return float(os.getenv("HASTE_REGION_MIN_VALID_FRACTION", "0.5"))
+
+    @property
+    def region_uncertain_confidence(self) -> float | None:
+        val = os.getenv("HASTE_REGION_UNCERTAIN_CONFIDENCE")
+        return float(val) if val else None
+
+    @property
+    def footprint_load_chunk(self) -> int:
+        return int(os.getenv("HASTE_FOOTPRINT_LOAD_CHUNK", "50000"))
+
+    @property
+    def map_max_features(self) -> int:
+        return int(os.getenv("HASTE_MAP_MAX_FEATURES", "5000"))
+
+    @property
+    def map_feature_min_zoom(self) -> int:
+        return int(os.getenv("HASTE_MAP_FEATURE_MIN_ZOOM", "14"))
+
     def _get_storage_config(self, storage_type=None):
         """Get storage configuration for the specified storage type.
 
@@ -277,6 +335,9 @@ class Config:
             "dtf_aoi_queue_name": os.getenv(
                 "DTF_AOI_QUEUE_NAME", "dtf-aoi-inference"
             ),
+            "assessment_queue_name": os.getenv(
+                "ASSESSMENT_QUEUE_NAME", "local-assessment-queue"
+            ),
         }
 
     @staticmethod
@@ -310,6 +371,8 @@ class Config:
             EMBEDDING_CONFIG = "embedding_config"
             DTF_CONFIG = "dtf_config"
             DTF_AOI_CONFIG = "dtf_aoi_config"
+            AOI_ASSESSMENT = "aoi_assessment"
+            AOI_ASSESSMENT_CONFIG = "aoi_assessment_config"
             PROCESSED_IMAGERY = "processed_imagery_post_event_cog"
             RAW_IMAGERY = "raw_imagery"
             PREVIEW_RAW_IMAGERY = "preview_raw_imagery"
