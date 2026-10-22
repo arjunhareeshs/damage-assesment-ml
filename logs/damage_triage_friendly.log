@@ -1,5 +1,0 @@
-2026-07-30T04:40:59.215219+00:00|Reading footprints from C:\ssgprojects\MLproject\Damage assesment\damage-assesment-ml\data\footprint\Texas.geojson\Texas.geojson
-2026-07-30T04:41:39.007586+00:00|Reading footprints from C:\ssgprojects\MLproject\Damage assesment\damage-assesment-ml\data\footprint\Texas.geojson\Texas.geojson
-2026-07-30T04:53:35.786331+00:00|10678921 footprints loaded (CRS: EPSG:4326)
-2026-07-30T04:53:35.790843+00:00|Loading DamageTriageFormer checkpoint on cpu...
-                                                                                                                                                                    
