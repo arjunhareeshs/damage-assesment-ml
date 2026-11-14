@@ -28,6 +28,10 @@ DTF_CATEGORIES = [
     "Partial Structural Collapse",
     "Total Structural Collapse",
 ]
+# Hex fill per class index; must match DTF_CLASS_COLORS in the UI
+# (LabelingToolHelper.js) and DTF_IDX_TO_COLOR in damage_triage_infer.py.
+DTF_CLASS_COLORS = ["#ffffff", "#fcbea5", "#fb7050", "#d32020", "#67000d"]
+DTF_UNKNOWN_COLOR = "#b0bec5"
 DTF_IM_SIZE = 1024
 UNCLASSIFIED = -1
 

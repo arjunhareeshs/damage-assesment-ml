@@ -1,6 +1,5 @@
 import { useEffect, useState } from "react";
 import { ChoiceGroup, PrimaryButton } from "@fluentui/react";
-import CreateEditModelTrainingModal from "../CreateEditModelTrainingModal";
 import { saveLabels } from "./LabelingToolHelper";
 import DrawingToolbar from "./DrawingToolbar";
 import PropType from "prop-types";
@@ -16,9 +15,6 @@ const RightPanel = ({
   labelingToolDataRef,
   setIsLoading,
   setHasUnsavedChanges,
-  setModalComponent,
-  projectId,
-  drawingCount,
   selectedShape,
 }) => {
   RightPanel.propTypes = {
@@ -31,9 +27,6 @@ const RightPanel = ({
     labelingToolDataRef: PropType.object.isRequired,
     setIsLoading: PropType.func.isRequired,
     setHasUnsavedChanges: PropType.func.isRequired,
-    setModalComponent: PropType.func.isRequired,
-    projectId: PropType.string.isRequired,
-    drawingCount: PropType.number.isRequired,
     selectedShape: PropType.object,
   };
 
@@ -107,55 +100,6 @@ const RightPanel = ({
     }
   }
 
-  async function handleSaveAndTrain() {
-    const isSaved = await saveLabels(
-      drawingManager,
-      labelingToolDataRef,
-      setIsLoading,
-      setHasUnsavedChanges
-    );
-
-    if (!isSaved) {
-      const buttons = [
-        {
-          type: "primary",
-          key: "close",
-          text: "Close",
-          onClick: () => {
-            setDialog("", "", []);
-          },
-        },
-      ];
-
-      setDialog("Important", "There was an error saving the labels", buttons);
-    } else {
-      setModalComponent(
-        <CreateEditModelTrainingModal
-          onClose={() => setModalComponent(null)}
-          projectId={projectId}
-          imageLayer={labelingToolDataRef.current}
-          guidedTour="createEditModelTrainingModalGuide"
-          autoLaunchGuidedTour={true}
-        />
-      );
-    }
-  }
-
-  const labelSavingMenuOptions = () => ({
-    items: [
-      {
-        key: "saveAndTrain",
-        text: "Save and Train",
-        iconProps: { iconName: "SaveAndClose" },
-        title: drawingCount === 0 && "Training requires at least one label",
-        disabled: drawingCount === 0,
-        onClick: () => {
-          handleSaveAndTrain();
-        },
-      },
-    ],
-  });
-
   return (
     <>
       <DrawingToolbar drawingManager={drawingManager} setDrawingManager={setDrawingManager} />
@@ -186,9 +130,7 @@ const RightPanel = ({
         <div className="col-12 d-flex mt-2 flex-column pt-2 pb-2">
           <PrimaryButton
             id="saveAndTrainButton"
-            split
             iconProps={{ iconName: "Save" }}
-            menuProps={labelSavingMenuOptions()}
             className="w-100"
             text="Save"
             onClick={async () => {

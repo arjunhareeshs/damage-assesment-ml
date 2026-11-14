@@ -28,18 +28,33 @@ USER root
 # Create non-root user before COPY so --chown can reference it
 RUN groupadd -r appgroup && useradd -r -g appgroup -m -s /bin/bash appuser
 
-# Copy files with correct ownership at copy time (avoids chown -R after the fact)
-COPY --chown=appuser:appgroup hastelib/src/hastegeo /app/hastegeo
-COPY --chown=appuser:appgroup docker/imageryprep/scripts /app/scripts/
+# Only the requirements file before the installs: copying the source code
+# here would invalidate the pip layers below on every code change and
+# re-download ~500 MB of packages. The code is copied after them.
 COPY --chown=appuser:appgroup docker/imageryprep/requirements.txt /app/
 
-# CUDA 12.4 torch wheel first (own layer, own index), matching training's TORCH_VARIANT default.
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu124
+# torch (CUDA 12.4 wheel by default, own layer, own index), matching training's
+# TORCH_VARIANT default. Nothing this image runs (prepare_imagery,
+# zip_artifacts) imports torch -- the model workflows run in haste-training --
+# so the host-CUDA build passes TORCH_VARIANT=none and skips the ~3 GB of
+# torch + nvidia/* wheels entirely. `cpu` installs the small CPU wheel.
+ARG TORCH_VARIANT=cu124
+RUN if [ "$TORCH_VARIANT" = "none" ] || [ "$TORCH_VARIANT" = "host" ]; then \
+        echo "TORCH_VARIANT=$TORCH_VARIANT: not installing torch"; \
+    else \
+        pip install --no-cache-dir --retries 10 --timeout 120 torch \
+            --index-url "https://download.pytorch.org/whl/${TORCH_VARIANT}"; \
+    fi
 
 # Install dependencies (no need to install haste package since we copy source directly)
 # --no-cache-dir: without it the downloaded wheels (~500 MB, incl. the GDAL
 # and opencv manylinux wheels) are baked into this layer and shipped.
 RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# Source code last, so editing it rebuilds in seconds (ownership set at copy
+# time, which avoids a chown -R afterwards).
+COPY --chown=appuser:appgroup hastelib/src/hastegeo /app/hastegeo
+COPY --chown=appuser:appgroup docker/imageryprep/scripts /app/scripts/
 
 # Provide CLI entrypoints expected by the workflows without requiring a separate package install
 RUN printf '#!/bin/bash\nexec python -m hastegeo.workflows.prepare_imagery "$@"\n' > /usr/local/bin/prepare-imagery \

@@ -1,6 +1,12 @@
-# syntax=docker/dockerfile:1.7
+# Base image. The default bundles the CUDA 12.4 toolkit (~5.3 GB compressed),
+# which Azure Batch GPU nodes need. The host-CUDA build
+# (docker-compose.hostcuda.yml) passes the CPU-only sibling instead
+# (~0.5 GB, same dockeruser + /opt/miniconda layout) and borrows CUDA from
+# the host at runtime -- see TORCH_VARIANT=host below.
+ARG BASE_IMAGE=mcr.microsoft.com/azureml/curated/minimal-py312-cuda12.4-inference
+
 # ---------- Stage 1: Build Conda Environment ----------
-FROM mcr.microsoft.com/azureml/curated/minimal-py312-cuda12.4-inference AS conda-env
+FROM ${BASE_IMAGE} AS conda-env
 
 USER root
 
@@ -12,6 +18,10 @@ USER root
 # /opt/miniconda/envs/bda, where the later `conda-pack -n bda` looks for it.
 ENV MAMBA_ROOT_PREFIX=/opt/miniconda
 
+# Every pip call in this stage (env.yml's pip section included) retries and
+# waits instead of aborting a multi-GB download on the first dropped read.
+ENV PIP_RETRIES=10 PIP_DEFAULT_TIMEOUT=120
+
 # Install micromamba and conda-pack (micromamba avoids Python version conflicts).
 # Install conda-pack with micromamba rather than the base image's `conda`: a
 # plain `conda install conda-pack` also drags in a conda self-upgrade (26.5.0 ->
@@ -19,7 +29,7 @@ ENV MAMBA_ROOT_PREFIX=/opt/miniconda
 # (ModuleNotFoundError: No module named 'conda'). micromamba installs conda-pack
 # into the same /opt/miniconda prefix without touching/upgrading conda.
 RUN for i in 1 2 3 4 5; do \
-		apt-get update && apt-get install -y --no-install-recommends libgl1-mesa-glx curl && break || sleep 15; \
+		apt-get update && apt-get install -y --no-install-recommends libgl1-mesa-glx curl ca-certificates && break || sleep 15; \
 	done \
 	&& rm -rf /var/lib/apt/lists/* \
 	&& curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xvj -C /usr/local bin/micromamba \
@@ -35,8 +45,19 @@ COPY docker/training/env/env.yml /tmp/env.yml
 # transitively-pulled `nvidia/*` CUDA runtime (2.7 GB) and `triton` (555 MB)
 # from site-packages. docker-compose.yml passes `cpu` for the local stack, where
 # no GPU is exposed to the containers anyway.
+#
+# `host` keeps GPU support but ships NO CUDA libraries: the env is solved
+# against the CPU wheels (so pip never pulls nvidia/* or triton), and after the
+# DINOv2 prefetch below the CUDA build of the same torch/torchvision versions
+# is swapped in with --no-deps. At runtime LocalRunner mounts the host's CUDA
+# libraries (HASTE_HOST_CUDA_DIR, a pip `site-packages/nvidia` folder) at
+# /opt/host-cuda/nvidia, which LD_LIBRARY_PATH in stage 2 points at. Without
+# that mount `import torch` fails, so a host-variant image only runs on a host
+# that has those libraries.
 ARG TORCH_VARIANT=cu124
-RUN sed -i "s/+cu124/+${TORCH_VARIANT}/g; s#/whl/cu124#/whl/${TORCH_VARIANT}#g" /tmp/env.yml
+RUN grep -oE '(torch|torchvision)==[0-9.]+\+cu124' /tmp/env.yml > /tmp/host-torch.txt \
+	&& if [ "$TORCH_VARIANT" = "host" ]; then wheel=cpu; else wheel="$TORCH_VARIANT"; fi \
+	&& sed -i "s/+cu124/+${wheel}/g; s#/whl/cu124#/whl/${wheel}#g" /tmp/env.yml
 
 # Create environment using micromamba and pack it for reuse.
 # Force-reinstall setuptools after pip to restore conda-managed files pip may clobber.
@@ -48,8 +69,36 @@ RUN sed -i "s/+cu124/+${TORCH_VARIANT}/g; s#/whl/cu124#/whl/${TORCH_VARIANT}#g" 
 # everywhere.
 RUN micromamba create -f /tmp/env.yml -y \
 	&& micromamba install -n bda -c conda-forge setuptools --force-reinstall -y \
-	&& micromamba clean -afy \
-	&& conda-pack -n bda -o /tmp/bda.tar.gz
+	&& micromamba clean -afy
+
+# Pre-bake DINOv2 source + weights into an image-level torch.hub cache so
+# Azure Batch nodes don't need internet access (or the GitHub API) at job
+# runtime. The workflow code calls ``torch.hub.set_dir(TORCH_HUB_CACHE_DIR)``
+# before loading so this cache is used regardless of the per-task TORCH_HOME
+# the entrypoint script sets. Runs here, in the build stage, because this is
+# the last point where `import torch` works for every variant: a host-variant
+# torch cannot import until the host's CUDA libraries are mounted at runtime.
+# The cache is copied into the runtime stage below.
+RUN SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+	micromamba run -n bda python -c "import torch; torch.hub.set_dir('/opt/torch-hub-cache/hub'); \
+	torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14', trust_repo=True, skip_validation=True); \
+	torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14', trust_repo=True, skip_validation=True)"
+
+# Host variant: swap the CPU wheels for the CUDA build of the SAME versions,
+# without dependencies, then fail the build if any bundled CUDA runtime
+# (nvidia-* wheel) slipped in. --retries/--timeout because these wheels are
+# large and download.pytorch.org drops long transfers on slow links.
+RUN if [ "$TORCH_VARIANT" = "host" ]; then \
+		micromamba run -n bda pip install --no-cache-dir --no-deps --force-reinstall \
+			--retries 10 --timeout 120 \
+			--index-url https://download.pytorch.org/whl/cu124 $(cat /tmp/host-torch.txt) \
+		&& micromamba run -n bda python -c "import importlib.metadata as m, sys; \
+bad = sorted(d.metadata['Name'] for d in m.distributions() if (d.metadata['Name'] or '').lower().startswith(('nvidia-', 'triton'))); \
+v = m.version('torch'); print('torch', v, 'bundled CUDA wheels:', bad or 'none'); \
+sys.exit(1 if bad or '+cu' not in v else 0)"; \
+	fi
+
+RUN conda-pack -n bda -o /tmp/bda.tar.gz
 
 # conda-pack writes the archive 0600 root. Stage 2 reads it through a bind mount
 # as the unprivileged `dockeruser`, and a bind mount preserves the source mode
@@ -60,7 +109,7 @@ RUN chmod 0644 /tmp/bda.tar.gz
 
 
 # ---------- Stage 2: Final Runtime Image ----------
-FROM mcr.microsoft.com/azureml/curated/minimal-py312-cuda12.4-inference
+FROM ${BASE_IMAGE}
 
 USER root
 
@@ -144,19 +193,15 @@ ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 # gdal_security.harden_gdal(). See docs/known-vulnerabilities.md Root Cause C.
 ENV GDAL_SKIP="HDF4 HDF4Image HDF5 HDF5Image netCDF"
 
+# Host-CUDA variant: where LocalRunner mounts the host's pip `nvidia` folder.
+# Harmless for the bundled-CUDA image (the directories simply don't exist).
+# torch finds cuDNN/cuBLAS through LD_LIBRARY_PATH, not through PYTHONPATH.
+ENV HASTE_HOST_CUDA_MOUNT=/opt/host-cuda/nvidia
+ENV LD_LIBRARY_PATH="/opt/host-cuda/nvidia/cuda_runtime/lib:/opt/host-cuda/nvidia/cublas/lib:/opt/host-cuda/nvidia/cudnn/lib:/opt/host-cuda/nvidia/cufft/lib:/opt/host-cuda/nvidia/curand/lib:/opt/host-cuda/nvidia/cusolver/lib:/opt/host-cuda/nvidia/cusparse/lib:/opt/host-cuda/nvidia/cusparselt/lib:/opt/host-cuda/nvidia/nccl/lib:/opt/host-cuda/nvidia/nvjitlink/lib:/opt/host-cuda/nvidia/cuda_nvrtc/lib:/opt/host-cuda/nvidia/cuda_cupti/lib:/opt/host-cuda/nvidia/nvtx/lib:/opt/host-cuda/nvidia/cufile/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
-# Pre-bake DINOv2 source + weights into an image-level torch.hub cache so
-# Azure Batch nodes don't need internet access (or the GitHub API) at job
-# runtime. The workflow code calls ``torch.hub.set_dir(TORCH_HUB_CACHE_DIR)``
-# before loading so this cache is used regardless of the per-task TORCH_HOME
-# the entrypoint script sets. Must run after the SSL_CERT_FILE env block so
-# the conda Python trusts GitHub's TLS cert for the source-repo fetch.
-RUN mkdir -p /opt/torch-hub-cache/hub \
-	&& chown -R dockeruser:dockeruser /opt/torch-hub-cache
+# DINOv2 torch.hub cache, pre-baked in the build stage (see there for why).
+COPY --from=conda-env --chown=dockeruser:dockeruser /opt/torch-hub-cache /opt/torch-hub-cache
 USER dockeruser
-RUN python -c "import torch; torch.hub.set_dir('/opt/torch-hub-cache/hub'); \
-	torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14', trust_repo=True, skip_validation=True); \
-	torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14', trust_repo=True, skip_validation=True)"
 
 # Use training-specific entrypoint wrapper to mirror imagery prep behavior
 ENTRYPOINT ["/app/scripts/entrypoint.sh"]

@@ -5,13 +5,26 @@
 # wildcard CORS, well-known Azurite credentials) that are NOT suitable for
 # production use. For production deployment see docs/deployment.md.
 #
-# Usage:
-#   Local development:  docker-compose up
-#   Build only:         docker-compose build
+# Usage (from the repo root):
+#   ./build.sh                       build every image (picks GPU or CPU)
+#   then start with the command build.sh prints, e.g.
+#   docker compose -f docker-compose.yml -f docker-compose.hostcuda.yml up -d
+#
+# Everything runs as one Compose project named `haste`: containers show up as
+# haste-<service>-1, images are haste-*, plus the haste_default network and
+# the haste_azurite-data / haste_postgis-data volumes.
+#
+# haste-training and haste-imageryprep are task images: LocalRunner (inside
+# hastefuncqueues) starts them per job through the Docker socket. They sit in
+# the `tasks` profile so `up` doesn't start them as idle containers; build.sh
+# builds them with --profile tasks. `docker compose up --build` alone does NOT
+# rebuild them -- use build.sh.
 #
 # Environment:
 #   - RUNNER_TYPE: "local" (default for this compose) or "azure_batch" (for remote)
 #   - DEVELOPMENT_MODE: "true" for local, "false" for production
+
+name: haste
 
 services:
   # ==============================================================================
@@ -26,6 +39,7 @@ services:
     build:
       context: ..
       dockerfile: ./docker/emulators/Dockerfile
+    image: haste-azurite
     ports:
       - "10000:10000"
       - "10001:10001"
@@ -38,6 +52,7 @@ services:
     build:
       context: ..
       dockerfile: ./docker/data-init/Dockerfile
+    image: haste-data-init
     volumes:
       - azurite-data:/shared/azurite
       # The bind-mounted host `data` directory is shared with the
@@ -62,7 +77,15 @@ services:
              if [ ! -f /shared/azurite/models/damage_triage/best_model.pth ]; then
                mkdir -p /shared/azurite/models &&
                cp -r /shared/models-src/damage_triage /shared/azurite/models/ &&
-               cp -r /shared/models-src/backbone /shared/azurite/models/ &&
+               chmod -R 777 /shared/azurite/models;
+             fi &&
+             if [ ! -f /shared/azurite/models/backbone/dinov3-vitl16/model.safetensors ]; then
+               mkdir -p /shared/azurite/models/backbone/dinov3-vitl16 &&
+               if [ -f /shared/models-src/backbone/dinov3-vitl16/model.safetensors ]; then
+                 cp -r /shared/models-src/backbone/dinov3-vitl16/. /shared/azurite/models/backbone/dinov3-vitl16/;
+               else
+                 cp /shared/models-src/backbone/config.json /shared/models-src/backbone/model.safetensors /shared/azurite/models/backbone/dinov3-vitl16/;
+               fi &&
                chmod -R 777 /shared/azurite/models;
              fi &&
              python /upload_data.py'
@@ -104,7 +127,10 @@ services:
       POSTGRES_PASSWORD: haste-dev-only  # pragma: allowlist secret # gitleaks:allow
       POSTGRES_DB: haste
     ports:
-      - "5432:5432"
+      # Host access only (psql, QGIS); the services use postgis:5432 on the
+      # internal network. 5433 because a host PostgreSQL usually owns 5432,
+      # which would stop this container from starting. localhost-only.
+      - "127.0.0.1:${HASTE_POSTGIS_PORT:-5433}:5432"
     volumes:
       - postgis-data:/var/lib/postgresql/data
       # Runs every .sql file here, in filename order, on first container
@@ -124,6 +150,7 @@ services:
     build:
       context: ..
       dockerfile: ./api/hastefuncapi/Dockerfile
+    image: haste-api
     environment:
       AzureWebJobsStorage: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;QueueEndpoint=http://azurite:10001/devstoreaccount1;"  # pragma: allowlist secret # gitleaks:allow
       ASPNETCORE_URLS: "http://+:8080"
@@ -155,6 +182,7 @@ services:
       HASTE_DTF_NORMALIZATION: "${HASTE_DTF_NORMALIZATION:-imagenet}"
       HASTE_REGION_WINDOWS_PER_BATCH: "${HASTE_REGION_WINDOWS_PER_BATCH:-20}"
       HASTE_REGION_MASKS_PER_FORWARD: "${HASTE_REGION_MASKS_PER_FORWARD:-64}"
+      HASTE_REGION_PREFETCH_UNITS: "${HASTE_REGION_PREFETCH_UNITS:-2}"
       HASTE_REGION_MAX_CONCURRENT_BATCHES: "${HASTE_REGION_MAX_CONCURRENT_BATCHES:-1}"
       HASTE_REGION_MAX_ATTEMPTS: "${HASTE_REGION_MAX_ATTEMPTS:-3}"
       HASTE_REGION_LEASE_SECONDS: "${HASTE_REGION_LEASE_SECONDS:-300}"
@@ -200,6 +228,7 @@ services:
     build:
       context: ..
       dockerfile: ./api/hastefuncqueues/Dockerfile
+    image: haste-queues
     environment:
       AzureWebJobsStorage: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;QueueEndpoint=http://azurite:10001/devstoreaccount1;"  # pragma: allowlist secret # gitleaks:allow
       ASPNETCORE_URLS: "http://+:8080"
@@ -240,6 +269,7 @@ services:
       HASTE_DTF_NORMALIZATION: "${HASTE_DTF_NORMALIZATION:-imagenet}"
       HASTE_REGION_WINDOWS_PER_BATCH: "${HASTE_REGION_WINDOWS_PER_BATCH:-20}"
       HASTE_REGION_MASKS_PER_FORWARD: "${HASTE_REGION_MASKS_PER_FORWARD:-64}"
+      HASTE_REGION_PREFETCH_UNITS: "${HASTE_REGION_PREFETCH_UNITS:-2}"
       HASTE_REGION_MAX_CONCURRENT_BATCHES: "${HASTE_REGION_MAX_CONCURRENT_BATCHES:-1}"
       HASTE_REGION_MAX_ATTEMPTS: "${HASTE_REGION_MAX_ATTEMPTS:-3}"
       HASTE_REGION_LEASE_SECONDS: "${HASTE_REGION_LEASE_SECONDS:-300}"
@@ -278,26 +308,21 @@ services:
       # LocalRunner (see the passthrough list in runners/local.py).
       HASTE_USER_FOOTPRINTS_MAX_BYTES: "${HASTE_USER_FOOTPRINTS_MAX_BYTES:-4294967296}"
       HASTE_OUTPUT_DIR: "/shared/azurite"
-      # CPU-safe by default. This used to default to "1", which made LocalRunner
-      # attach a GPU DeviceRequest to every spawned task container; on a host
-      # without an NVIDIA GPU `containers.run(device_requests=...)` fails and the
-      # pipeline dies. It only worked here because docker/.env sets 0 -- and
-      # docker/.env is gitignored, so anyone cloning the repo hit the failure.
-      #
-      # This value is paired with the training image's TORCH_VARIANT build arg:
-      # requesting a GPU is pointless against a CPU-only torch build, and a
-      # cu124 build is wasted without the device. Do not set this to 1 here --
-      # use the override file, which flips both together and cannot drift:
-      #   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up
+      # CPU by default. GPU is switched on by an overlay, never here, because
+      # it must match how haste-training was built (TORCH_VARIANT):
+      #   docker-compose.hostcuda.yml  torch only, CUDA from the host (build.sh
+      #                                picks this when it finds a GPU)
+      #   docker-compose.gpu.yml       CUDA baked into the image
       HASTE_ENABLE_GPU: "${HASTE_ENABLE_GPU:-0}"
       HASTE_GPU_DEVICES: "${HASTE_GPU_DEVICES:-all}"
       HASTE_DATALOADER_WORKERS: "8"
       TITILER_ENDPOINT: "http://titiler:8000/"
       TITILER_PUBLIC_ENDPOINT: "http://${HOST_IP:-localhost}:7071/api/titiler/"
-      # Docker volume/network names (prefixed by docker-compose project name)
-      HASTE_DOCKER_NETWORK: "docker_default"
-      HASTE_DOCKER_AZURITE_VOLUME: "docker_azurite-data"
-      # Memory settings for training containers (increase for large VMs)
+      # Network and volume the spawned task containers join. Both are given
+      # fixed names at the bottom of this file, so these can't drift.
+      HASTE_DOCKER_NETWORK: "haste_default"
+      HASTE_DOCKER_AZURITE_VOLUME: "haste_azurite-data"
+      # Memory limits for spawned task containers (increase for large VMs)
       HASTE_DOCKER_SHM_SIZE: "${HASTE_DOCKER_SHM_SIZE:-64g}"
       HASTE_DOCKER_MEM_LIMIT: "${HASTE_DOCKER_MEM_LIMIT:-256g}"
       # Pre-downloaded DamageTriageFormer checkpoint paths (skip HuggingFace download)
@@ -317,10 +342,6 @@ services:
         condition: service_started
       data-init:
         condition: service_completed_successfully
-      training_image:
-        condition: service_started
-      imageryprep_image:
-        condition: service_started
       titiler:
         condition: service_started
       postgis:
@@ -332,6 +353,7 @@ services:
 
   ui:
     build: ../ui
+    image: haste-ui
     ports:
       - "4280:4280"
     environment:
@@ -341,6 +363,10 @@ services:
       VITE_PROJECT_STORAGE_APIM_URL: "http://${HOST_IP:-localhost}:10000"
       VITE_TITILER_URL: "http://${HOST_IP:-localhost}:7071/api/titiler/"
       VITE_AZURE_MAPS_CLIENT_ID: "${VITE_AZURE_MAPS_CLIENT_ID:-placeholder}"
+      # Optional basemap behind the imagery (off when empty; Azure Maps not
+      # configured). See ui/src/util/basemap.js.
+      VITE_BASEMAP_TILE_URL: "${VITE_BASEMAP_TILE_URL:-}"
+      VITE_BASEMAP_ATTRIBUTION: "${VITE_BASEMAP_ATTRIBUTION:-}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -349,55 +375,52 @@ services:
       - titiler
 
   # ==============================================================================
-  # BUILD-ONLY SERVICES (used by LocalRunner via docker run)
+  # TASK IMAGES (build-only; LocalRunner starts them per job via docker run)
   # ==============================================================================
 
-  # Training workflow image
+  # Model inference image (DTF damage assessment, embeddings, segmentation
+  # inference). Named "training" for historical reasons; it no longer trains.
   training_image:
+    profiles: ["tasks"]
     build:
       context: ..
       dockerfile: ./docker/training/Dockerfile
       args:
-        # The local stack exposes no GPU to these containers, so the CUDA wheels
-        # are dead weight here: `cpu` drops nvidia/* (2.7 GB) and triton (555 MB).
-        # Azure Batch / ACR builds go through build_and_push_images.sh, which does
-        # not pass this arg and therefore keeps the Dockerfile's cu124 default.
-        # Set HASTE_TORCH_VARIANT=cu124 if you run this stack on a GPU host.
+        # CPU torch here; the GPU overlays override it (see HASTE_ENABLE_GPU
+        # above). Azure Batch / ACR builds (build_and_push_images.sh) don't
+        # pass this arg and keep the Dockerfile's cu124 default.
         TORCH_VARIANT: ${HASTE_TORCH_VARIANT:-cpu}
+        # CPU-only base (~0.5 GB): the Dockerfile's default CUDA 12.4 base
+        # (~5.3 GB) is useless without a GPU. docker-compose.gpu.yml puts the
+        # CUDA base back.
+        BASE_IMAGE: ${HASTE_TRAINING_BASE_IMAGE:-mcr.microsoft.com/azureml/minimal-py312-inference:20261103.v1}
     image: haste-training
 
   # Imagery preparation image
   imageryprep_image:
+    profiles: ["tasks"]
     build:
       context: ..
       dockerfile: ./docker/imageryprep/Dockerfile
+      args:
+        # Nothing this image runs imports torch (the models run in
+        # haste-training), so don't install it. The Dockerfile's own default
+        # (cu124) is kept for build_and_push_images.sh.
+        TORCH_VARIANT: none
     image: haste-imageryprep
 
-  # ==============================================================================
-  # STANDALONE TRAINING SERVICE (for direct training runs, optional)
-  # ==============================================================================
-
-  training:
-    shm_size: '20gb'
-    deploy:
-      resources:
-        limits:
-          memory: 32g
-    build:
-      context: ./training
-      dockerfile: Dockerfile
-    command: ["ls -la /app/training && source activate bda && conda info --envs && python fine_tune.py --config configs/config.yml --overwrite | tee -a /app/training/fine_tune.log"]
-    volumes:
-      - ../data/training:/app/training
-    profiles:
-      - standalone  # Only start with: docker-compose --profile standalone up training
-
 # ==============================================================================
-# SHARED VOLUMES
+# NETWORK AND VOLUMES (fixed names: LocalRunner attaches task containers to them)
 # ==============================================================================
+
+networks:
+  default:
+    name: haste_default
 
 volumes:
   azurite-data:
+    name: haste_azurite-data
     driver: local
   postgis-data:
+    name: haste_postgis-data
     driver: local

@@ -34,7 +34,11 @@ logger = logging.getLogger(__name__)
 ALLOWED_RASTER_DRIVERS = frozenset(
     {"GTiff", "COG", "VRT", "JPEG", "PNG", "MEM"}
 )
-ALLOWED_VECTOR_DRIVERS = frozenset({"GPKG", "GeoJSON", "Memory"})
+# OpenFileGDB is Esri file-geodatabase *read* support (native, no external
+# libs) — needed for user-supplied .gdb / .gdb.zip building footprints.
+ALLOWED_VECTOR_DRIVERS = frozenset(
+    {"GPKG", "GeoJSON", "Memory", "OpenFileGDB"}
+)
 
 # Denylist for the GDAL_SKIP env (subprocess CLI + any fresh registration).
 # These are the CVE-relevant driver families; an allowlist can't be
@@ -52,6 +56,9 @@ _FORMAT_TO_SNIFF = {
     "tiff": "tiff",
     "geotiff": "tiff",
     "gpkg": "gpkg",
+    "geojson": "geojson",
+    "zip": "zip",
+    "parquet": "parquet",
 }
 
 _hardened = False
@@ -122,7 +129,8 @@ def sniff_file_type(path: str) -> str | None:
 
     One of ``"tiff"`` (incl. BigTIFF / GeoTIFF / COG), ``"gpkg"``,
     ``"sqlite"`` (SQLite that is not a GeoPackage), ``"png"``, ``"jpeg"``,
-    ``"geojson"`` (JSON-looking text), or ``None`` if unrecognized.
+    ``"geojson"`` (JSON-looking text), ``"zip"``, ``"parquet"``, or ``None``
+    if unrecognized.
     """
     try:
         with open(path, "rb") as fh:
@@ -142,6 +150,10 @@ def sniff_file_type(path: str) -> str | None:
         return "png"
     if head[:3] == b"\xff\xd8\xff":
         return "jpeg"
+    if head[:4] == b"PK\x03\x04":
+        return "zip"
+    if head[:4] == b"PAR1":
+        return "parquet"
     if head[:16] == b"SQLite format 3\x00":
         # GeoPackage application_id lives big-endian at byte offset 68.
         appid = head[68:72] if len(head) >= 72 else b""
@@ -158,7 +170,8 @@ def assert_allowed_upload_format(declared: str) -> str:
     """Normalize and validate a declared chunked-upload format.
 
     Returns the normalized lowercase format. Raises ``ValueError`` for
-    anything outside the allowlist (``tif``/``tiff``/``geotiff``/``gpkg``).
+    anything outside the allowlist (``tif``/``tiff``/``geotiff``/``gpkg``/
+    ``geojson``/``zip``/``parquet``).
     """
     norm = (declared or "").strip().lower()
     if norm not in _FORMAT_TO_SNIFF:

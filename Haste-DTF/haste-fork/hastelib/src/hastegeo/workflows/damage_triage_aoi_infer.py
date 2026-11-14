@@ -60,6 +60,8 @@ from hastegeo.workflows.damage_triage_infer import (
     build_dtf_model,
     decode_gated_predictions,
     decode_severity_predictions,
+    resolve_device,
+    score_crop,
 )
 
 WORKDIR = os.getenv("WORKDIR", ".")
@@ -73,6 +75,10 @@ logger = HasteLogger.get_logger(
 logger.info("Executing %s", __file__)
 
 DEFAULT_PAD_PX = 32
+# Same rule and default as damage_triage_region_infer.DEFAULT_MIN_VALID_FRACTION.
+MIN_VALID_PIXEL_FRACTION = 0.5
+# preprocessing.minimum_footprint_area_pixels in the checkpoint's config.json.
+MIN_FOOTPRINT_PIXELS = 30
 DTF_HF_MODEL_ID = "Ymx1025/DamageTriageFormer-model"
 
 
@@ -184,6 +190,18 @@ def crop_class_mask_to_png(class_idx: int, crop_size: int) -> np.ndarray:
     return mask
 
 
+def _unclassified_result(building_id) -> dict:
+    return {
+        "building_id": building_id,
+        "class": -1,
+        "class_name": "Unclassified",
+        "confidence": 0.0,
+        "probs": [0.0] * len(DTF_CATEGORIES),
+        "crop_url": "",
+        "mask_url": "",
+    }
+
+
 def run_damage_triage_aoi(
     image_path: str,
     buildings: list,
@@ -227,14 +245,14 @@ def run_damage_triage_aoi(
         model, use_gated = preloaded_model
         device = next(model.parameters()).device
     else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = resolve_device()
         log_progress(f"Loading DamageTriageFormer checkpoint on {device}...")
         # Loaded ONCE for the whole run, not once per building — reloading a
         # ~500MB ViT-L checkpoint per building would make even a modest AOI
         # (thousands of buildings) impractical. See "Biggest pitfalls" #4 in
         # docs/OptionB_AOI_Integration_Plan.md.
         model, use_gated = build_dtf_model(
-            checkpoint_path, checkpoint_config_path, device
+            checkpoint_path, checkpoint_config_path, device, allow_crop_mode=True
         )
     log_progress(
         f"Model architecture: {'gated head' if use_gated else 'severity head'}"
@@ -253,46 +271,59 @@ def run_damage_triage_aoi(
                 geom_raster_crs, crop_transform, crop_size
             )
 
-            crop_t = (
-                torch.from_numpy(crop.astype(np.float32) / 255.0)
-                .unsqueeze(0)
-                .to(device)
+            # A building in the AOI but off this raster reads as an all-black
+            # crop; scoring it would return a confident class from no pixels.
+            mask_px = mask > 0
+            invalid_value = raster.nodata if raster.nodata is not None else 0
+            valid_px = ~np.all(crop == invalid_value, axis=0)
+            mask_sum = int(mask_px.sum())
+            valid_fraction = (
+                float((mask_px & valid_px).sum() / mask_sum) if mask_sum else 0.0
             )
-            mask_t = torch.from_numpy(mask).unsqueeze(0).to(device)
-
-            with torch.inference_mode():
-                try:
-                    _, damage_out = model(crop_t, [mask_t])
-                except torch.cuda.OutOfMemoryError:
-                    torch.cuda.empty_cache()
-                    logger.warning(
-                        f"CUDA OOM on building {building_id}; retrying on CPU"
-                    )
-                    model.to("cpu")
-                    _, damage_out = model(crop_t.cpu(), [mask_t.cpu()])
-                    model.to(device)
-                probs = (
-                    decode_gated_predictions(damage_out)
-                    if use_gated
-                    else decode_severity_predictions(damage_out)
+            if valid_fraction < MIN_VALID_PIXEL_FRACTION or mask_sum < MIN_FOOTPRINT_PIXELS:
+                logger.warning(
+                    f"Building {building_id} has valid pixel fraction "
+                    f"{valid_fraction:.2f} over {mask_sum} px on {image_path}; "
+                    "not scored."
                 )
+                results.append(_unclassified_result(building_id))
+                continue
+
+            if getattr(model, "crop_mode", False) is True:
+                # Natural padded-bbox window: crop mode resizes it to 224.
+                natural_crop, _, _ = crop_building(raster, geom_4326, pad_px=pad_px)
+                probs = score_crop(model, natural_crop, device)
+            else:
+                crop_t = (
+                    torch.from_numpy(crop.astype(np.float32) / 255.0)
+                    .unsqueeze(0)
+                    .to(device)
+                )
+                mask_t = torch.from_numpy(mask).unsqueeze(0).to(device)
+
+                with torch.inference_mode():
+                    try:
+                        _, damage_out = model(crop_t, [mask_t])
+                    except torch.cuda.OutOfMemoryError:
+                        torch.cuda.empty_cache()
+                        logger.warning(
+                            f"CUDA OOM on building {building_id}; retrying on CPU"
+                        )
+                        model.to("cpu")
+                        _, damage_out = model(crop_t.cpu(), [mask_t.cpu()])
+                        model.to(device)
+                    probs = (
+                        decode_gated_predictions(damage_out)
+                        if use_gated
+                        else decode_severity_predictions(damage_out)
+                    )
 
             if probs.shape[0] == 0:
                 logger.warning(
                     f"Building {building_id} produced zero valid mask "
                     "pixels; skipping (no crop/mask written)."
                 )
-                results.append(
-                    {
-                        "building_id": building_id,
-                        "class": -1,
-                        "class_name": "Unclassified",
-                        "confidence": 0.0,
-                        "probs": [0.0] * len(DTF_CATEGORIES),
-                        "crop_url": "",
-                        "mask_url": "",
-                    }
-                )
+                results.append(_unclassified_result(building_id))
                 continue
 
             class_idx = int(probs[0].argmax())
@@ -323,7 +354,8 @@ def run_damage_triage_aoi(
             if (i + 1) % 25 == 0 or (i + 1) == n_total:
                 log_progress(f"Scored building {i + 1}/{n_total}")
 
-    log_progress(f"Classified {len(results)}/{n_total} buildings")
+    n_classified = sum(1 for r in results if r["class"] != -1)
+    log_progress(f"Classified {n_classified}/{n_total} buildings")
     return results
 
 
@@ -365,6 +397,51 @@ def write_predictions_gpkg(buildings: list, results: list, output_path: str) -> 
     gdf = gpd.GeoDataFrame(rows, geometry="geometry", crs="EPSG:4326")
     gdf.to_file(output_path, layer="predictions", driver="GPKG")
     return len(gdf)
+
+
+def write_predictions_geoparquet(
+    buildings: list, results: list, output_path: str, extra: dict = None
+) -> int:
+    """Write this run's predictions as GeoParquet (WKB geometry, EPSG:4326).
+
+    This is the file handed to the downstream platform. It is produced here,
+    at inference time, from data already in the container, so it exists for
+    every run path (Azure Batch job and the local/Docker runner) and needs
+    no database. Only classified buildings are written, one row each:
+    id, class, class name, confidence, the per-class probabilities, crop /
+    mask file names, plus any ``extra`` constant columns (e.g. model_id).
+    Returns the row count.
+    """
+    import pyarrow as pa  # type: ignore
+    import shapely  # type: ignore
+    from shapely.geometry import shape as shapely_shape  # type: ignore
+
+    from hastegeo.core.utils.geoparquet import write_geoparquet
+
+    results_by_id = {r["building_id"]: r for r in results if r["class"] != -1}
+    rows, wkb = [], []
+    for building in buildings:
+        result = results_by_id.get(building["building_id"])
+        if result is None:
+            continue
+        rows.append(result)
+        wkb.append(shapely.to_wkb(shapely_shape(building["geometry"])))
+
+    columns = {
+        "building_id": [str(r["building_id"]) for r in rows],
+        "damage_class": pa.array([r["class"] for r in rows], pa.int32()),
+        "damage_class_name": [r["class_name"] for r in rows],
+        "confidence": pa.array([r["confidence"] for r in rows], pa.float64()),
+    }
+    for i, name in enumerate(DTF_CATEGORIES):
+        columns["prob_" + "_".join(name.lower().split())] = pa.array(
+            [float(r["probs"][i]) for r in rows], pa.float64()
+        )
+    columns["crop_file"] = [r.get("crop_url") or None for r in rows]
+    columns["mask_file"] = [r.get("mask_url") or None for r in rows]
+    for key, value in (extra or {}).items():
+        columns[key] = [str(value)] * len(rows)
+    return write_geoparquet(output_path, columns, wkb)
 
 
 def log_progress(message):
@@ -459,12 +536,26 @@ def main():
         log_progress(f"Writing {len(results)} buildings -> {gpkg_path}")
         write_predictions_gpkg(buildings, results, gpkg_path)
 
+        parquet_name = files.get(
+            "predictions_parquet", f"dtf_aoi_results_{model_id}.parquet"
+        )
+        parquet_path = os.path.join(output_dir, os.path.basename(parquet_name))
+        log_progress(f"Writing GeoParquet -> {parquet_path}")
+        n_parquet = write_predictions_geoparquet(
+            buildings, results, parquet_path, extra={"model_id": model_id}
+        )
+        if n_parquet == 0:
+            raise RuntimeError(
+                "No building was classified, so the results GeoParquet is empty."
+            )
+
         manifest = {
             "num_buildings": len(buildings),
             "num_classified": sum(1 for r in results if r["class"] != -1),
             "categories": DTF_CATEGORIES,
             "buildings": results,
             "predictions_gpkg_filename": os.path.basename(gpkg_path),
+            "predictions_parquet_filename": os.path.basename(parquet_path),
         }
         log_progress("Finalizing outputs")
         with open(

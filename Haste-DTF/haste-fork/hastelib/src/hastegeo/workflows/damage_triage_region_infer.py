@@ -19,6 +19,9 @@ import argparse
 import json
 import os
 import sys
+import threading
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any, Dict
 
@@ -36,9 +39,14 @@ from hastegeo.core.utils.logs import Logger as HasteLogger
 from hastegeo.workflows.damage_triage_infer import (
     DTF_IM_SIZE,
     _find_local_checkpoint,
+    MIN_CROP_FOOTPRINT_PX,
     build_dtf_model,
     compute_model_digest,
+    crop_box_from_mask,
     read_tile,
+    resolve_crops_per_forward,
+    resolve_device,
+    score_crops,
     score_window,
 )
 
@@ -125,10 +133,37 @@ def run_batch_inference(config: Dict[str, Any]) -> Dict[str, Any]:
             f"Model digest mismatch! Expected {expected_digest}, got {actual_digest}"
         )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device()
     logger.info("Loading DTF model on %s with strict region validation", device)
     model, use_gated = build_dtf_model(
-        checkpoint_path, config_path, device, strict_region_check=True
+        checkpoint_path,
+        config_path,
+        device,
+        strict_region_check=True,
+        allow_crop_mode=True,
+    )
+    crop_mode = getattr(model, "crop_mode", False) is True
+    crops_per_forward = None
+    if crop_mode:
+        # Sized from the memory that is free right now; masks_per_forward is
+        # the upper bound. A crop-mode checkpoint is trained on ImageNet-
+        # normalised input, whatever the config asks for.
+        crops_per_forward = resolve_crops_per_forward(device, masks_per_forward)
+        if normalization != "imagenet":
+            logger.warning(
+                "normalization=%r ignored: the crop-mode checkpoint needs imagenet",
+                normalization,
+            )
+    # Units prepared ahead on CPU threads while the GPU scores the current one.
+    prefetch = max(1, int(os.getenv("HASTE_REGION_PREFETCH_UNITS", "2")))
+    log_progress(
+        f"Scoring on {device}: "
+        + (
+            f"crop mode, {crops_per_forward} crops per forward"
+            if crop_mode
+            else f"mask mode, {masks_per_forward or 'all'} masks per forward"
+        )
+        + f", {prefetch} unit(s) prefetched"
     )
 
     if not os.path.exists(image_path):
@@ -140,20 +175,115 @@ def run_batch_inference(config: Dict[str, Any]) -> Dict[str, Any]:
     completed_units = 0
     failed_units = 0
 
-    with rasterio.open(image_path) as raster:
-        raster_transform = raster.transform
-        raster_crs = raster.crs
+    local = threading.local()
+    handles = []
+
+    def _raster():
+        # One dataset handle per worker thread: rasterio handles are not
+        # safe to share across threads.
+        ds = getattr(local, "ds", None)
+        if ds is None:
+            ds = local.ds = rasterio.open(image_path)
+            handles.append(ds)
+        return ds
+
+    def _prepare_unit(u):
+        """CPU-side work for one unit: windowed read, valid-pixel gate, and
+        per-building masks (mask mode) or crop boxes (crop mode)."""
+        raster = _raster()
+        col_off = int(u["col_off"])
+        row_off = int(u["row_off"])
+        w = int(u["width"])
+        h = int(u["height"])
+        unit_id = u["unit_id"]
+
+        win = rasterio.windows.Window(col_off, row_off, w, h)
+        # Windowed raster read only (no full-image load!)
+        tile = read_tile(raster, win, tile_size=DTF_IM_SIZE)
+        tile_transform = rasterio.windows.transform(win, raster.transform)
+
+        # Valid pixels: inside the real (unpadded) window, and not nodata in
+        # all three bands. Without a declared nodata value, all-zero RGB
+        # (black collar at imagery edges) counts as nodata - the same rule
+        # utils/aoi.py uses for the valid-area mask.
         nodata_val = raster.nodata
+        invalid_value = nodata_val if nodata_val is not None else 0
+        valid_tile_mask = ~np.all(tile == invalid_value, axis=0)
+        valid_tile_mask[h:, :] = False
+        valid_tile_mask[:, w:] = False
 
-        with open(evidence_file, "w", encoding="utf-8") as ev_out:
-            for u_idx, u in enumerate(units):
+        items = []  # masks (mask mode) or boxes (crop mode)
+        bldg_meta = []
+        for b in u.get("buildings", []):
+            b_id = b["building_id"]
+            cov_frac = float(b.get("coverage_fraction", 1.0))
+            # Footprints are stored in EPSG:4326; rasterize in the raster's
+            # own CRS (e.g. UTM for NAIP).
+            geom = _reproject_geometry(parse_geometry(b["geometry"]), raster.crs)
+
+            # Binary instance mask; all_touched matches the whole-layer and
+            # AOI workflows' rasterization.
+            mask_bool = rasterio.features.geometry_mask(
+                [geom],
+                out_shape=(DTF_IM_SIZE, DTF_IM_SIZE),
+                transform=tile_transform,
+                all_touched=True,
+                invert=True,
+            )
+            mask_sum = int(mask_bool.sum())
+            if mask_sum == 0 or (crop_mode and mask_sum < MIN_CROP_FOOTPRINT_PX):
+                continue
+
+            valid_frac = float((mask_bool & valid_tile_mask).sum() / mask_sum)
+            if valid_frac < min_valid_fraction:
+                logger.info(
+                    "Building %s in unit %s has valid fraction %.2f < %.2f; skipping evidence",
+                    b_id,
+                    unit_id,
+                    valid_frac,
+                    min_valid_fraction,
+                )
+                continue
+
+            if crop_mode:
+                box = crop_box_from_mask(mask_bool, w, h)
+                if box is None:
+                    continue
+                items.append(box)
+            else:
+                items.append(mask_bool.astype(np.float32))
+            bldg_meta.append({
+                "building_id": b_id,
+                "coverage_fraction": cov_frac,
+                "valid_pixel_fraction": valid_frac,
+            })
+        return tile, items, bldg_meta
+
+    try:
+        with ThreadPoolExecutor(max_workers=prefetch) as pool, open(
+            evidence_file, "w", encoding="utf-8"
+        ) as ev_out:
+            pending = deque()
+            unit_iter = iter(enumerate(units))
+
+            def _fill():
+                while len(pending) < prefetch:
+                    nxt = next(unit_iter, None)
+                    if nxt is None:
+                        return
+                    idx, unit = nxt
+                    future = (
+                        pool.submit(_prepare_unit, unit)
+                        if unit.get("buildings")
+                        else None
+                    )
+                    pending.append((idx, unit, future))
+
+            _fill()
+            while pending:
+                u_idx, u, future = pending.popleft()
+                _fill()  # keep the next units preparing while this one scores
                 unit_id = u["unit_id"]
-                col_off = int(u["col_off"])
-                row_off = int(u["row_off"])
-                w = int(u["width"])
-                h = int(u["height"])
-                unit_buildings = u.get("buildings", [])
-
                 u_summary: Dict[str, Any] = {
                     "unit_id": unit_id,
                     "status": "pending",
@@ -161,93 +291,35 @@ def run_batch_inference(config: Dict[str, Any]) -> Dict[str, Any]:
                     "error": None,
                 }
 
-                if not unit_buildings:
+                if future is None:
                     u_summary["status"] = "completed"
                     unit_summaries.append(u_summary)
                     completed_units += 1
                     continue
 
                 try:
-                    win = rasterio.windows.Window(col_off, row_off, w, h)
-                    # Windowed raster read only (no full-image load!)
-                    tile = read_tile(raster, win, tile_size=DTF_IM_SIZE)
-                    tile_transform = rasterio.windows.transform(win, raster_transform)
-
-                    # Valid pixels: inside the real (unpadded) window, and
-                    # not nodata in all three bands. Without a declared
-                    # nodata value, all-zero RGB (black collar at imagery
-                    # edges) counts as nodata — the same rule
-                    # utils/aoi.py uses for the valid-area mask.
-                    invalid_value = nodata_val if nodata_val is not None else 0
-                    valid_tile_mask = ~np.all(tile == invalid_value, axis=0)
-                    valid_tile_mask[h:, :] = False
-                    valid_tile_mask[:, w:] = False
-
-                    # Prepare building masks and validate valid_pixel_fraction
-                    masks_list = []
-                    bldg_meta = []
-
-                    for b in unit_buildings:
-                        b_id = b["building_id"]
-                        cov_frac = float(b.get("coverage_fraction", 1.0))
-                        # Footprints are stored in EPSG:4326; rasterize in
-                        # the raster's own CRS (e.g. UTM for NAIP).
-                        geom = _reproject_geometry(
-                            parse_geometry(b["geometry"]), raster_crs
-                        )
-
-                        # Binary instance mask; all_touched matches the
-                        # whole-layer and AOI workflows' rasterization.
-                        mask_bool = rasterio.features.geometry_mask(
-                            [geom],
-                            out_shape=(DTF_IM_SIZE, DTF_IM_SIZE),
-                            transform=tile_transform,
-                            all_touched=True,
-                            invert=True,
-                        )
-                        mask_sum = mask_bool.sum()
-                        if mask_sum == 0:
-                            continue
-
-                        valid_sum = (mask_bool & valid_tile_mask).sum()
-                        valid_frac = float(valid_sum / mask_sum)
-
-                        # Check if valid pixel fraction satisfies threshold
-                        if valid_frac < min_valid_fraction:
-                            logger.info(
-                                "Building %s in unit %s has valid fraction %.2f < %.2f; skipping evidence",
-                                b_id,
-                                unit_id,
-                                valid_frac,
-                                min_valid_fraction,
-                            )
-                            continue
-
-                        masks_list.append(mask_bool.astype(np.float32))
-                        bldg_meta.append({
-                            "building_id": b_id,
-                            "coverage_fraction": cov_frac,
-                            "valid_pixel_fraction": valid_frac,
-                        })
-
-                    if not masks_list:
+                    tile, items, bldg_meta = future.result()
+                    if not items:
                         u_summary["status"] = "completed"
                         unit_summaries.append(u_summary)
                         completed_units += 1
                         continue
 
-                    masks_arr = np.stack(masks_list, axis=0)
-
-                    # Execute model scoring with mask chunking and OOM fallback
-                    probs = score_window(
-                        model=model,
-                        use_gated=use_gated,
-                        tile=tile,
-                        masks=masks_arr,
-                        device=device,
-                        normalization=normalization,
-                        masks_per_forward=masks_per_forward,
-                    )
+                    # Model scoring with batching and OOM fallback
+                    if crop_mode:
+                        probs = score_crops(
+                            model, tile, items, device, crops_per_forward
+                        )
+                    else:
+                        probs = score_window(
+                            model=model,
+                            use_gated=use_gated,
+                            tile=tile,
+                            masks=np.stack(items, axis=0),
+                            device=device,
+                            normalization=normalization,
+                            masks_per_forward=masks_per_forward,
+                        )
 
                     classes = probs.argmax(axis=1)
                     confs = probs.max(axis=1)
@@ -278,6 +350,9 @@ def run_batch_inference(config: Dict[str, Any]) -> Dict[str, Any]:
 
                 unit_summaries.append(u_summary)
                 log_progress(f"Processed unit {u_idx + 1}/{len(units)}: {u_summary['status']}")
+    finally:
+        for ds in handles:
+            ds.close()
 
     manifest = {
         "batch_id": batch_id,

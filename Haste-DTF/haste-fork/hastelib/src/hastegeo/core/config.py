@@ -409,6 +409,9 @@ class Config:
             TIF = "tif"
             TIFF = "tif"
             GPKG = "gpkg"
+            GEOJSON = "geojson"
+            ZIP = "zip"
+            PARQUET = "parquet"
 
         return DataFormats
 

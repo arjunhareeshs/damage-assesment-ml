@@ -15,6 +15,8 @@ import CreateEditImageLayerFileUploader from "./CreateEditImageLayerFileUploader
 import {
   addUrlToFootprintArray,
   addFootprintFileToArray,
+  FOOTPRINT_ACCEPT,
+  footprintDataFormat,
   onFormChange,
 } from "./CreateEditImageLayerHelper";
 
@@ -109,8 +111,10 @@ const CreateEditImageLayerFormBuildingFootprints = ({
             Optional. By default, building footprints are downloaded from
             Overture Maps using the area-of-interest derived from the
             post-event imagery. Enable this panel to instead supply your
-            own building-footprints GeoPackage (.gpkg). The file will be
-            reprojected to EPSG:4326 and clipped to the AOI before use.
+            own building footprints: a GeoPackage (.gpkg), GeoJSON, GeoParquet,
+            or a .zip holding a file geodatabase (.gdb) or several of those
+            (e.g. one per region). The data is reprojected to EPSG:4326 and
+            clipped to the AOI before use.
           </Text>
         </div>
 
@@ -142,7 +146,7 @@ const CreateEditImageLayerFormBuildingFootprints = ({
                   <React.Fragment>
                     <TextField
                       className="flex-grow-1 me-2"
-                      placeholder="Write or paste a .gpkg URL"
+                      placeholder="Write or paste a footprints file URL"
                       value={urlInput}
                       onChange={(e) => setUrlInput(e.target.value)}
                       errorMessage={controlError}
@@ -163,7 +167,7 @@ const CreateEditImageLayerFormBuildingFootprints = ({
                     <input
                       type="file"
                       multiple={false}
-                      accept=".gpkg"
+                      accept={FOOTPRINT_ACCEPT}
                       className="d-none"
                       id="userBuildingFootprintsFileInput"
                       aria-label="Building footprints file input"
@@ -177,7 +181,7 @@ const CreateEditImageLayerFormBuildingFootprints = ({
                     />
                     <TextField
                       className="flex-grow-1 me-2 cursor-pointer-on-hover"
-                      placeholder="Click here to select a .gpkg file"
+                      placeholder="Click here to select a footprints file"
                       value={pickedFile ? pickedFile.name : ""}
                       readOnly
                       errorMessage={controlError}
@@ -220,7 +224,7 @@ const CreateEditImageLayerFormBuildingFootprints = ({
                         componentState={componentState}
                         file={entry}
                         field={FIELD}
-                        dataFormat="gpkg"
+                        dataFormat={footprintDataFormat(entry.value && entry.value.name)}
                       />
                     )}
                   </div>

@@ -51,6 +51,7 @@ from ..runners.unified_runner import UnifiedRunner
 from ..utils import assessment_store, postgis_query
 from ..utils.dtf_constants import DTF_IM_SIZE, compute_model_digest
 from ..utils.dtf_preprocess import PREPROCESSING_VERSION
+from ..utils import current_damage
 from ..utils.imagery_catalog import imagery_for_aoi
 from ..utils.logs import Logger
 from ..utils.metadata import MetadataUtils
@@ -612,6 +613,10 @@ class AoiAssessmentPostprocessor:
         assessment_store.upsert_damage_assessments(
             self.assessment_id, results, conn=self.conn
         )
+        # Make these results the current per-building output (original
+        # footprints, latest successful class) for HASTE and the Texas app.
+        current_damage.publish_current_results(self.assessment_id, conn=self.conn)
+        current_damage.export_after_publish(image_layer_id, conn=self.conn)
 
         counts = assessment_store.unit_status_counts(self.assessment_id, conn=self.conn)
         n_failed_units = counts.get("failed", 0)

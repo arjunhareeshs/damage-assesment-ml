@@ -34,6 +34,51 @@ def _normalize_azurite_url(url: Optional[str]) -> Optional[str]:
     return normalized
 
 
+
+# Host-side folder (pip ``site-packages/nvidia``) holding the CUDA runtime
+# libraries for host-CUDA images, and where those images expect it.
+_HOST_CUDA_ENV = "HASTE_HOST_CUDA_DIR"
+_HOST_CUDA_TARGET = "/opt/host-cuda/nvidia"
+
+
+def _host_cuda_volume(logger) -> Dict[str, Dict[str, str]]:
+    """Return the read-only host-CUDA bind mount, or ``{}`` when not configured.
+
+    The path is not checked for existence: it is a host path, and this code
+    runs inside the hastefuncqueues container, which cannot see it.
+    """
+    host_dir = (os.getenv(_HOST_CUDA_ENV) or "").strip()
+    if not host_dir:
+        return {}
+    if not os.path.isabs(host_dir):
+        logger.error(
+            "%s=%r must be an absolute host path; not mounting host CUDA",
+            _HOST_CUDA_ENV,
+            host_dir,
+        )
+        return {}
+    logger.info(
+        "[PIPELINE-TRACE] Mounting host CUDA libraries %s -> %s (ro)",
+        host_dir,
+        _HOST_CUDA_TARGET,
+    )
+    return {host_dir: {"bind": _HOST_CUDA_TARGET, "mode": "ro"}}
+
+
+def _is_gpu_attach_error(err: Exception) -> bool:
+    """True when a container start failed only because no GPU could be attached."""
+    text = str(err).lower()
+    return any(
+        marker in text
+        for marker in (
+            "could not select device driver",
+            "nvidia-container-cli",
+            "no cuda-capable device",
+            "unknown or invalid runtime name: nvidia",
+            "capabilities: [[gpu]]",
+        )
+    )
+
 class LocalRunner(BaseRunner):
     """Local runner that executes containers using Docker instead of Azure Batch."""
 
@@ -277,9 +322,9 @@ class LocalRunner(BaseRunner):
             volumes = {}
 
             # Mount the azurite volume - this contains both blob storage AND task_work
-            # Volume name depends on docker-compose project name (directory name)
+            # docker-compose.yml gives this volume the fixed name haste_azurite-data
             azurite_volume_name = os.getenv(
-                "HASTE_DOCKER_AZURITE_VOLUME", "docker_azurite-data"
+                "HASTE_DOCKER_AZURITE_VOLUME", "haste_azurite-data"
             )
             volumes[azurite_volume_name] = {
                 "bind": "/shared/azurite",
@@ -288,6 +333,15 @@ class LocalRunner(BaseRunner):
             self.logger.info(
                 f"[PIPELINE-TRACE] Using azurite volume: {azurite_volume_name}"
             )
+
+            # Host-CUDA mode (docker-compose.hostcuda.yml): the training image
+            # ships torch without CUDA libraries and expects the host's pip
+            # ``site-packages/nvidia`` folder at /opt/host-cuda/nvidia (its
+            # LD_LIBRARY_PATH points there). The path is a HOST path: task
+            # containers are siblings started through the host's Docker daemon.
+            host_cuda_mount = _host_cuda_volume(self.logger)
+            if host_cuda_mount:
+                volumes.update(host_cuda_mount)
 
             # Container working dir points directly to the task directory in the volume
             container_working_dir = f"/shared/azurite/{relative_task_path}"
@@ -329,6 +383,8 @@ class LocalRunner(BaseRunner):
                 "HASTE_DTF_NORMALIZATION",
                 "HASTE_REGION_WINDOWS_PER_BATCH",
                 "HASTE_REGION_MASKS_PER_FORWARD",
+                "HASTE_REGION_PREFETCH_UNITS",
+                "DTF_DEVICE",
                 "HASTE_REGION_MAX_CONCURRENT_BATCHES",
                 "HASTE_REGION_MAX_ATTEMPTS",
                 "HASTE_REGION_LEASE_SECONDS",
@@ -707,23 +763,43 @@ class LocalRunner(BaseRunner):
                             f"Failed to configure GPU device request, continuing without GPU: {gpu_err}"
                         )
 
-                container = self.docker_client.containers.run(
-                    container_image,
+                run_kwargs = dict(
                     command=container_command,
                     environment=task_env,
                     volumes=volumes,
                     working_dir=container_working_dir,
-                    device_requests=device_requests,
                     shm_size=os.getenv("HASTE_DOCKER_SHM_SIZE", "8g"),
                     mem_limit=os.getenv("HASTE_DOCKER_MEM_LIMIT", "32g"),
                     network=os.getenv(
-                        "HASTE_DOCKER_NETWORK", "docker_default"
+                        "HASTE_DOCKER_NETWORK", "haste_default"
                     ),  # Connect to docker-compose network for azurite access
                     remove=False,  # Keep for inspection (we'll decide after)
                     detach=True,
                     stdout=True,
                     stderr=True,
                 )
+                try:
+                    container = self.docker_client.containers.run(
+                        container_image,
+                        device_requests=device_requests,
+                        **run_kwargs,
+                    )
+                except docker.errors.APIError as run_err:
+                    # "Use the GPU when the system has one": if the daemon
+                    # cannot attach a GPU (no NVIDIA runtime, no device,
+                    # driver busy) run the task on CPU instead of failing it.
+                    # The workflows pick cuda/cpu themselves (DTF_DEVICE=auto).
+                    if not device_requests or not _is_gpu_attach_error(
+                        run_err
+                    ):
+                        raise
+                    self.logger.warning(
+                        "GPU could not be attached (%s); running task on CPU",
+                        run_err,
+                    )
+                    container = self.docker_client.containers.run(
+                        container_image, device_requests=None, **run_kwargs
+                    )
 
                 # Stream container logs to disk for parity with Azure Batch outputs
                 try:

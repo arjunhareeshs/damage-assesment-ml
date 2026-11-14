@@ -11,6 +11,7 @@ import { convertDateToString } from "../../util/conversion";
 import VisualizerImageryControls from "./VisualizerImageryControls"
 import DtfAoiReviewPanel from "../BuildingValidation/DtfAoiReviewPanel";
 import "../../assets/css/visualizer.css";
+import { addOpenBasemap } from "../../util/basemap";
 import { getAzureMapsAuthOptions, isAzureMapsPlaceholder } from "../../util/azureMapsAuth";
 
 // AOI-scoped DamageTriageFormer (Option B, AOI-scoped —
@@ -182,6 +183,9 @@ const Visualizer = ({ setModalComponent }) => {
           // Avoid map rotation
           avoidRotation(primaryMap);
 
+          // Satellite landscape under the imagery when Azure Maps isn't set up.
+          addOpenBasemap(primaryMap);
+
           await loadPreOrPostDisasterLayer(
             primaryMap,
             visualizerResults.preDisasterImagery,
@@ -208,6 +212,8 @@ const Visualizer = ({ setModalComponent }) => {
         secondaryMap.events.add("ready", function () {
           // Avoid map rotation
           avoidRotation(secondaryMap);
+
+          addOpenBasemap(secondaryMap);
 
           loadPreOrPostDisasterLayer(
             secondaryMap,

@@ -37,16 +37,30 @@ WEIGHT_DECAY = 1e-4
 # filesystem and never has this local models/ folder, so this is a no-op
 # there.
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(BASE_DIR))
-_LOCAL_BACKBONE_DIR = os.path.join(_PROJECT_ROOT, "models", "backbone", "dinov3-vitl16")
-# Check for actual weight content, not just directory existence — a
-# download that was interrupted/failed partway can leave an empty (or
-# config-only) directory behind, which must NOT be treated as "downloaded".
-_LOCAL_BACKBONE_READY = os.path.isfile(
-    os.path.join(_LOCAL_BACKBONE_DIR, "config.json")
-) and any(
-    fn.endswith((".safetensors", ".bin"))
-    for fn in (os.listdir(_LOCAL_BACKBONE_DIR) if os.path.isdir(_LOCAL_BACKBONE_DIR) else [])
+
+def _backbone_dir_ready(path):
+    # Check for actual weight content, not just directory existence — a
+    # download that was interrupted/failed partway can leave an empty (or
+    # config-only) directory behind, which must NOT be treated as "downloaded".
+    return (
+        bool(path)
+        and os.path.isfile(os.path.join(path, "config.json"))
+        and any(fn.endswith((".safetensors", ".bin")) for fn in os.listdir(path))
+    )
+
+
+# Candidates in priority order: explicit DTF_BACKBONE_DIR, the nested
+# models/backbone/dinov3-vitl16/ layout, then the flat models/backbone/ layout
+# (config.json + model.safetensors directly inside it).
+_BACKBONE_CANDIDATES = [
+    os.environ.get("DTF_BACKBONE_DIR", ""),
+    os.path.join(_PROJECT_ROOT, "models", "backbone", "dinov3-vitl16"),
+    os.path.join(_PROJECT_ROOT, "models", "backbone"),
+]
+_LOCAL_BACKBONE_DIR = next(
+    (p for p in _BACKBONE_CANDIDATES if _backbone_dir_ready(p)), None
 )
+_LOCAL_BACKBONE_READY = _LOCAL_BACKBONE_DIR is not None
 BACKBONE = (
     _LOCAL_BACKBONE_DIR
     if _LOCAL_BACKBONE_READY

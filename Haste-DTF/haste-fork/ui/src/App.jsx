@@ -6,8 +6,7 @@ import "./assets/css/style.css";
 import { DefaultButton, PrimaryButton } from "@fluentui/react/lib/Button";
 import { Dialog, DialogFooter, DialogType } from "@fluentui/react/lib/Dialog";
 import { AppContext } from "./AppContext";
-import { apiValidateUser, apiLogout, apiGet } from "./util/api";
-import { upsertUser } from "./AppHelper";
+import { apiValidateUser } from "./util/api";
 
 import { useLocation } from 'react-router-dom';
 

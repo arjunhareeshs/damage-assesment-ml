@@ -32,8 +32,6 @@ import {
   validateEmptyOrInvalid,
   validateEmpty,
   validateAtLeastSomeNumber,
-  validatePrimaryClasses,
-  validateEventTypes
 } from "../util/validation";
 import { AppContext } from "../AppContext";
 import { useNavigate } from "react-router-dom";
@@ -71,24 +69,19 @@ const CreateEditProjectModal = ({ onClose, projectId }) => {
       1
     );
 
-    const primaryClassesError = validatePrimaryClasses(
-      primaryClasses
-    );
+    // Event types are optional (older projects have none). The removal of
+    // the Primary Classes section also dropped this declaration, which made
+    // every Save throw "eventTypesError is not defined".
+    const eventTypesError = "";
 
-    // Only validate event types if creating a new project. Old projects may not have any.
-    var eventTypesError = "";
-    validateEventTypes(
-      eventTypes
-    );
-
-    if (nameError || eventTypesError || eventDateError || affectedCountriesError || primaryClassesError) {
+    if (nameError || eventTypesError || eventDateError || affectedCountriesError) {
       setComponentState({
         ...componentState,
         nameError: nameError,
         eventTypesError: eventTypesError,
         eventDateError: eventDateError,
         affectedCountriesError: affectedCountriesError,
-        primaryClassesError: primaryClassesError,
+        primaryClassesError: "",
       });
       return;
     }
@@ -403,45 +396,7 @@ const CreateEditProjectModal = ({ onClose, projectId }) => {
             </div>
           ))}
 
-          <div className="row mt-4 mb-4">
-            <div className="col-12 d-flex flex-column box-highlight p-4 pb-2">
-              <div className="col-12 pb-2">
-                <h6 className="m-0 pb-2">
-                  Primary Classes
-                  <span className="required-form-element"> *</span>
-                </h6>
 
-                <ErrorMessage errorMessage={componentState.primaryClassesError} />
-
-                <Text variant="medium" id="createEditProjectPrimaryClasses">
-                  These categories will be used to train the damage assessment model. Use the defaults here or edit them to define your own.
-                </Text>
-              </div>
-              {componentState.primaryClasses.map((primaryClass, index) => (
-                <PrimaryClassCreator
-                  key={"primaryClass" + index}
-                  primaryClass={primaryClass}
-                  index={index}
-                  setComponentState={setComponentState}
-                  componentState={componentState}
-                  projectId={projectId}
-                  setDialog={setDialog}
-                />
-              ))}
-
-              <Link
-                id="createEditProjectAddPrimaryClass"
-                aria-label="AddPrimaryClass"
-                className="pb-2 mt-3"
-                disabled={projectId !== undefined}
-                onClick={() =>
-                  addPrimaryClass(setComponentState, componentState)
-                }
-              >
-                Add Class
-              </Link>
-            </div>
-          </div>
 
           <div className="row">
             <div className="col-12 d-flex justify-content-end">

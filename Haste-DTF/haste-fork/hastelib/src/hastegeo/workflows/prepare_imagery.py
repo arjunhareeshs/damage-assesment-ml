@@ -641,7 +641,13 @@ class ImageryWorkflow:
         )
 
         with tempfile.TemporaryDirectory(prefix="user_footprints_") as scratch:
-            staged_path = os.path.join(scratch, "user_footprints.gpkg")
+            staged_path = os.path.join(
+                scratch,
+                "user_footprints"
+                + self._user_footprints_extension(
+                    self.user_building_footprints_url
+                ),
+            )
             try:
                 self._download_user_footprints_to(
                     self.user_building_footprints_url,
@@ -696,6 +702,22 @@ class ImageryWorkflow:
         )
         self.building_footprints_path = output_path
         self.building_footprints_error = ""
+
+    @staticmethod
+    def _user_footprints_extension(url: str) -> str:
+        """File extension for the staged download, from the URL path.
+
+        Content is sniffed by the reader, so this only needs to be a
+        sensible hint; unknown extensions fall back to ``.gpkg``.
+        """
+        from urllib.parse import urlparse
+
+        ext = os.path.splitext(urlparse(url).path)[1].lower()
+        return (
+            ext
+            if ext in (".gpkg", ".geojson", ".json", ".zip", ".parquet")
+            else ".gpkg"
+        )
 
     def _download_user_footprints_to(
         self,

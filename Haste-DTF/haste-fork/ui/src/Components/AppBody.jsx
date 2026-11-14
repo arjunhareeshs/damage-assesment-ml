@@ -20,7 +20,6 @@ import AdminSourceTypes from "./AdminSourceTypes";
 import AdminLabelingTool from "./AdminLabelingTool";
 import CreateEditImageLayerForm from "./CreateEditImageLayerForm";
 import HelpDocs from "./HelpDocs";
-import { apiValidateUser, apiLogout } from "../util/api";
 import PropType from "prop-types";
 
 import { AppContext } from "../AppContext";

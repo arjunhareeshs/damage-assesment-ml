@@ -22,3 +22,7 @@ ENV/
 *.py[cod]
 .DS_Store
 
+
+# Docker run logs (run.sh)
+/logs/
+/localpkgs/

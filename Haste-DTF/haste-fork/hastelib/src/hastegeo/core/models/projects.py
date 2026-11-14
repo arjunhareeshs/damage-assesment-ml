@@ -438,6 +438,9 @@ class Model(BaseModel):
     inferenceStatusMessage: Optional[str] = Field(default="")
     predictedDamageLayerUrl: Optional[str] = Field(default=None)
     gpkgUrl: Optional[str] = Field(default=None)
+    # GeoParquet of a dtf-aoi run's results (geometry, class, confidence,
+    # per-class probabilities), written by DTFAoiInferencePostprocessor.
+    parquetUrl: Optional[str] = Field(default=None)
     labelsUrl: Optional[str] = Field(default=None)
     # ── Building labeling workflow (embedding sub-row) ──────────────────
     # A Model with modelType="embedding" represents a building-embedding

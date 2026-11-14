@@ -1,0 +1,210 @@
+tudent@ubuntu-bit:/mnt/9035d428-606e-456a-8b00-3b244a71810b/hastedmg$ cd Haste-DTF/haste-fork/docker
+docker compose -f docker-compose.yml -f docker-compose.hostcuda.yml up -d
+[+] up 13/13
+ ! Image haste-ui                                 pull access denied for haste-ui, repository does not exist or may require 'docker login'                                                   5.4s
+ ! Image haste-api                                pull access denied for haste-api, repository does not exist or may require 'docker login'                                                  3.7s
+ ! Image haste-titiler                            pull access denied for haste-titiler, repository does not exist or may require 'docker login'                                              2.9s
+ ! Image haste-queues                             pull access denied for haste-queues, repository does not exist or may require 'docker login'                                               2.9s
+ ✔ Image mcr.microsoft.com/oss/nginx/nginx:1.21.6 Pulled                                                                                                                                    19.1s
+ ! Image haste-azurite                            pull access denied for haste-azurite, repository does not exist or may require 'docker login'                                              5.5s
+ ! Image haste-data-init                          pull access denied for haste-data-init, repository does not exist or may require 'docker login'                                            5.4s
+[+] Building 627.5s (61/61) FINISHED                                                                                                                                                             
+ => [internal] load local bake definitions                                                                                                                                                  0.0s
+ => => reading from stdin 3.24kB                                                                                                                                                            0.0s
+ => [data-init internal] load build definition from Dockerfile                                                                                                                              0.1s
+ => => transferring dockerfile: 1.07kB                                                                                                                                                      0.0s
+ => [ui internal] load build definition from Dockerfile                                                                                                                                     0.1s
+ => => transferring dockerfile: 634B                                                                                                                                                        0.0s
+ => [hastefuncqueues internal] load build definition from Dockerfile                                                                                                                        0.1s
+ => => transferring dockerfile: 1.38kB                                                                                                                                                      0.0s
+ => [azurite internal] load build definition from Dockerfile                                                                                                                                0.1s
+ => => transferring dockerfile: 509B                                                                                                                                                        0.0s
+ => [titiler internal] load build definition from Dockerfile                                                                                                                                0.1s
+ => => transferring dockerfile: 569B                                                                                                                                                        0.0s
+ => [hastefuncapi internal] load build definition from Dockerfile                                                                                                                           0.1s
+ => => transferring dockerfile: 1.58kB                                                                                                                                                      0.0s
+ => [titiler internal] load metadata for ghcr.io/developmentseed/titiler:0.18.6                                                                                                             2.8s
+ => [hastefuncapi internal] load metadata for mcr.microsoft.com/azure-functions/python:4.30.0-python3.11                                                                                    0.8s
+ => [data-init internal] load metadata for docker.io/library/python:3.11-slim                                                                                                               5.6s
+ => [azurite internal] load metadata for mcr.microsoft.com/azure-storage/azurite:3.37.0                                                                                                     0.7s
+ => [ui internal] load metadata for mcr.microsoft.com/azurelinux/base/nodejs:24                                                                                                             0.8s
+ => [data-init internal] load .dockerignore                                                                                                                                                 0.0s
+ => => transferring context: 651B                                                                                                                                                           0.0s
+ => [azurite 1/1] FROM mcr.microsoft.com/azure-storage/azurite:3.37.0@sha256:830430c1da1a2d537e08f3e6764dd1f5ae00cf0346bcaf625b968ec3f0971fd5                                             296.1s
+ => => resolve mcr.microsoft.com/azure-storage/azurite:3.37.0@sha256:830430c1da1a2d537e08f3e6764dd1f5ae00cf0346bcaf625b968ec3f0971fd5                                                       0.0s
+ => => sha256:a6eee6a69bb34f8baebf8e5eaec54bff7ed56534f12042768438c12710646370 348.56kB / 348.56kB                                                                                          1.1s
+ => => sha256:0a677b611880d54b2ce01f69179b9c9348b04e859f2ad5be5772bcca6949e63e 52.63MB / 52.63MB                                                                                           42.4s
+ => => sha256:a34d4f0e431b412396b5205f5b5ce271084381c52221db02ed504fee356b6237 2.86kB / 2.86kB                                                                                              0.9s
+ => => sha256:e6f31ffc071e5560b82a8685fba8214954e5721e3e49269d00958316edbe89fe 3.84MB / 3.84MB                                                                                              4.1s
+ => => sha256:6ed849575913a208b5e1eb2c9c6849b86b8ed4c5b88da48b4303779d5a081de8 401.06kB / 401.06kB                                                                                          0.7s
+ => => sha256:944f1b656c9185acc5b0e71706b007431a973d5d67c1abca58255b66d4e0b589 117B / 117B                                                                                                  0.3s
+ => => sha256:d983d2844deb265f47babe99173ff936a625d62ddcc93f295e895aa5381357a0 447B / 447B                                                                                                  0.3s
+ => => sha256:d6d6f66299cee3f0cfb6f5a20d3af9d2532a2556ed38c4083f2805d5930df622 54.39MB / 54.39MB                                                                                           58.1s
+ => => sha256:430113713fa91b476e13aeeb928dd61f5e45cff1b264da76feadddfee4018f3b 898.95kB / 898.95kB                                                                                          2.0s
+ => => sha256:7f668503d887986f6a4b9004705839925c61d0bc699434f9cf023ec54732f242 1.26MB / 1.26MB                                                                                              1.9s
+ => [hastefuncapi 1/9] FROM mcr.microsoft.com/azure-functions/python:4.30.0-python3.11@sha256:c856e609820cbc981ff185e3c37b95de53d8124090673e52acea27cf8642ea0a                            356.6s
+ => => resolve mcr.microsoft.com/azure-functions/python:4.30.0-python3.11@sha256:c856e609820cbc981ff185e3c37b95de53d8124090673e52acea27cf8642ea0a                                           0.0s
+ => => sha256:b751b94e1c28b633b7233098a26e2b4e02fb79c3e9308b18fc20b8b54670888c 120.43MB / 120.43MB                                                                                        250.8s
+ => => sha256:35fc585579a7813a1a914c9c8ab8e1807eb92df2e57869c7f1aac1afa5b7a95d 472B / 472B                                                                                                  0.6s
+ => => sha256:28a2a6c5e2a31cf2baa8472215f9f384ea3adc36f18e881ba9cb35dd99b1845e 6.62MB / 6.62MB                                                                                             18.1s
+ => => sha256:a633638c81bc1819331ea19808ce8415103909874466686b25e47ea3a38e18f0 519B / 519B                                                                                                  0.5s
+ => => sha256:5a5f86afbaf6b7ab9d97ff0c6177fdc62002eb000da167ca7067ed1d3698cf8f 525B / 525B                                                                                                  1.0s
+ => => sha256:1fcda0572d2a0c64631574f893753b999e1549a92a13610642872794e68f3e63 296.92MB / 296.92MB                                                                                        330.2s
+ => => sha256:3616779ed2244d2eca1940c4889870387cf331078962e2925e713e3846abb197 100.42MB / 100.42MB                                                                                        194.6s
+ => => sha256:95f796306f11dc2c8d2602646ae5dab5fec130686c7bc920dfb2703f1f81d864 15.17MB / 15.17MB                                                                                           45.4s
+ => => sha256:5d0aeceef7eeb53c3f853fb229ea7fd13a5a56f4ba371ca48f0477493046b702 31.42MB / 31.42MB                                                                                           48.6s
+ => => extracting sha256:5d0aeceef7eeb53c3f853fb229ea7fd13a5a56f4ba371ca48f0477493046b702                                                                                                   1.0s
+ => => extracting sha256:95f796306f11dc2c8d2602646ae5dab5fec130686c7bc920dfb2703f1f81d864                                                                                                   0.3s
+ => => extracting sha256:3616779ed2244d2eca1940c4889870387cf331078962e2925e713e3846abb197                                                                                                   0.8s
+ => => extracting sha256:1fcda0572d2a0c64631574f893753b999e1549a92a13610642872794e68f3e63                                                                                                   2.3s
+ => => extracting sha256:5a5f86afbaf6b7ab9d97ff0c6177fdc62002eb000da167ca7067ed1d3698cf8f                                                                                                   0.0s
+ => => extracting sha256:a633638c81bc1819331ea19808ce8415103909874466686b25e47ea3a38e18f0                                                                                                   0.0s
+ => => extracting sha256:28a2a6c5e2a31cf2baa8472215f9f384ea3adc36f18e881ba9cb35dd99b1845e                                                                                                   0.2s
+ => => extracting sha256:35fc585579a7813a1a914c9c8ab8e1807eb92df2e57869c7f1aac1afa5b7a95d                                                                                                   0.0s
+ => => extracting sha256:b751b94e1c28b633b7233098a26e2b4e02fb79c3e9308b18fc20b8b54670888c                                                                                                   2.9s
+ => [hastefuncqueues internal] load build context                                                                                                                                           0.1s
+ => => transferring context: 2.22MB                                                                                                                                                         0.1s
+ => [hastefuncapi internal] load build context                                                                                                                                              0.1s
+ => => transferring context: 2.48MB                                                                                                                                                         0.1s
+ => [ui internal] load .dockerignore                                                                                                                                                        0.1s
+ => => transferring context: 776B                                                                                                                                                           0.0s
+ => [ui 1/7] FROM mcr.microsoft.com/azurelinux/base/nodejs:24@sha256:affe8e33adb5aa9039d6bf37156fd07d0eb8bb3ace44bd178835484dc2911b5f                                                      95.0s
+ => => resolve mcr.microsoft.com/azurelinux/base/nodejs:24@sha256:affe8e33adb5aa9039d6bf37156fd07d0eb8bb3ace44bd178835484dc2911b5f                                                          0.0s
+ => => sha256:74a60e88506b680b3b037fca986ef5db5d558fc36c27e063cdf0799d0d5f3a37 106.48kB / 106.48kB                                                                                          0.3s
+ => => sha256:6e51ed3b8c5f7c87e49afb2a129f9613f18ea1650e7af28905026ef3e10292c0 47.24MB / 47.24MB                                                                                           93.8s
+ => => sha256:216290f83a176b2c69022b0d186a33eb692f5d3e00969e6ded13328511bb383f 33.07MB / 33.07MB                                                                                           73.0s
+ => => extracting sha256:216290f83a176b2c69022b0d186a33eb692f5d3e00969e6ded13328511bb383f                                                                                                   0.5s
+ => => extracting sha256:6e51ed3b8c5f7c87e49afb2a129f9613f18ea1650e7af28905026ef3e10292c0                                                                                                   1.0s
+ => => extracting sha256:74a60e88506b680b3b037fca986ef5db5d558fc36c27e063cdf0799d0d5f3a37                                                                                                   0.0s
+ => [ui internal] load build context                                                                                                                                                        0.3s
+ => => transferring context: 24.46MB                                                                                                                                                        0.2s
+ => [azurite] exporting to image                                                                                                                                                          306.8s
+ => => exporting layers                                                                                                                                                                     0.0s
+ => => exporting manifest sha256:f95c1909e422c0b0c290e3d1aaba1edaa2038fad90347215627f6b4f99962f3f                                                                                           0.0s
+ => => exporting config sha256:9dc31df514b8d021134ff894ed6164b5833cc88c9fd31d43dd82b0673e8c24bf                                                                                             0.1s
+ => => exporting attestation manifest sha256:0d11e45818c16e9044b2e5cc38f04cefb6ab037d6c523ebf9964e5c1f440de1e                                                                               0.0s
+ => => exporting manifest list sha256:dbc890b4e1c77078edda9a105748be3670b1c8b013f0850182ebc73fae530c3a                                                                                      0.0s
+ => => naming to docker.io/library/haste-azurite:latest                                                                                                                                     0.0s
+ => => unpacking to docker.io/library/haste-azurite:latest                                                                                                                                306.6s
+ => [auth] library/python:pull token for registry-1.docker.io                                                                                                                               0.0s
+ => [titiler 1/1] FROM ghcr.io/developmentseed/titiler:0.18.6@sha256:ab05b8d0b18155f3d43570a200c3205617419d5276593377ce48f96810aa8992                                                     352.3s
+ => => resolve ghcr.io/developmentseed/titiler:0.18.6@sha256:ab05b8d0b18155f3d43570a200c3205617419d5276593377ce48f96810aa8992                                                               0.0s
+ => => sha256:57c8ce23569a039d807491eba003125cedb3912eea9d837ab40285991d67002f 1.25kB / 1.25kB                                                                                              0.7s
+ => => sha256:c74ca23a3fedb4ae77b2c241597509e62ec57d84c00d45a8698e112ae075141e 260B / 260B                                                                                                  1.3s
+ => => sha256:7d94c0c0d836ec444a125134547a077db2fcea669ff9af3f92b06f932550e0f1 64.76MB / 64.76MB                                                                                          160.6s
+ => => sha256:82713c5853089ace6ae67183af4de96212a78d885075dc0d087c98c380c942fa 1.39kB / 1.39kB                                                                                              1.2s
+ => => sha256:6edb070a4c64f82ae14bce3d166490ffce3ba92854134eadc963277ad7345993 263.48MB / 263.48MB                                                                                        351.2s
+ => => sha256:d7305a396d00498becf34498b8d0ebcc46cf088b85e77582e3d37b9c28b8d3a5 128B / 128B                                                                                                  1.5s
+ => => sha256:fb143f5f743e98c672118cc6da7c23a8a0fba46f0fb0c847f69cd4a639612d05 7.58MB / 7.58MB                                                                                             27.3s
+ => => sha256:f29ce7e7ce0d13cc20eacee1c75950ab36d1a609e9fb3fd24ac1c38efaac18e6 1.24kB / 1.24kB                                                                                              0.7s
+ => => sha256:6c9fd21a4b4fd7859754ce1926eb3839b34aa28f9330dba0991bcdf921a18e04 1.24kB / 1.24kB                                                                                              1.0s
+ => => sha256:a8b4790fce0e43abaf34c585554e509af3e70a04991ab977ae8edec0a454099d 1.25kB / 1.25kB                                                                                              0.9s
+ => => sha256:c729745ea8bd80b205c40d6bccfc3b489903f05e21117dcce54998f31823284d 125.97kB / 125.97kB                                                                                          0.9s
+ => => sha256:eb890d716f32d6c618928fba23821f5ba4189d97ee1e5588d5d69a555fb0a897 1.54kB / 1.54kB                                                                                              0.8s
+ => => sha256:9c9d50ad2495c8143321ab88d4c11275ded13e73a674b8270c65dfb6f7227bd6 34.65MB / 34.65MB                                                                                           84.6s
+ => => sha256:cc94674df9d0d701cd1550a58b705c6a8bace73f465976c04b44d34fc5970a43 235B / 235B                                                                                                  0.6s
+ => => sha256:98d32090bc0f569a31a9859a09ee8393387c59d6f0724c3441d96b8dd8b1c648 2.06kB / 2.06kB                                                                                              1.4s
+ => => sha256:fbeedb6fdd25a2c93b1ed87b0b6e07c1a3fb6135fc23fd0822ee872aef26b4dc 5.79MB / 5.79MB                                                                                             17.8s
+ => => sha256:b07054abf3ebe400169cbb41a4f556242888d56657b1940c85eec6a595c11f0c 193B / 193B                                                                                                  0.6s
+ => => sha256:06005fdb6753bb1232d2f5ce99c1e2c0f321428dbcd1ca33bed93490638e3fd4 1.99kB / 1.99kB                                                                                              0.9s
+ => [titiler] exporting to image                                                                                                                                                          359.8s
+ => => exporting layers                                                                                                                                                                     0.0s
+ => => exporting manifest sha256:b0e1556129759db0b12a60d806f6c41a226015a2ea7f610964e841fc850bbb86                                                                                           0.0s
+ => => exporting config sha256:d16abae5ebf9e610a7d6c3271301589514fa31c37ad41d36967a90a3babd63ea                                                                                             0.0s
+ => => exporting attestation manifest sha256:b878a54b07b4567e2bccca3f547d73c5fc68604d52b8de66c2b20bd9fdc21d0f                                                                               0.0s
+ => => exporting manifest list sha256:65801446da8a02a5b1686cfaed2eb636ed048e37e26da8ebf9ecff875e39a89c                                                                                      0.0s
+ => => naming to docker.io/library/haste-titiler:latest                                                                                                                                     0.0s
+ => => unpacking to docker.io/library/haste-titiler:latest                                                                                                                                359.7s
+ => [data-init internal] load build context                                                                                                                                                 0.1s
+ => => transferring context: 9.84kB                                                                                                                                                         0.0s
+ => [data-init 1/7] FROM docker.io/library/python:3.11-slim@sha256:db20d8506e2f15b6db39b40b6015ca46bae855dec6dd326d462cfe79ae972893                                                        77.0s
+ => => resolve docker.io/library/python:3.11-slim@sha256:db20d8506e2f15b6db39b40b6015ca46bae855dec6dd326d462cfe79ae972893                                                                   0.0s
+ => => sha256:361db81715472ecba5e656c314c299bd945309020483159596a8d123c2b1d580 251B / 251B                                                                                                  1.0s
+ => => sha256:24ff04c921070df4f4dc987278926d5dabde59d57b55ae3665439331f79af932 14.46MB / 14.46MB                                                                                           43.5s
+ => => sha256:ee5aaeba9945927662bea2702989dfd74d9273796415b896363e6a9c44d9a8ce 1.29MB / 1.29MB                                                                                              5.4s
+ => => sha256:6fc242d221a673263eabd14a9ad9584d3177c96e5cb504c891497338e2f912f5 29.86MB / 29.86MB                                                                                           75.2s
+ => => extracting sha256:6fc242d221a673263eabd14a9ad9584d3177c96e5cb504c891497338e2f912f5                                                                                                   0.8s
+ => => extracting sha256:ee5aaeba9945927662bea2702989dfd74d9273796415b896363e6a9c44d9a8ce                                                                                                   0.2s
+ => => extracting sha256:24ff04c921070df4f4dc987278926d5dabde59d57b55ae3665439331f79af932                                                                                                   0.7s
+ => => extracting sha256:361db81715472ecba5e656c314c299bd945309020483159596a8d123c2b1d580                                                                                                   0.0s
+ => [data-init 2/7] RUN pip install --no-cache-dir azure-storage-blob azure-storage-queue                                                                                                  25.9s
+ => [ui 2/7] WORKDIR /app                                                                                                                                                                   0.4s
+ => [ui 3/7] RUN chown nonroot:nonroot /app                                                                                                                                                 0.2s
+ => [ui 4/7] COPY --chown=nonroot:nonroot package*.json ./                                                                                                                                  0.1s
+ => [ui 5/7] RUN npm install                                                                                                                                                               48.7s
+ => [data-init 3/7] COPY ./setup/config_admin_settings.json /data/config_admin_settings.json                                                                                                0.0s
+ => [data-init 4/7] RUN echo '[]' > /data/users_acl.json                                                                                                                                    0.2s
+ => [data-init 5/7] RUN echo '{"projects": [], "project_count": 0, "layer_count": 0, "model_count": 0}' > /data/project_stats.json                                                          0.2s
+ => [data-init 6/7] COPY ./docker/data-init/upload_data.py /upload_data.py                                                                                                                  0.0s
+ => [data-init 7/7] RUN chmod +x /upload_data.py                                                                                                                                            0.2s
+ => [data-init] exporting to image                                                                                                                                                          2.6s
+ => => exporting layers                                                                                                                                                                     1.9s
+ => => exporting manifest sha256:73d80911bf46a70701ac1de228b2cf2064d67901573a5e4133d9151b02c91f6f                                                                                           0.0s
+ => => exporting config sha256:dcc39bd76432c3543c12d96bc61e15ea17affb78af963ae29f345c2e51671e68                                                                                             0.0s
+ => => exporting attestation manifest sha256:3a613ccdc61f79f3fa7f296a4acd5589afef13dc0c61df291f92b54fd3c27678                                                                               0.0s
+ => => exporting manifest list sha256:27e326d47ff38a090190908ff4d2d5bccd4429f458430a3979872dd213264586                                                                                      0.0s
+ => => naming to docker.io/library/haste-data-init:latest                                                                                                                                   0.0s
+ => => unpacking to docker.io/library/haste-data-init:latest                                                                                                                                0.6s
+ => [data-init] resolving provenance for metadata file                                                                                                                                      0.0s
+ => [ui 6/7] COPY --chown=nonroot:nonroot . .                                                                                                                                               0.4s
+ => [ui 7/7] COPY --chown=nonroot:nonroot .env.docker .env                                                                                                                                  0.1s
+ => [ui] exporting to image                                                                                                                                                                22.3s
+ => => exporting layers                                                                                                                                                                    15.6s
+ => => exporting manifest sha256:df5f7afda2edc6882aae325c02e8cde501fc3063f0e4ff42b70561082617467a                                                                                           0.0s
+ => => exporting config sha256:560af62f9904729142c05502b0a1931e366feea09a93ed1a57243727a8a515ab                                                                                             0.0s
+ => => exporting attestation manifest sha256:5306be9d256dd41e1a3ce5520698ba9cf26d3832d2c1c4943a7ae5f67e81ec8c                                                                               0.0s
+ => => exporting manifest list sha256:726299304ee1d6908dce56250ad63342c416422db1daec552f3d262fe459de01                                                                                      0.0s
+ => => naming to docker.io/library/haste-ui:latest                                                                                                                                          0.0s
+ => => unpacking to docker.io/library/haste-ui:latest                                                                                                                                       6.7s
+ => [ui] resolving provenance for metadata file                                                                                                                                             0.0s
+ => [azurite] resolving provenance for metadata file                                                                                                                                        0.0s
+ => [hastefuncqueues 2/9] WORKDIR /home/site/wwwroot                                                                                                                                        0.6s
+ => [hastefuncapi 3/9] RUN groupadd -r appgroup && useradd -r -g appgroup appuser     && mkdir -p /azure-functions-host/Secrets     && chown appuser:appgroup /azure-functions-host/Secret  0.3s
+ => [hastefuncapi 4/8] COPY --chown=appuser:appgroup hastelib/src/hastegeo /home/site/wwwroot/hastegeo                                                                                      0.1s
+ => [hastefuncapi 5/8] COPY --chown=appuser:appgroup hastelib/ /tmp/hastelib/                                                                                                               0.1s
+ => [hastefuncqueues 6/8] COPY --chown=appuser:appgroup api/hastefuncqueues/requirements.txt ./                                                                                             0.1s
+ => CACHED [hastefuncapi 4/9] COPY --chown=appuser:appgroup hastelib/src/hastegeo /home/site/wwwroot/hastegeo                                                                               0.0s
+ => CACHED [hastefuncapi 5/9] COPY --chown=appuser:appgroup hastelib/ /tmp/hastelib/                                                                                                        0.0s
+ => [hastefuncapi 6/9] COPY --chown=appuser:appgroup api/hastefuncapi/requirements.txt ./                                                                                                   0.1s
+ => [hastefuncapi 7/9] RUN pip install --no-cache-dir -r requirements.txt     && HASTE_SKIP_VERSION_BUMP=1 pip install --no-cache-dir /tmp/hastelib/     && rm -rf /tmp/hastelib          227.2s
+ => [hastefuncqueues 7/8] RUN pip install --no-cache-dir -r requirements.txt     && HASTE_SKIP_VERSION_BUMP=1 pip install --no-cache-dir /tmp/hastelib/     && rm -rf /tmp/hastelib       226.9s
+ => [titiler] resolving provenance for metadata file                                                                                                                                        0.0s
+ => [hastefuncqueues 8/8] COPY --chown=appuser:appgroup api/hastefuncqueues/ .                                                                                                              0.2s
+ => [hastefuncqueues] exporting to image                                                                                                                                                   41.5s
+ => => exporting layers                                                                                                                                                                    34.8s
+ => => exporting manifest sha256:04673fd54c4b50f6c3682ba7340f13906c5c910f4fae8af500bd9f21b5285523                                                                                           0.0s
+ => => exporting config sha256:ebd763c6f03c459610f26115ba4c9a60eb7e92b209c9d140f144b38d908710a4                                                                                             0.0s
+ => => exporting attestation manifest sha256:3aef8e9ad80a7d1aa289e90e263c4fca260502c838001437c3c42226c0efc28c                                                                               0.0s
+ => => exporting manifest list sha256:05efced51af0d871a7d7e6646c79914b9cacb2ad14da5620e27f3439425da4be                                                                                      0.0s
+ => => naming to docker.io/library/haste-queues:latest                                                                                                                                      0.0s
+ => => unpacking to docker.io/library/haste-queues:latest                                                                                                                                   6.5s
+ => [hastefuncapi 8/9] COPY --chown=appuser:appgroup api/hastefuncapi/ .                                                                                                                    0.2s
+ => [hastefuncapi 9/9] RUN sed -i 's/\r$//' /home/site/wwwroot/entrypoint.sh && chmod +x /home/site/wwwroot/entrypoint.sh                                                                   0.2s
+ => [hastefuncapi] exporting to image                                                                                                                                                      40.9s
+ => => exporting layers                                                                                                                                                                    34.6s
+[+] up 23/24ting manifest sha256:40850d14b53de950ba5585ca4a1af4225e25c58a21a8994d6be4ca7f95b0959d                                                                                           0.0s
+ ✔ Image haste-ui                                 Built                                                                                                                                    646.8s
+ ✔ Image haste-api                                Built                                                                                                                                    646.7s
+ ✔ Image haste-titiler                            Built                                                                                                                                    646.7s
+ ✔ Image haste-queues                             Built                                                                                                                                    646.7s
+ ✔ Image mcr.microsoft.com/oss/nginx/nginx:1.21.6 Pulled                                                                                                                                    19.1s
+ ✔ Image haste-azurite                            Built                                                                                                                                    646.8s
+ ✔ Image haste-data-init                          Built                                                                                                                                    646.7s
+ ✔ Volume haste_postgis-data                      Created                                                                                                                                    0.0s
+ ✔ Volume haste_azurite-data                      Created                                                                                                                                    0.0s
+ ✔ Network haste_default                          Created                                                                                                                                    0.0s
+ ⠧ Container haste-postgis-1                      Starting                                                                                                                                   1.8s
+ ✔ Container haste-azurite-1                      Started                                                                                                                                    1.8s
+ ✔ Container haste-titiler-1                      Created                                                                                                                                    0.1s
+ ✔ Container haste-data-init-1                    Created                                                                                                                                    0.1s
+ ✔ Container haste-hastefuncapi-1                 Created                                                                                                                                    0.7s
+ ✔ Container haste-hastefuncqueues-1              Created                                                                                                                                    0.8s
+ ... 2 more                                                                                                                                                                                      
+Error response from daemon: mounts denied: 
+The path /mnt/9035d428-606e-456a-8b00-3b244a71810b/hastedmg/Haste-DTF/haste-fork/db/migrations is not shared from the host and is not known to Docker.
+You can configure shared paths from Docker -> Preferences... -> Resources -> File Sharing.
+See https://docs.docker.com/ for more info.
+
+What's next:
+    Debug this Compose error with Gordon → docker ai "help me fix this compose error"
+student@ubuntu-bit:/mnt/9035d428-606e-456a-8b00-3b244a71810b/hastedmg/Haste-DTF/haste-fork/docker$ 

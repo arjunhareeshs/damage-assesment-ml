@@ -15,6 +15,10 @@ Usage:
 
 Requires the model weights to already be downloaded locally:
     python download_models.py
+
+With no arguments it scores buildings in a 500 m box at the centre of the
+default imagery tile and writes GPKG + GeoParquet + manifest to
+data/outputs/local_aoi/.
 """
 
 import argparse
@@ -33,8 +37,10 @@ import os
 
 os.environ["DTF_REPO_ROOT"] = str(DTF_REPO)
 
-DEFAULT_IMAGERY = BASE_DIR / "data" / "imagery" / "m_3510141_ne_14_060_20200915.tif"
-DEFAULT_FOOTPRINTS = BASE_DIR / "data" / "footprint" / "Texas.geojson" / "Texas.geojson"
+DEFAULT_IMAGERY = (
+    BASE_DIR / "data" / "data" / "imagery" / "naip_2020" / "m_3510141_ne_14_060_20200915.tif"
+)
+DEFAULT_FOOTPRINTS = BASE_DIR / "data" / "data" / "footprints" / "Texas.geojson"
 DEFAULT_OUTPUT_DIR = BASE_DIR / "data" / "outputs" / "local_aoi"
 
 
@@ -51,7 +57,33 @@ def get_local_checkpoint():
     return str(checkpoint_path), str(config_path)
 
 
-def load_buildings_in_scope(footprints_path, aoi_geojson_path, building_ids):
+def imagery_bounds_4326(imagery_path):
+    import rasterio
+    from rasterio.warp import transform_bounds
+
+    with rasterio.open(imagery_path) as src:
+        return transform_bounds(src.crs, "EPSG:4326", *src.bounds)
+
+
+def default_aoi(imagery_path, out_path, size_m=500):
+    """A ``size_m`` square at the imagery centre, saved as GeoJSON."""
+    from pyproj import Transformer
+    import rasterio
+    from shapely.geometry import box, mapping
+    from shapely.ops import transform
+
+    with rasterio.open(imagery_path) as src:
+        cx = (src.bounds.left + src.bounds.right) / 2
+        cy = (src.bounds.bottom + src.bounds.top) / 2
+        to_4326 = Transformer.from_crs(src.crs, "EPSG:4326", always_xy=True).transform
+    h = size_m / 2
+    geom = transform(to_4326, box(cx - h, cy - h, cx + h, cy + h))
+    with open(out_path, "w") as f:
+        json.dump(mapping(geom), f)
+    return str(out_path)
+
+
+def load_buildings_in_scope(footprints_path, aoi_geojson_path, building_ids, imagery_path=None):
     """Filter the footprints file down to just the buildings in scope,
     mirroring the semantics of the server's
     ``postgis_query.buildings_in_aoi`` (ST_Intersects) - just done locally
@@ -59,14 +91,28 @@ def load_buildings_in_scope(footprints_path, aoi_geojson_path, building_ids):
     import geopandas as gpd
     from shapely.geometry import mapping, shape
 
-    gdf = gpd.read_file(footprints_path)
+    # Only read the footprints inside the area of interest. The statewide
+    # file is ~3 GB; loading it whole exhausts memory and never finishes.
+    if building_ids:
+        bbox = imagery_bounds_4326(imagery_path)
+    else:
+        with open(aoi_geojson_path) as f:
+            aoi_gj = json.load(f)
+        bbox = shape(aoi_gj["geometry"] if "geometry" in aoi_gj else aoi_gj).bounds
+    print(f"[+] Reading footprints in bbox {tuple(round(b, 5) for b in bbox)} ...")
+    gdf = gpd.read_file(footprints_path, bbox=bbox, engine="pyogrio")
     if gdf.crs is not None and gdf.crs.to_epsg() != 4326:
         gdf = gdf.to_crs(epsg=4326)
 
-    if "id" not in gdf.columns:
-        gdf["id"] = gdf.index.astype(str)
-    else:
+    if "id" in gdf.columns:
         gdf["id"] = gdf["id"].astype(str)
+    else:
+        # The footprint file carries no building id, and a row number would
+        # change with every AOI. Derive a stable id from the footprint's own
+        # location instead: the same building gets the same id on every run.
+        c = gdf.geometry.representative_point()
+        gdf["id"] = [f"{x:.6f}_{y:.6f}" for x, y in zip(c.x, c.y)]
+        gdf = gdf.drop_duplicates(subset="id")
 
     if building_ids:
         wanted = {str(b) for b in building_ids}
@@ -97,10 +143,6 @@ def main():
     parser.add_argument("--pad-px", type=int, default=32)
     args = parser.parse_args()
 
-    if not args.aoi and not args.building_ids:
-        print("[ERROR] Provide either --aoi <file.geojson> or --building-ids id1,id2,...")
-        sys.exit(1)
-
     imagery_path = Path(args.imagery)
     footprints_path = Path(args.footprints)
     output_dir = Path(args.output_dir)
@@ -113,8 +155,12 @@ def main():
         print(f"[ERROR] Footprints file not found: {footprints_path}")
         sys.exit(1)
 
+    if not args.aoi and not args.building_ids:
+        args.aoi = default_aoi(imagery_path, output_dir / "default_aoi.geojson")
+        print(f"[+] No --aoi/--building-ids given; using a 500 m box at the imagery centre: {args.aoi}")
+
     building_ids = args.building_ids.split(",") if args.building_ids else None
-    buildings = load_buildings_in_scope(footprints_path, args.aoi, building_ids)
+    buildings = load_buildings_in_scope(footprints_path, args.aoi, building_ids, str(imagery_path))
     if not buildings:
         print("[ERROR] No buildings found in the given AOI / id list.")
         sys.exit(1)
@@ -125,6 +171,7 @@ def main():
 
     from hastegeo.workflows.damage_triage_aoi_infer import (
         run_damage_triage_aoi,
+        write_predictions_geoparquet,
         write_predictions_gpkg,
     )
 
@@ -140,12 +187,21 @@ def main():
     gpkg_path = output_dir / "local_aoi_predictions.gpkg"
     write_predictions_gpkg(buildings, results, str(gpkg_path))
 
+    parquet_path = output_dir / "local_aoi_predictions.parquet"
+    n_parquet = write_predictions_geoparquet(
+        buildings, results, str(parquet_path), extra={"model_id": "local_aoi"}
+    )
+    if n_parquet == 0:
+        print("[ERROR] No building was classified; GeoParquet is empty.")
+        sys.exit(1)
+
     manifest_path = output_dir / "local_aoi_manifest.json"
     with open(manifest_path, "w") as f:
         json.dump(
             {
                 "num_buildings": len(buildings),
                 "num_classified": sum(1 for r in results if r["class"] != -1),
+                "predictions_parquet_filename": parquet_path.name,
                 "buildings": results,
             },
             f,
@@ -155,6 +211,7 @@ def main():
     print("\n" + "=" * 70)
     print(f" DONE. {len(results)} building(s) classified.")
     print(f" GeoPackage: {gpkg_path}")
+    print(f" GeoParquet: {parquet_path}  ({n_parquet} rows)")
     print(f" Manifest:   {manifest_path}")
     print("=" * 70)
 

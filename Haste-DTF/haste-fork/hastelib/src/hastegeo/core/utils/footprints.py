@@ -302,53 +302,6 @@ def download_building_footprints(
     return int(footprints.shape[0])
 
 
-def _read_footprints_within_aoi(input_path: str, aoi_polygon):
-    """Read only the features whose geometry intersects ``aoi_polygon``.
-
-    A user-supplied footprint file is often statewide (multi-GB, millions
-    of features) while the AOI is a single scene. Reading the whole file
-    and clipping afterwards needs many times the file size in RAM and
-    reliably OOMs the imageryprep container, so push the spatial filter
-    down into the GDAL/pyogrio read.
-
-    ``bbox=`` must be expressed in the *dataset's* CRS, so the AOI (always
-    EPSG:4326 here) is reprojected first using the CRS reported by a
-    metadata-only ``read_info`` call. Any failure in the fast path falls
-    back to an unfiltered read so a CRS we cannot interpret degrades to
-    the previous behavior instead of failing outright.
-    """
-    try:
-        import pyogrio
-
-        info = pyogrio.read_info(input_path)
-        source_crs = info.get("crs")
-        if not source_crs:
-            raise ValueError("no CRS reported by read_info")
-
-        bounds = (
-            gpd.GeoSeries([aoi_polygon], crs="EPSG:4326")
-            .to_crs(source_crs)
-            .total_bounds
-        )
-        gdf = gpd.read_file(input_path, bbox=tuple(bounds))
-        logger.info(
-            "Read %d building footprints from %s using an AOI bbox filter "
-            "(source CRS %s)",
-            len(gdf),
-            os.path.basename(input_path),
-            source_crs,
-        )
-        return gdf
-    except Exception:
-        logger.warning(
-            "AOI bbox-filtered read failed for %s; falling back to a full "
-            "read (this may use a lot of memory for large files)",
-            os.path.basename(input_path),
-            exc_info=True,
-        )
-        return gpd.read_file(input_path)
-
-
 def clip_and_normalize_user_footprints(
     input_path: str,
     aoi_polygon,
@@ -358,8 +311,9 @@ def clip_and_normalize_user_footprints(
 ):
     """Clip a user-supplied building-footprint GPKG to an AOI polygon.
 
-    Reads ``input_path`` (any GDAL-supported vector format readable by
-    geopandas), reprojects to EPSG:4326 if needed, filters to polygonal
+    Reads ``input_path`` (a ``.gpkg``, ``.geojson``, ``.gdb`` folder,
+    ``.gdb.zip``, GeoParquet, a zip of those, or a folder holding several —
+    see :mod:`hastegeo.core.utils.footprint_sources`), reprojects to EPSG:4326 if needed, filters to polygonal
     geometries, clips to ``aoi_polygon`` (EPSG:4326), normalizes the
     schema to ``(id, geometry, subtype, class)`` synthesizing any
     missing non-geometry column, and writes a GeoPackage to
@@ -399,17 +353,23 @@ def clip_and_normalize_user_footprints(
             )
         os.remove(output_path)
 
-    gdf = _read_footprints_within_aoi(input_path, aoi_polygon)
+    # footprint_sources handles .gpkg / .geojson / .gdb(.zip) / .parquet /
+    # zips and folders of those, and pushes the AOI bbox into the read so a
+    # statewide file is never fully loaded.
+    from .footprint_sources import read_footprints
+
+    gdf = read_footprints(input_path, aoi_polygon)
     if gdf.crs is None:
         raise ValueError(
-            "Input GPKG is missing a CRS; embed one (e.g. EPSG:4326) and retry."
+            "Input is missing a CRS; embed one (e.g. EPSG:4326) and retry."
         )
 
     polygon_mask = gdf.geometry.geom_type.isin(["Polygon", "MultiPolygon"])
     gdf = gdf.loc[polygon_mask].copy()
     if gdf.empty:
         raise ValueError(
-            "Input GPKG contains no Polygon/MultiPolygon features."
+            "Input contains no Polygon/MultiPolygon features within the "
+            "AOI bounding box."
         )
 
     if gdf.crs.to_epsg() != 4326:

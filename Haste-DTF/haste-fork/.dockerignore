@@ -12,6 +12,9 @@ build
 *.log
 checkpoints/*.pth
 data/tiles_1024
+# Upload staging area bind-mounted into the API containers (can hold GB of
+# imagery); no Dockerfile copies from it.
+data
 *.incomplete
 # The training / imageryprep / api images all build with the repo root as
 # context but none of them COPY from ui/. The ui image has its own context

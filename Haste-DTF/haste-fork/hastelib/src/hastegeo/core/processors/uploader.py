@@ -143,7 +143,8 @@ class FileUploader:
         """Normalize and validate the chunked-upload data format.
 
         Accepts ``None`` (back-compat default of ``tif``), ``tif``,
-        ``tiff``, ``geotiff`` (all normalize to ``tif``), and ``gpkg``.
+        ``tiff``, ``geotiff`` (all normalize to ``tif``), ``gpkg``, ``geojson``,
+        ``zip`` (zipped .gdb / .gpkg / .geojson) and ``parquet``.
         Raises ValueError for anything else so a hostile client cannot
         smuggle arbitrary extensions through the blob-path construction.
         """
@@ -155,6 +156,12 @@ class FileUploader:
             return formats.TIF.value
         if normalized == "gpkg":
             return formats.GPKG.value
+        if normalized in ("geojson", "json"):
+            return formats.GEOJSON.value
+        if normalized == "zip":
+            return formats.ZIP.value
+        if normalized in ("parquet", "geoparquet"):
+            return formats.PARQUET.value
         raise ValueError(
             f"Unsupported chunked-upload data_format: {data_format!r}"
         )

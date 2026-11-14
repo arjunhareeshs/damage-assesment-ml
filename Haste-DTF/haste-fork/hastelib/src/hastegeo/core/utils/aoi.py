@@ -20,6 +20,7 @@ import numpy as np
 import rasterio
 import rasterio.features
 import shapely.geometry
+import shapely.geometry.base
 
 from .gdal_security import harden_gdal
 
@@ -34,30 +35,37 @@ def extract_aoi_polygon(
     cog_path: str,
     *,
     simplify_tolerance_meters: float = 10.0,
-) -> shapely.geometry.Polygon:
-    """Extract the largest valid-data polygon from a GeoTIFF, in EPSG:4326.
+    min_region_fraction: float = 0.01,
+) -> shapely.geometry.base.BaseGeometry:
+    """Extract the valid-data area of a GeoTIFF as a polygon, in EPSG:4326.
 
     The valid-data mask is built from pixels that are non-zero in any band
     (matching the original ``extract_data_mask_from_geotiff.py`` semantics).
-    When multiple disconnected valid regions exist, the largest by area is
-    chosen. The exterior ring is simplified by approximately
-    ``simplify_tolerance_meters`` meters and any interior holes are dropped.
 
-    The returned polygon is in EPSG:4326 regardless of the input CRS.
+    Every disconnected valid region is kept, so a layer built from imagery
+    tiles that don't touch (two NAIP tiles kilometres apart, say) covers all
+    of them. Only specks smaller than ``min_region_fraction`` of the largest
+    region are dropped as noise. This used to keep just the largest region,
+    which silently threw away every other tile -- and with it its buildings.
+
+    Each region's exterior ring is simplified by approximately
+    ``simplify_tolerance_meters`` meters and its interior holes are dropped.
 
     Args:
         cog_path: Path to a readable GeoTIFF (typically the post-event mosaic).
         simplify_tolerance_meters: Douglas-Peucker tolerance applied to the
-            exterior ring before reprojection. Defaults to 10 m.
+            exterior rings before reprojection. Defaults to 10 m.
+        min_region_fraction: Regions smaller than this fraction of the
+            largest region's area are dropped as noise. Defaults to 1%.
 
     Returns:
-        ``shapely.geometry.Polygon`` of the largest valid-data region in
+        A ``Polygon`` (one region) or ``MultiPolygon`` (several), in
         EPSG:4326.
 
     Raises:
         ValueError: If no valid-data region can be derived.
     """
-    import fiona.transform
+    import shapely.ops
 
     with rasterio.open(cog_path) as f:
         data = f.read()
@@ -67,46 +75,47 @@ def extract_aoi_polygon(
     num_channels, _, _ = data.shape
     mask = ((data == 0).sum(axis=0) != num_channels).astype(np.uint8)
 
-    features = list(rasterio.features.shapes(mask, transform=transform))
-
-    geoms = []
-    areas = []
-    for geom, val in features:
-        if val == 1:
-            shape = shapely.geometry.shape(geom)
-            areas.append(shape.area)
-            geoms.append(geom)
-
-    if not geoms:
+    regions = [
+        shapely.geometry.shape(geom)
+        for geom, val in rasterio.features.shapes(mask, transform=transform)
+        if val == 1
+    ]
+    if not regions:
         raise ValueError(
             f"No valid-data regions found in {cog_path} (mask is all zero)."
         )
 
-    if len(geoms) > 1:
-        logger.warning(
-            "Found %d valid-data regions in %s; choosing largest by area.",
-            len(geoms),
+    largest = max(r.area for r in regions)
+    kept = [r for r in regions if r.area >= largest * min_region_fraction]
+    if len(regions) > 1:
+        logger.info(
+            "Found %d valid-data regions in %s; keeping %d (dropped %d "
+            "specks under %.1f%% of the largest region).",
+            len(regions),
             cog_path,
+            len(kept),
+            len(regions) - len(kept),
+            min_region_fraction * 100,
         )
-        max_area = max(areas)
-        geom = next(g for g, a in zip(geoms, areas) if a == max_area)
-    else:
-        geom = geoms[0]
 
-    shape = shapely.geometry.shape(geom)
-    # Drop any holes — we only want the outer footprint
-    exterior_shape = shapely.geometry.Polygon(list(shape.exterior.coords))
+    tolerance = (
+        simplify_tolerance_meters / 111_139.0  # 1 degree lat ~ 111,139 m
+        if crs == "EPSG:4326"
+        else simplify_tolerance_meters
+    )
+    # Drop holes -- we only want each region's outer footprint.
+    outlines = [
+        shapely.geometry.Polygon(list(r.exterior.coords)).simplify(tolerance)
+        for r in kept
+    ]
+    merged = shapely.ops.unary_union(outlines)
 
     if crs == "EPSG:4326":
-        # 1 degree lat ≈ 111,139 m
-        simplified = exterior_shape.simplify(
-            simplify_tolerance_meters / 111_139.0
-        )
-        return simplified
+        return merged
+    import fiona.transform
 
-    simplified = exterior_shape.simplify(simplify_tolerance_meters)
     geom_4326 = fiona.transform.transform_geom(
-        crs, "EPSG:4326", shapely.geometry.mapping(simplified)
+        crs, "EPSG:4326", shapely.geometry.mapping(merged)
     )
     return shapely.geometry.shape(geom_4326)
 

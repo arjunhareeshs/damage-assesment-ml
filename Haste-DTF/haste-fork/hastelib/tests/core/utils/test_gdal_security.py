@@ -88,7 +88,7 @@ class TestUploadFormatHelpers(unittest.TestCase):
         self.assertEqual(g.assert_allowed_upload_format("gpkg"), "gpkg")
 
     def test_disallowed_formats_raise(self):
-        for v in ("hdf", "zip", "", "shp", None):
+        for v in ("hdf", "", "shp", None):
             with self.subTest(v=v):
                 with self.assertRaises(ValueError):
                     g.assert_allowed_upload_format(v)

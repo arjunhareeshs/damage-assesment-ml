@@ -1,0 +1,41 @@
+# Normally started through ./run.sh, which sets these variables from its flags.
+name: haste-dtf-aoi
+
+services:
+  dtf-aoi:
+    build:
+      context: .
+      additional_contexts:
+        pylibs: ./localpkgs
+    image: haste-dtf-aoi:latest
+    container_name: haste-dtf-aoi
+    # Bind-mounted output files belong to the host user.
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    command: ${DTF_ARGS:---aoi /app/input/aoi.json} --imagery /app/input/imagery.tif --footprints /app/input/footprints${FOOTPRINTS_EXT:-.geojson} --output-dir /app/outputs
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      DTF_DEVICE: "${DTF_DEVICE:-cuda}"
+      CUDA_VISIBLE_DEVICES: "${CUDA_VISIBLE_DEVICES:-0}"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+    volumes:
+      - ./models:/app/models:ro
+      - ${IMAGERY_FILE:-./data/data/imagery/naip_2020/m_3510141_ne_14_060_20200915.tif}:/app/input/imagery.tif:ro
+      - ${FOOTPRINTS_FILE:-./data/data/footprints/Texas.geojson}:/app/input/footprints${FOOTPRINTS_EXT:-.geojson}:ro
+      - ${AOI_FILE:-./aoi/default_aoi.json}:/app/input/aoi.json:ro
+      - ${OUTPUT_DIR:-./data/outputs/local_aoi}:/app/outputs
+      - ./logs:/app/run/logs
+    # A batch job: a failure is deterministic, so restarting would only repeat
+    # it and hide the non-zero exit code from run.sh.
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "nvidia-smi", "-L"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s

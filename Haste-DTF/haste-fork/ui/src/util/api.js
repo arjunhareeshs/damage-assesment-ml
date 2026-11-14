@@ -3,8 +3,6 @@
 
 const APIUrl = import.meta.env.VITE_API_URL;
 const APIMSubscriptionKey = import.meta.env.VITE_APIM_SUBSCRIPTION_KEY;
-import { upsertUser } from "../AppHelper.js";
-import { sanitizeRedirectPath } from "./validation.js";
 
 function resolveVarConcatChar(text) {
   if (text === "") return "";
@@ -20,47 +18,22 @@ export function buildUrl(endpoint) {
   return base;
 }
 
-export async function apiValidateUser(setAppParams) {
-  try {
-    const staticAppStatus = await fetch("/.auth/me");
-    const staticAppUserStatus = await staticAppStatus.json();
-    if (staticAppUserStatus.clientPrincipal) {
-      var response = await apiGet("GetUserById?userId=" + staticAppUserStatus.clientPrincipal.userDetails);
-      if (response && response.status === "Active" || response && response.status === "Inactive") {
-        const upsertUserObject = await upsertUser(response);
-        if (upsertUserObject) {
-          setAppParams((prevParams) => ({
-            ...prevParams,
-            userId: upsertUserObject.userId,
-            userRoles: upsertUserObject.userRoles,
-            userSettings: upsertUserObject.settings,
-            userStatus: upsertUserObject.status
-          }));
-        }
-      } else if (response && response.status === "PendingAcceptance") {
-        setAppParams((prevParams) => ({
-          ...prevParams,
-          userId: response.userId,
-          userRoles: response.userRoles,
-          userSettings: response.settings,
-          userStatus: response.status
-        }));
-      }
-    }
-  } catch (error) {
-    console.error("Error validating user:", error);
-  }
-}
+// No sign-in: the app runs as a single local user with full access.
+export const LOCAL_USER = {
+  userId: "local-user",
+  userRoles: ["administrators"],
+  settings: { disableGuidedTour: false, itemsPerPage: 10 },
+  status: "Active",
+};
 
-export async function apiLogout(redirectPath = "/") {
-  try {
-    // Constrain to a same-origin relative path so a crafted logout link can't
-    // redirect users off-origin after sign-out (Security Review finding §8.6).
-    const safePath = sanitizeRedirectPath(redirectPath);
-    window.location.href = `/.auth/logout?post_logout_redirect_uri=${encodeURIComponent(safePath)}`;
-  } catch (error) {
-    console.error("Error logging out:", error);
-  }
+export async function apiValidateUser(setAppParams) {
+  setAppParams((prevParams) => ({
+    ...prevParams,
+    userId: LOCAL_USER.userId,
+    userRoles: LOCAL_USER.userRoles,
+    userSettings: LOCAL_USER.settings,
+    userStatus: LOCAL_USER.status,
+  }));
 }
 
 export async function apiGet(endpoint) {

@@ -20,10 +20,7 @@ const ProjectHeader = () => {
             <Text className="fw-semibold">Labeling</Text>
           </th>
           <th className="pb-3 pe-4 custom-text-no-wrap d-none d-xl-table-cell">
-            <Text className="fw-semibold">Model Training</Text>
-          </th>
-          <th className="pb-3 pe-4 custom-text-no-wrap d-none d-xl-table-cell">
-            <Text className="fw-semibold">Building Validation</Text>
+            <Text className="fw-semibold">Models</Text>
           </th>
           <th className="pb-3 pe-4 custom-text-no-wrap d-none d-xl-table-cell">
             <Text className="fw-semibold">DamageTriageFormer</Text>

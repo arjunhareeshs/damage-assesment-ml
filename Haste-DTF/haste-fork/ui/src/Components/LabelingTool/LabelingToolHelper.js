@@ -142,10 +142,15 @@ export function loadImagery(tileUrl, map, imageryRef, customId, isVisible) {
   }
 }
 
+// Room for the overlays (top header strip, drawing toolbar, the ~320 px right
+// panel). With padding 0 the right panel covered the east edge of the imagery,
+// so the whole image was never fully visible.
+export const IMAGERY_FIT_PADDING = { top: 70, bottom: 40, left: 40, right: 360 };
+
 export function centrateMap(bbox, map, duration = 2500) {
   map.setCamera({
     bounds: bbox,
-    padding: 0,
+    padding: IMAGERY_FIT_PADDING,
     type: "fly",
     pitch: 0,
     duration: duration,

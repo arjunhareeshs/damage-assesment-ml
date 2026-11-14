@@ -9,6 +9,13 @@ import { apiPost, apiPut } from "../../util/api";
 import { AppContext } from "../../AppContext";
 import SectionModal from "../SectionModal";
 
+const STATE_STYLE = {
+  ready: { text: "AOI ready", color: "#107c10" },
+  incomplete_imagery: { text: "Incomplete imagery coverage", color: "#bf6a00" },
+  no_buildings: { text: "No buildings found in this AOI", color: "#a4262c" },
+  no_imagery: { text: "No usable imagery found", color: "#a4262c" },
+};
+
 const AoiAssessmentModal = ({
   onClose,
   projectId,
@@ -77,6 +84,13 @@ const AoiAssessmentModal = ({
         name: name.trim() || undefined,
       };
       const result = await apiPut("PutAoiAssessment", body);
+      if (result === 409) {
+        setDialog(
+          "Already running",
+          "An assessment for this exact area is already in progress."
+        );
+        return;
+      }
       onClose();
       if (onAssessmentCreated) {
         onAssessmentCreated(result.assessmentId);
@@ -93,7 +107,7 @@ const AoiAssessmentModal = ({
     }
   }
 
-  const hasNoImagery = preview && preview.imageryCount === 0;
+  const cannotSubmit = preview && preview.canSubmit === false;
 
   return (
     <SectionModal
@@ -145,21 +159,42 @@ const AoiAssessmentModal = ({
                   </p>
                 ) : preview ? (
                   <div className="d-flex flex-column gap-1" style={{ fontSize: 13 }}>
+                    <div
+                      style={{
+                        color: STATE_STYLE[preview.state]?.color || "#333",
+                        fontWeight: 600,
+                      }}
+                    >
+                      {STATE_STYLE[preview.state]?.text || "Assessment unavailable"}
+                    </div>
                     <div>
                       <strong>AOI Area:</strong> {preview.areaKm2} km²
                     </div>
                     <div>
-                      <strong>Covering TIFs:</strong>{" "}
-                      <span style={{ color: preview.imageryCount === 0 ? "#a4262c" : "#333" }}>
-                        {preview.imageryCount} raster{preview.imageryCount === 1 ? "" : "s"}
-                      </span>
+                      <strong>Imagery:</strong> {preview.imageryCount} raster
+                      {preview.imageryCount === 1 ? "" : "s"} (
+                      {preview.fullyCoveredTiles ?? 0} full,{" "}
+                      {preview.partiallyCoveredTiles ?? 0} partial)
                     </div>
                     <div>
-                      <strong>Eligible Buildings:</strong> {preview.buildingCount.toLocaleString()} footprints
+                      <strong>Imagery coverage:</strong>{" "}
+                      {preview.coveragePercent ?? 0}%
+                      {preview.missingAreaKm2 > 0
+                        ? ` (${preview.missingAreaKm2} km² has no imagery and will not be assessed)`
+                        : ""}
                     </div>
-                    {hasNoImagery && (
+                    <div>
+                      <strong>Buildings:</strong>{" "}
+                      {preview.buildingCount.toLocaleString()} footprints
+                    </div>
+                    <div>
+                      <strong>Processing units (est. max):</strong>{" "}
+                      {(preview.estimatedUnits ?? 0).toLocaleString()}
+                    </div>
+                    {preview.exceedsMaxUnits && (
                       <p style={{ color: "#a4262c", margin: "6px 0 0 0", fontSize: 12 }}>
-                        Warning: No registered imagery covers this AOI. Submission will be rejected.
+                        This AOI needs more than the allowed {preview.maxUnits} units.
+                        Draw a smaller area.
                       </p>
                     )}
                   </div>
@@ -179,7 +214,7 @@ const AoiAssessmentModal = ({
                 id="submitAoiAssessment"
                 className="me-2"
                 onClick={handleSubmit}
-                disabled={!aoiGeoJson || previewLoading || hasNoImagery}
+                disabled={!aoiGeoJson || previewLoading || !!previewError || cannotSubmit}
               >
                 Submit Assessment
               </PrimaryButton>

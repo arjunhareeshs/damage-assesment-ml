@@ -146,11 +146,84 @@ DTF_IDX_TO_COLOR = np.array(
 )
 
 
+def resolve_device() -> torch.device:
+    """Inference device from ``DTF_DEVICE`` (default ``auto``).
+
+    ``auto`` keeps the historical cuda-if-available behaviour. An explicit
+    ``cuda``/``cuda:N`` refuses to fall back to CPU, so a container started
+    without GPU access fails immediately instead of running for hours on CPU.
+    """
+    requested = os.getenv("DTF_DEVICE", "auto")
+    if requested == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(requested)
+        if device.type == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError(
+                f"DTF_DEVICE={requested} but torch sees no CUDA device "
+                f"(torch {torch.__version__}, built for CUDA {torch.version.cuda})."
+            )
+    if device.type == "cuda":
+        logger.info(
+            "Using %s: %s (torch %s, CUDA %s)",
+            device,
+            torch.cuda.get_device_name(device),
+            torch.__version__,
+            torch.version.cuda,
+        )
+    return device
+
+
+class GatedDinoCrop(torch.nn.Module):
+    """Crop-mode DamageTriageFormer: the architecture of the current released
+    checkpoint (upstream ``scripts/train_crop.py``). DINOv3 CLS token -> linear
+    gate + 4-way leaf. Takes a 224x224 building crop, no instance mask."""
+
+    crop_mode = True
+    use_gated_head = True
+
+    def __init__(self):
+        super().__init__()
+        from transformers import AutoConfig, AutoModel
+
+        if DTF_REPO_ROOT not in sys.path:
+            sys.path.insert(0, DTF_REPO_ROOT)
+        from src.config import BACKBONE  # noqa: E402 (see sys.path above)
+
+        # Architecture only: every weight comes from the checkpoint.
+        self.vit = AutoModel.from_config(AutoConfig.from_pretrained(BACKBONE))
+        hidden = self.vit.config.hidden_size
+        self.gate = torch.nn.Linear(hidden, 1)
+        self.leaf = torch.nn.Linear(hidden, len(DTF_CATEGORIES) - 1)
+        self.aux = torch.nn.Linear(hidden, 1)
+
+    def forward(self, x):
+        cls = self.vit(pixel_values=x).last_hidden_state[:, 0]
+        p_damaged = torch.sigmoid(self.gate(cls))
+        return torch.cat(
+            [1 - p_damaged, p_damaged * torch.softmax(self.leaf(cls), dim=-1)],
+            dim=1,
+        )
+
+
+def score_crop(model, crop: np.ndarray, device: torch.device) -> np.ndarray:
+    """(1, 5) class probabilities for one ``(3, H, W)`` uint8 building crop."""
+    import cv2
+
+    resized = cv2.resize(
+        np.transpose(crop, (1, 2, 0)), (224, 224), interpolation=cv2.INTER_AREA
+    )
+    x = np.transpose(normalize_tile(resized, mode="imagenet"), (2, 0, 1))
+    with torch.inference_mode():
+        return model(torch.from_numpy(x).unsqueeze(0).to(device)).cpu().numpy()
+
+
 def build_dtf_model(
     checkpoint_path: str,
     config_path: str,
     device: torch.device,
     strict_region_check: bool = False,
+    allow_crop_mode: bool = False,
 ):
     """Load Damage-TriageFormer's Model class and checkpoint weights.
 
@@ -169,10 +242,33 @@ def build_dtf_model(
     a saved ``last_checkpoint.pth`` is a dict with a ``model_state_dict`` key;
     a bare ``best_model.pth`` (what the HF repo ships) is a raw state_dict.
 
-    ``strict_region_check`` (large-AOI region workflow only) raises if any
-    ``backbone.*`` or ``damage_head.*`` weight is missing from the
-    checkpoint instead of only logging the count.
+    Raises if any ``backbone.*`` or ``damage_head.*`` weight is missing from
+    the checkpoint: ``strict=False`` would otherwise leave them randomly
+    initialised and every prediction would be noise.
+
+    A crop-mode checkpoint (``GatedDinoCrop``) has neither of those prefixes.
+    It is only returned to callers that pass ``allow_crop_mode``, since it
+    cannot score the instance masks the tile-based workflows feed it.
     """
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state_dict = (
+        checkpoint["model_state_dict"]
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint
+        else checkpoint
+    )
+    if "gate.weight" in state_dict:
+        if not allow_crop_mode:
+            raise RuntimeError(
+                f"{checkpoint_path} is a crop-mode checkpoint; this tile-based "
+                "workflow needs a mask-pooling one. Use the per-building path "
+                "(damage_triage_aoi_infer)."
+            )
+        model = GatedDinoCrop()
+        model.load_state_dict(state_dict, strict=True)
+        model.to(device)
+        model.eval()
+        return model, True
+
     if DTF_REPO_ROOT not in sys.path:
         sys.path.insert(0, DTF_REPO_ROOT)
     from src.model.net import Model as DTFModel  # noqa: E402 (see sys.path above)
@@ -192,12 +288,6 @@ def build_dtf_model(
         use_attention=not train_cfg.get("no_attention_pool", False),
         drop_path_rate=float(train_cfg.get("drop_path", 0.0)),
     )
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    state_dict = (
-        checkpoint["model_state_dict"]
-        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint
-        else checkpoint
-    )
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing or unexpected:
         logger.warning(
@@ -205,16 +295,16 @@ def build_dtf_model(
             f"{len(unexpected)} unexpected keys "
             f"(architecture derived from {config_path})"
         )
-    if strict_region_check:
-        critical_missing = [
-            k for k in missing
-            if k.startswith("backbone.") or k.startswith("damage_head.")
-        ]
-        if critical_missing:
-            raise RuntimeError(
-                f"Checkpoint failed critical validation for region inference: "
-                f"missing {len(critical_missing)} essential weights starting with backbone./damage_head."
-            )
+    critical_missing = [
+        k for k in missing
+        if k.startswith("backbone.") or k.startswith("damage_head.")
+    ]
+    if critical_missing:
+        raise RuntimeError(
+            f"Checkpoint failed critical validation: missing "
+            f"{len(critical_missing)} essential weights starting with "
+            "backbone./damage_head."
+        )
 
     model.to(device)
     model.eval()
@@ -418,6 +508,128 @@ def score_window(
     )
 
 
+# Crop-mode input contract (the released checkpoint's config.json,
+# "preprocessing"): footprint bbox + 32 px margin clipped to the tile, resized
+# to 224, ImageNet-normalised; footprints under 30 px are not scored.
+CROP_MARGIN_PX = 32
+CROP_INPUT_SIZE = 224
+MIN_CROP_FOOTPRINT_PX = 30
+# GPU memory kept free for activations when sizing a forward pass, as a share
+# of what is free when the batch size is chosen.
+CROP_VRAM_BUDGET = 0.6
+# Measured on an RTX 3060 (ViT-L, 224 px, fp32): 9.5 MiB per crop at batch 32-128,
+# 17 MiB at batch 1. 12 MiB leaves a margin. Throughput plateaus at ~42 crops/s
+# from batch 16 up, so a larger batch only costs memory.
+CROP_BYTES_PER_ITEM = 12 * 1024 * 1024
+CROP_MAX_PER_FORWARD = 64
+CROP_CPU_PER_FORWARD = 4
+
+
+def crop_box_from_mask(
+    mask: np.ndarray, width: int, height: int, margin: int = CROP_MARGIN_PX
+):
+    """Pixel box ``(x0, y0, x1, y1)`` around a boolean footprint mask, grown by
+    ``margin`` and clipped to the real ``width`` x ``height`` window (never into
+    zero padding). ``None`` if the mask is empty."""
+    rows = np.flatnonzero(mask.any(axis=1))
+    cols = np.flatnonzero(mask.any(axis=0))
+    if rows.size == 0 or cols.size == 0:
+        return None
+    return (
+        max(0, int(cols[0]) - margin),
+        max(0, int(rows[0]) - margin),
+        min(width, int(cols[-1]) + 1 + margin),
+        min(height, int(rows[-1]) + 1 + margin),
+    )
+
+
+def resolve_crops_per_forward(
+    device: torch.device,
+    upper: Optional[int] = None,
+    free_bytes: Optional[int] = None,
+) -> int:
+    """Crops per forward pass, chosen from the hardware that is actually there.
+
+    * CPU: a small fixed batch (a large one only adds latency).
+    * CUDA: as many as fit in ``CROP_VRAM_BUDGET`` of the memory free right
+      now, rounded down to a power of two, between 1 and ``upper``
+      (``HASTE_REGION_MASKS_PER_FORWARD``, default ``CROP_MAX_PER_FORWARD``).
+    """
+    cap = upper if upper and upper > 0 else CROP_MAX_PER_FORWARD
+    if device.type != "cuda":
+        return max(1, min(cap, CROP_CPU_PER_FORWARD))
+    if free_bytes is None:
+        free_bytes = torch.cuda.mem_get_info(device)[0]
+    fit = int(free_bytes * CROP_VRAM_BUDGET // CROP_BYTES_PER_ITEM)
+    fit = max(1, min(cap, fit))
+    return 1 << (fit.bit_length() - 1)
+
+
+def score_crops(
+    model: torch.nn.Module,
+    tile: np.ndarray,
+    boxes: list,
+    device: torch.device,
+    crops_per_forward: Optional[int] = None,
+) -> np.ndarray:
+    """Score one crop per box from a ``(3, H, W)`` uint8 tile with a crop-mode
+    model. Returns ``(len(boxes), 5)`` probabilities in ``boxes`` order.
+
+    Crops are run ``crops_per_forward`` at a time. On CUDA out-of-memory the
+    chunk is halved and retried, and a single crop that still does not fit is
+    scored on the CPU, so a window is never lost to memory pressure.
+    """
+    import cv2
+
+    if not boxes:
+        return np.empty((0, len(DTF_CATEGORIES)), dtype=np.float32)
+    if tile.dtype != np.uint8:
+        tile = np.clip(
+            tile * 255.0 if tile.max() <= 1.0 else tile, 0, 255
+        ).astype(np.uint8)
+    hwc = np.transpose(tile, (1, 2, 0))
+    batch = np.empty(
+        (len(boxes), 3, CROP_INPUT_SIZE, CROP_INPUT_SIZE), dtype=np.float32
+    )
+    for i, (x0, y0, x1, y1) in enumerate(boxes):
+        crop = cv2.resize(
+            np.ascontiguousarray(hwc[y0:y1, x0:x1]),
+            (CROP_INPUT_SIZE, CROP_INPUT_SIZE),
+            interpolation=cv2.INTER_AREA,
+        )
+        batch[i] = np.transpose(normalize_tile(crop, mode="imagenet"), (2, 0, 1))
+
+    chunk = crops_per_forward if crops_per_forward and crops_per_forward > 0 else len(batch)
+    out = []
+    idx = 0
+    while idx < len(batch):
+        n = min(chunk, len(batch) - idx)
+        x = torch.from_numpy(batch[idx : idx + n])
+        try:
+            with torch.inference_mode():
+                out.append(model(x.to(device)).cpu().numpy())
+            idx += n
+        except torch.cuda.OutOfMemoryError:
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            if n > 1:
+                chunk = max(1, n // 2)
+                logger.warning(
+                    "CUDA OOM on %d crops; reducing to %d per forward", n, chunk
+                )
+                continue
+            logger.warning("CUDA OOM at 1 crop; scoring it on the CPU")
+            orig_device = next(model.parameters()).device
+            model.to("cpu")
+            try:
+                with torch.inference_mode():
+                    out.append(model(x).numpy())
+                idx += n
+            finally:
+                model.to(orig_device)
+    return np.vstack(out)
+
+
 def write_visualizer_rasters(
     work: gpd.GeoDataFrame,
     best_class: np.ndarray,
@@ -516,7 +728,7 @@ def run_damage_triage(
     n_total = len(footprints)
     log_progress(f"{n_total} footprints loaded (CRS: {footprints.crs})")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device()
     log_progress(f"Loading DamageTriageFormer checkpoint on {device}...")
     model, use_gated = build_dtf_model(
         checkpoint_path, checkpoint_config_path, device

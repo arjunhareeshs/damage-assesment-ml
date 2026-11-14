@@ -77,7 +77,6 @@ const CreateEditImageLayerModal = () => {
     const {
       name,
       description,
-      workflowType,
       preEventImageryUrls,
       postEventImageryUrls,
       format,
@@ -127,7 +126,7 @@ const CreateEditImageLayerModal = () => {
         !!entries[0].value;
       if (!firstReady) {
         userBuildingFootprintsControlError =
-          "Add a building-footprints URL or upload a .gpkg file, or disable the custom footprints panel.";
+          "Add a building-footprints URL or upload a footprints file, or disable the custom footprints panel.";
       }
     }
 
@@ -199,7 +198,7 @@ const CreateEditImageLayerModal = () => {
           projectId: componentState.projectId,
           name: name,
           description: description,
-          workflowType: workflowType || "standard",
+          workflowType: "standard",
           preEventImageryUrls: getUrlList(preEventImageryUrls),
           postEventImageryUrls: getUrlList(postEventImageryUrls),
           format: format,
@@ -275,46 +274,16 @@ const CreateEditImageLayerModal = () => {
             </div>
           </div>
 
-          <div className="row mb-2">
-            <div className="col-12">
-              <Dropdown
-                id="createEditImageLayerWorkflowType"
-                label="Workflow type"
-                selectedKey={componentState.workflowType || "standard"}
-                options={[
-                  {
-                    key: "standard",
-                    text: "Standard labeling workflow",
-                  },
-                  {
-                    key: "building",
-                    text: "Building labeling workflow",
-                  },
-                ]}
-                onChange={(e, option) =>
-                  onFormChange(
-                    option.key,
-                    "workflowType",
-                    setComponentState,
-                    componentState
-                  )
-                }
-              />
-            </div>
-          </div>
-
           <div className="row mb-2 p-2">
             <div className="col-12 p-4  flex-column d-flex box-highlight">
               <div className="col-12">
                 <h6 className="m-0 pb-2">Imagery Details</h6>
                 <Text variant="medium">
                   Add imagery files by providing publicly accessible URLs or
-                  uploading files from a local directory that show the Area of
-                  Interest (AOI). If multiple files are provided in a section,
-                  they will be merged into a single GeoTIFF image; therefore,
-                  all files in a given section must correspond to the same AOI.
-                  You can combine files from both a URL and a local directory if
-                  needed. All files must be valid GeoTIFF (.tif) files.
+                  uploading files from a local directory. Multiple files are
+                  merged into a single GeoTIFF image, and files covering
+                  separate areas are all kept. You can combine URLs and local
+                  files. All files must be valid GeoTIFF (.tif) files.
                 </Text>
               </div>
             </div>
@@ -324,15 +293,12 @@ const CreateEditImageLayerModal = () => {
             <div className="col-12 p-4 pb-0 flex-column d-flex box-highlight">
               <div className="col-12 mb-4">
                 <h6 className="m-0 pb-3">
-                  Post-Event Imagery
+                  Imagery
                   <span className="required-form-element"> *</span>
                 </h6>
                 <Text variant="medium" className="">
-                  This section is <span className="fw-semibold">required</span>.
-                  Here you must add imagery files that represent an AOI captured
-                  after the date of the natural catastrophe. Select the
-                  &quot;Source Type&quot; that matches your images for the best
-                  labeling experience.
+                  Add the imagery to assess. Select the &quot;Source Type&quot;
+                  that matches your images for the best labeling experience.
                 </Text>
               </div>
               <CreateEditImageLayerFormImagerySources
@@ -387,91 +353,6 @@ const CreateEditImageLayerModal = () => {
                 }
                 errorMessage={componentState.sourceTypePostEventError}
                 selectedKey={componentState.sourceTypePostEvent}
-                className="flex-grow-1 me-0 me-md-2"
-                disabled={imageLayerId ? true : false}
-              />
-              <Dropdown
-                placeholder="Select a Format"
-                label="Format"
-                options={[{ key: "tif", text: "Tif" }]}
-                value={componentState.format}
-                onChange={(e, item) =>
-                  onFormChange(
-                    item.key,
-                    "format",
-                    setComponentState,
-                    componentState
-                  )
-                }
-                errorMessage={componentState.formatError}
-                selectedKey={componentState.format}
-                className="flex-grow-1 mb-2"
-                disabled={imageLayerId ? true : false}
-              />
-            </div>
-          </div>
-
-          <div className="row mb-2 p-2">
-            <div className="col-12 p-4 pb-0 flex-column d-flex box-highlight">
-              <div className="col-12 mb-4">
-                <h6 className="m-0 pb-3">Pre-Event Imagery</h6>
-                <Text variant="medium">
-                  This section is optional. Here you can add imagery files that
-                  represent an AOI captured prior to the date of the natural
-                  catastrophe. Select the &quot;Source Type&quot; that matches
-                  your images for the best labeling experience.
-                </Text>
-              </div>
-              <CreateEditImageLayerFormImagerySources
-                onFormChange={onFormChange}
-                setComponentState={setComponentState}
-                componentState={componentState}
-                field="preEventImageryUrls"
-                currentEventImageryUrlControl="currentPreEventImageryUrlControl"
-                imageLayerId={imageLayerId}
-              />
-            </div>
-
-            <div className="col-12 p-4 pt-0 d-flex flex-column flex-md-row box-highlight">
-              <DatePicker
-                label="Imagery capture date  "
-                id="createEditImageLayerImageryCapturePretEventDate"
-                placeholder="Select a date..."
-                ariaLabel="Select a date"
-                className="flex-grow-1 me-0 me-md-2"
-                onSelectDate={(e) =>
-                  onFormChange(
-                    e,
-                    "imageryCaptureDatePreEvent",
-                    setComponentState,
-                    componentState
-                  )
-                }
-                value={
-                  componentState.imageryCaptureDatePreEvent !== ""
-                    ? new Date(componentState.imageryCaptureDatePreEvent)
-                    : ""
-                }
-                disabled={imageLayerId ? true : false}
-              />
-              <Dropdown
-                id="createEditImageLayerPreEventSourceType"
-                placeholder="Select a Source Type"
-                label="Source type"
-                options={componentState.sourceTypeList.filter(
-                  (option) => option.showInDropdown
-                )}
-                value={componentState.sourceTypePreEvent}
-                onChange={(e, item) =>
-                  onFormChange(
-                    item.key,
-                    "sourceTypePreEvent",
-                    setComponentState,
-                    componentState
-                  )
-                }
-                errorMessage={componentState.sourceTypePreEventError}
-                selectedKey={componentState.sourceTypePreEvent}
                 className="flex-grow-1 me-0 me-md-2"
                 disabled={imageLayerId ? true : false}
               />

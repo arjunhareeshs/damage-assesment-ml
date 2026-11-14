@@ -41,6 +41,7 @@ from ..models.projects import ImageLayer, Model, TrainingJob
 from ..runners.unified_runner import UnifiedRunner
 from ..utils import postgis_query
 from ..utils.data import extract_from_url
+from ..utils.dtf_constants import DTF_CATEGORIES
 from ..utils.logs import Logger
 from ..utils.metadata import MetadataUtils
 from ..utils.queues import AzureQueueHandler
@@ -49,6 +50,14 @@ from .damage_triage import _download_hf_checkpoint
 BATCH_JOB_WORKDIR = "AZ_BATCH_TASK_WORKING_DIR"
 DTF_AOI_PREFIX = "dtfaoi"
 
+
+
+
+def _probabilities(probs) -> dict:
+    """The model's class-probability vector as {class name: probability}."""
+    if not probs:
+        return {}
+    return {name: float(p) for name, p in zip(DTF_CATEGORIES, probs)}
 
 class DTFAoiInferencePreprocessor:
     def __init__(self, model: Model, config: Config = None):
@@ -347,35 +356,134 @@ class DTFAoiInferencePostprocessor:
         # is never touched, only attributes: plan.pdf's "the polygon never
         # changed, only its attribute changed."
         classified_rows = [r for r in building_rows if r.get("class", -1) != -1]
-        if classified_rows:
+        db_rows = [
+            {
+                "building_id": r["building_id"],
+                "class": r["class"],
+                "class_name": r["class_name"],
+                "confidence": r["confidence"],
+                "probabilities": _probabilities(r.get("probs")),
+                "mask_url": self._artifact_url(r.get("mask_url", ""), "png"),
+                "crop_url": self._artifact_url(r.get("crop_url", ""), "png"),
+            }
+            for r in classified_rows
+        ]
+        if db_rows:
+            # Current result per building (what the map, review panel and
+            # whole-layer exports read).
             postgis_query.update_building_predictions(
                 image_layer_id=self.model_data.imageLayerId,
                 model_id=self.model_data.modelId,
-                rows=[
-                    {
-                        "building_id": r["building_id"],
-                        "class": r["class"],
-                        "class_name": r["class_name"],
-                        "confidence": r["confidence"],
-                        "mask_url": self._artifact_url(
-                            r.get("mask_url", ""), "png"
-                        ),
-                        "crop_url": self._artifact_url(
-                            r.get("crop_url", ""), "png"
-                        ),
-                    }
-                    for r in classified_rows
-                ],
+                rows=db_rows,
                 review_status="pending_review",
             )
 
         gpkg_filename = manifest.get("predictions_gpkg_filename", "")
         self.model_data.gpkgUrl = self._artifact_url(gpkg_filename, "gpkg")
+
+        # Run history and the GeoParquet download. Both are extras on top of
+        # the results above, so a failure here is reported, not fatal.
+        try:
+            stored = postgis_query.record_run_results(
+                image_layer_id=self.model_data.imageLayerId,
+                model_id=self.model_data.modelId,
+                project_id=self.model_data.projectId,
+                rows=db_rows,
+            )
+            self._update_progress(
+                f"Stored {stored} results in the database "
+                "(hg_buildings + hg_dtf_run_results)"
+            )
+        except Exception as exc:
+            self.logger.error("Recording run results failed", exc_info=True)
+            self._update_progress(f"Could not store the run history: {exc}")
+        try:
+            parquet_filename = manifest.get("predictions_parquet_filename", "")
+            if parquet_filename:
+                # Written by the inference job next to the GeoPackage and
+                # already uploaded with its outputs.
+                self.model_data.parquetUrl = self._artifact_url(
+                    parquet_filename, "parquet"
+                )
+            else:
+                self.model_data.parquetUrl = self._publish_results_geoparquet(db_rows)
+            if self.model_data.parquetUrl:
+                self._update_progress("Results GeoParquet ready for download")
+        except Exception as exc:
+            self.logger.error("Writing the results GeoParquet failed", exc_info=True)
+            self._update_progress(f"Could not write the results GeoParquet: {exc}")
         self._update_progress(
             f"Classified {manifest.get('num_classified', '?')}/"
             f"{manifest.get('num_buildings', '?')} buildings in AOI",
             step=self.model_data.totalSteps,
         )
+
+    def _publish_results_geoparquet(self, db_rows: list) -> str:
+        """Write this run's results as GeoParquet next to its GeoPackage.
+
+        One row per classified building: footprint (WKB, EPSG:4326), class,
+        confidence, the five class probabilities, crop/mask links and the
+        run/layer ids. Geometries come from hg_buildings, so they match the
+        database exactly. Returns the file's URL ("" if nothing to write).
+        """
+        if not db_rows:
+            return ""
+        import tempfile
+
+        import pyarrow as pa
+        import shapely
+        from shapely.geometry import shape
+
+        from ..utils.geoparquet import write_geoparquet
+
+        geometries = {
+            b["building_id"]: shape(b["geometry"])
+            for b in postgis_query.buildings_in_aoi(
+                self.model_data.imageLayerId,
+                building_ids=[r["building_id"] for r in db_rows],
+            )
+        }
+        rows = [r for r in db_rows if r["building_id"] in geometries]
+        created_at = MetadataUtils.get_timestamp()
+        columns = {
+            "building_id": [r["building_id"] for r in rows],
+            "damage_class": pa.array([r["class"] for r in rows], pa.int32()),
+            "damage_class_name": [r["class_name"] for r in rows],
+            "confidence": pa.array([r["confidence"] for r in rows], pa.float64()),
+        }
+        for name in DTF_CATEGORIES:
+            column = "prob_" + "_".join(name.lower().split())
+            columns[column] = pa.array(
+                [(r.get("probabilities") or {}).get(name) for r in rows],
+                pa.float64(),
+            )
+        columns.update(
+            {
+                "crop_url": [r.get("crop_url") or None for r in rows],
+                "mask_url": [r.get("mask_url") or None for r in rows],
+                "model_id": [str(self.model_data.modelId)] * len(rows),
+                "image_layer_id": [self.model_data.imageLayerId] * len(rows),
+                "project_id": [self.model_data.projectId] * len(rows),
+                "created_at": [created_at] * len(rows),
+            }
+        )
+        filename = f"dtf_aoi_results_{self.model_data.modelId}.parquet"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = f"{tmp}/{filename}"
+            write_geoparquet(
+                path,
+                columns,
+                [shapely.to_wkb(geometries[r["building_id"]]) for r in rows],
+            )
+            with open(path, "rb") as f:
+                self.storage.save(
+                    identifier=filename,
+                    data_type=None,
+                    data=f.read(),
+                    data_format="parquet",
+                    extra_partition_keys=f"{self.model_data.dtfAoiJob.taskId}",
+                )
+        return self._artifact_url(filename, "parquet")
 
     def _artifact_url(self, filename: str, data_format: str = "gpkg") -> str:
         if not filename:

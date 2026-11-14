@@ -35,3 +35,6 @@ services:
     build:
       args:
         TORCH_VARIANT: cu124
+        # docker-compose.yml defaults to the CPU-only base; CUDA wheels need
+        # the CUDA one.
+        BASE_IMAGE: mcr.microsoft.com/azureml/curated/minimal-py312-cuda12.4-inference

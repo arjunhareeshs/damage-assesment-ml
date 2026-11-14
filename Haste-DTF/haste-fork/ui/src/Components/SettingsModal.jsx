@@ -7,8 +7,6 @@ import {
   Text
 } from "@fluentui/react";
 
-import { apiGet } from "../util/api";
-import { updateUserSettings } from "../AppHelper";
 import { AppContext } from "../AppContext";
 import SectionModal from "./SectionModal";
 import proptypes from "prop-types";
@@ -23,8 +21,6 @@ const SettingsModal = ({ onClose }) => {
 
   async function handleGuidedTourToggle() {
     setIsLoading(true, "Toggling Guided Tour...");
-    var response = await apiGet("GetUserById?userId=" + appParams.userId);
-    await updateUserSettings(response, [{ disableGuidedTour: !appParams.userSettings.disableGuidedTour }]);
     setAppParams((prevParams) => ({
       ...prevParams,
       userSettings: {
@@ -37,8 +33,6 @@ const SettingsModal = ({ onClose }) => {
 
   async function handleItemsPerPageChange(event, option) {
     setIsLoading(true, "Updating Items Per Page...");
-    var response = await apiGet("GetUserById?userId=" + appParams.userId);
-    await updateUserSettings(response, [{ itemsPerPage: option.key }]);
     setAppParams((prevParams) => ({
       ...prevParams,
       userSettings: {

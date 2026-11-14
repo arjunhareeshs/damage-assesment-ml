@@ -209,7 +209,7 @@ export const addUrlToFootprintArray = (setComponentState, componentState, URL, f
     if ((componentState[field] || []).length > 0) {
         setComponentState({
             ...componentState,
-            [errorField]: "Only one building-footprints GPKG can be added; remove the existing entry first.",
+            [errorField]: "Only one building-footprints file can be added; remove the existing entry first. To use several regions, zip them together.",
         });
         return false;
     }
@@ -279,26 +279,44 @@ export const removeUrlFromEventImageryArray = (id, setComponentState, componentS
     });
 };
 
+// Footprint upload formats -> the `data_format` the chunked uploader expects.
+// A .gdb.zip (zipped Esri file geodatabase) is just a "zip".
+export const FOOTPRINT_FORMATS = {
+    gpkg: "gpkg",
+    geojson: "geojson",
+    json: "geojson",
+    zip: "zip",
+    parquet: "parquet",
+    geoparquet: "parquet",
+};
+export const FOOTPRINT_ACCEPT = Object.keys(FOOTPRINT_FORMATS).map((e) => "." + e).join(",");
+export const FOOTPRINT_TYPES_LABEL = ".gpkg, .geojson, .parquet, or a .zip / .gdb.zip (file geodatabase)";
+
+export const footprintDataFormat = (fileName) => {
+    const ext = (fileName || "").split(".").pop().toLowerCase();
+    return FOOTPRINT_FORMATS[ext] || "gpkg";
+};
+
 // Single-file variant for the building-footprints panel: enforces exactly
-// one entry and validates the .gpkg extension.
+// one entry and validates the extension against FOOTPRINT_FORMATS.
 export const addFootprintFileToArray = (files, componentState, setComponentState, field, errorField) => {
     if (!files || files.length === 0) {
         setComponentState({
             ...componentState,
-            [errorField]: "Select a .gpkg file to upload.",
+            [errorField]: `Select a file to upload (${FOOTPRINT_TYPES_LABEL}).`,
         });
         return false;
     }
     if ((componentState[field] || []).length > 0) {
         setComponentState({
             ...componentState,
-            [errorField]: "Only one building-footprints GPKG can be added; remove the existing entry first.",
+            [errorField]: "Only one building-footprints file can be added; remove the existing entry first. To use several regions, zip them together.",
         });
         return false;
     }
     // Single-file picker, but be defensive.
     const file = files[0];
-    const isValid = validateFileType(file.name, ["gpkg"]);
+    const isValid = validateFileType(file.name, Object.keys(FOOTPRINT_FORMATS));
     if (!isValid[0]) {
         setComponentState({
             ...componentState,

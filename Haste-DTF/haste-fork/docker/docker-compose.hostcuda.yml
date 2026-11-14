@@ -1,0 +1,46 @@
+# Host-CUDA overlay: GPU inference WITHOUT bundling CUDA in the images.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.hostcuda.yml up -d
+#   (../../../build.sh builds with this overlay by default)
+#
+# docker-compose.gpu.yml bakes the CUDA 12.4 toolkit + cuDNN into the training
+# image (~5 GB base image + ~3 GB of nvidia/* wheels, twice counting
+# imageryprep). This overlay instead:
+#
+#   training_image     TORCH_VARIANT=host: the CUDA build of torch/torchvision
+#                      with no nvidia/* deps, on the CPU-only base image.
+#   hastefuncqueues    asks Docker for the GPU (HASTE_ENABLE_GPU) and mounts
+#                      the host's CUDA libraries into each task container
+#                      (HASTE_HOST_CUDA_DIR -> /opt/host-cuda/nvidia, read-only).
+#
+# At runtime the models use the GPU when one is attached and fall back to CPU
+# otherwise (DTF_DEVICE=auto; LocalRunner retries without a GPU when the
+# daemon cannot attach one).
+#
+# Host requirements:
+#   * NVIDIA driver supporting CUDA 12.x (`nvidia-smi`), and the NVIDIA
+#     Container Toolkit registered with Docker (`docker info` lists `nvidia`).
+#   * HASTE_HOST_CUDA_DIR: absolute path of a pip `site-packages/nvidia`
+#     folder holding CUDA 12 runtime libraries -- cudnn/lib/libcudnn.so.9,
+#     cublas/lib/libcublas.so.12, cuda_runtime/lib/libcudart.so.12, ... (what
+#     `pip install torch` for CUDA 12 installs). build.sh detects it and
+#     records it in docker/.env, which compose reads automatically.
+#
+# The images built this way do not work without that mount: their torch
+# cannot load. Use docker-compose.gpu.yml for self-contained (e.g. Azure
+# Batch) images, or the base file alone for CPU-only machines.
+
+services:
+  hastefuncqueues:
+    environment:
+      HASTE_ENABLE_GPU: "1"
+      # Narrow to specific devices with e.g. HASTE_GPU_DEVICES=0,1
+      HASTE_GPU_DEVICES: "${HASTE_GPU_DEVICES:-all}"
+      HASTE_HOST_CUDA_DIR: "${HASTE_HOST_CUDA_DIR:?run build.sh, or set HASTE_HOST_CUDA_DIR in docker/.env to the host site-packages/nvidia folder}"
+
+  # BASE_IMAGE (CPU-only) and imageryprep's TORCH_VARIANT=none come from
+  # docker-compose.yml; only the torch build changes here.
+  training_image:
+    build:
+      args:
+        TORCH_VARIANT: host

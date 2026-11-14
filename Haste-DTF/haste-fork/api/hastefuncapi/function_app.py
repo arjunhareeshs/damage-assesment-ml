@@ -41,8 +41,8 @@ from hastegeo.core.processors.imagery import ImageryPreProcessor
 from hastegeo.core.processors.inference import InferencePreprocessor
 from hastegeo.core.processors.metadata import MetadataProcessor
 from hastegeo.core.processors.stats import StatsPreProcessor
-from hastegeo.core.processors.train import TrainPreprocessor
 from hastegeo.core.processors.uploader import FileUploader
+from hastegeo.core.utils.tiles import mask_nodata
 from hastegeo.core.utils import postgis_query
 from hastegeo.core.utils.blob import (
     download_blob_to_tempfile,
@@ -1153,12 +1153,14 @@ _MODEL_ARTIFACT_URL_FIELDS = {
     "sidecar": "featuresSidecarUrl",
     "geojson": "embeddingsGeoJSONUrl",
     "gpkg": "gpkgUrl",
+    "parquet": "parquetUrl",
 }
 _MODEL_ARTIFACT_CONTENT_TYPES = {
     "pmtiles": "application/octet-stream",
     "sidecar": "application/octet-stream",
     "geojson": "application/geo+json",
     "gpkg": "application/geopackage+sqlite3",
+    "parquet": "application/vnd.apache.parquet",
 }
 
 
@@ -1180,7 +1182,7 @@ async def GetModelArtifact(req: func.HttpRequest) -> func.HttpResponse:
     pmtiles.js can do partial reads.
 
     Supported ``kind`` values: ``pmtiles``, ``sidecar`` and ``geojson``
-    (fetched/parsed in-browser), plus ``gpkg`` — the per-building
+    (fetched/parsed in-browser), plus ``gpkg`` and ``parquet`` — the per-building
     predictions GeoPackage saved by ``PutBuildingPredictions``, served as
     a downloadable attachment. Example:
     ``GET /api/GetModelArtifact?projectId=<pid>&modelId=<mid>&kind=gpkg``.
@@ -1252,6 +1254,10 @@ async def GetModelArtifact(req: func.HttpRequest) -> func.HttpResponse:
         headers[
             "Content-Disposition"
         ] = f'attachment; filename="building_predictions_{model_id}.gpkg"'
+    elif kind == "parquet":
+        headers[
+            "Content-Disposition"
+        ] = f'attachment; filename="building_predictions_{model_id}.parquet"'
     if result.etag:
         headers["ETag"] = (
             result.etag if result.etag.startswith('"') else f'"{result.etag}"'
@@ -1377,6 +1383,14 @@ async def GetLayerLabelingToolData(req: func.HttpRequest) -> func.HttpResponse:
             return func.HttpResponse(
                 "Label project not found.", status_code=404
             )
+
+        # Make the empty parts of the imagery transparent instead of black.
+        # Applied when serving (not only when the label project is written)
+        # so layers processed before this existed get it too.
+        imagery = match_label_projects.get("imagery") or {}
+        for key in ("tileUrl", "preEventTileUrl", "postEventTileUrl"):
+            if imagery.get(key):
+                imagery[key] = mask_nodata(imagery[key])
 
         return func.HttpResponse(
             json.dumps(match_label_projects), status_code=200
@@ -2101,7 +2115,9 @@ async def GetVisualizerResults(req: func.HttpRequest) -> func.HttpResponse:
             preDisasterImagery=Imagery(
                 # If no image is uploaded, then the base Azure Map will be displayed in the pre section
                 url=(
-                    f"{titiler_ep}cog/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}?scale=1&url={pre_event_image_URL}"
+                    mask_nodata(
+                        f"{titiler_ep}cog/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}?scale=1&url={pre_event_image_URL}"
+                    )
                     if pre_event_image_URL
                     else ""
                 ),
@@ -2112,7 +2128,9 @@ async def GetVisualizerResults(req: func.HttpRequest) -> func.HttpResponse:
                 ),
             ),
             postDisasterImagery=Imagery(
-                url=f"{titiler_ep}cog/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}?scale=1&url={post_disaster_image_URL}",
+                url=mask_nodata(
+                    f"{titiler_ep}cog/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}?scale=1&url={post_disaster_image_URL}"
+                ),
                 bounds=(
                     label_project.features[0].bbox
                     if label_project.features
@@ -2164,71 +2182,22 @@ async def GetVisualizerResults(req: func.HttpRequest) -> func.HttpResponse:
     methods=["PUT"],
 )
 async def PutRunModelQueueMessage(req: func.HttpRequest) -> func.HttpResponse:
-    logger.info(
-        "PutRunModelQueueMessage HTTP trigger function processed a request."
+    """Model training was removed from this deployment.
+
+    The stack only runs pre-trained models: DamageTriageFormer
+    (PutRunDTFInferenceQueueMessage / PutRunDTFAoiInferenceQueueMessage /
+    PutAoiAssessment), building embeddings, and segmentation inference on
+    models that already have a checkpoint (PutRunInferenceQueueMessage). The
+    route is kept so an old UI or script gets a clear answer instead of 404.
+    """
+    logger.info("PutRunModelQueueMessage called; model training is disabled.")
+    return func.HttpResponse(
+        "Model training is not available in this deployment: it runs "
+        "pre-trained models only (DamageTriageFormer damage assessment, "
+        "building embeddings, and inference on models that already have a "
+        "checkpoint).",
+        status_code=410,
     )
-    try:
-        req_body = req.get_json()
-        output = Model(**req_body)
-
-        if output.modelId is None:
-            output.modelId = MetadataUtils.generate_short_int_id()
-        if output.creationDate is None:
-            output.creationDate = MetadataUtils.get_timestamp()
-        output.name = output.name.replace(" ", "-")
-
-        label_projects = await asyncio.to_thread(
-            MetadataProcessor(
-                data_type=config.get_metadata_types().LABELS.value,
-                partition_key=output.projectId,
-            ).load_all_from_partition
-        )
-        match_label_projects = next(
-            (
-                label_project
-                for label_project in label_projects
-                if label_project["imageLayerId"] == output.imageLayerId
-            ),
-            None,
-        )
-
-        output.labelprojectId = match_label_projects["labelprojectId"]
-        output.labelsCount = len(match_label_projects["labels"])
-
-        output = await asyncio.to_thread(
-            TrainPreprocessor(output).send_to_queue
-        )
-
-        await asyncio.to_thread(
-            MetadataProcessor(
-                data_type=config.get_metadata_types().MODEL.value,
-                partition_key=output.projectId,
-            ).save,
-            output.modelId,
-            output.dict(),
-        )
-
-        request = StatsPreProcessor(
-            request=StatsRequest(
-                action="add",
-                projectId=output.projectId,
-                modelIds=[output.modelId],
-            )
-        ).send_to_queue()
-        logger.info(
-            f"Message sent to update stats for project id {output.projectId} with request {request.dict()}"
-        )
-
-        return func.HttpResponse(json.dumps(output.dict()), status_code=200)
-
-    except ValidationError as e:
-        logger.error(f"Validation error: {e}\n{traceback.format_exc()}")
-        return func.HttpResponse("Validation error.", status_code=400)
-    except ValueError as e:
-        logger.error(f"Invalid JSON: {e}\n{traceback.format_exc()}")
-        return func.HttpResponse(
-            "Invalid JSON in request body.", status_code=400
-        )
 
 
 @app.route(
@@ -2529,6 +2498,59 @@ async def PutRunDTFAoiInferenceQueueMessage(
 
 
 @app.route(
+    route="GetLayerBuildings",
+    auth_level=AUTH_LEVEL,
+    methods=["GET"],
+)
+async def GetLayerBuildings(req: func.HttpRequest) -> func.HttpResponse:
+    """GET /api/GetLayerBuildings -- the layer's footprints for the labeling map.
+
+    Query: ``imageLayerId`` (required), ``bbox=minx,miny,maxx,maxy``
+    (optional, EPSG:4326).
+
+    Served from ``hg_buildings``: the exact buildings (and ids) a
+    DamageTriageFormer run resolves, all of them up to
+    ``postgis_query.MAX_MAP_BUILDINGS`` -- not the random 2,000-building
+    sample of ``GetBuildingFootprintsGeoJSON``, which left buildings out of
+    the map. Response: a FeatureCollection plus ``total`` and ``truncated``.
+    """
+    try:
+        image_layer_id = req.params.get("imageLayerId")
+        if not image_layer_id:
+            return func.HttpResponse(
+                "imageLayerId is required.", status_code=400
+            )
+        bbox = None
+        if req.params.get("bbox"):
+            try:
+                bbox = tuple(float(v) for v in req.params["bbox"].split(","))
+                if len(bbox) != 4:
+                    raise ValueError
+            except ValueError:
+                return func.HttpResponse(
+                    "bbox must be minx,miny,maxx,maxy.", status_code=400
+                )
+        collection = await asyncio.to_thread(
+            postgis_query.layer_buildings_feature_collection,
+            image_layer_id,
+            bbox,
+        )
+        return func.HttpResponse(
+            json.dumps(collection),
+            status_code=200,
+            mimetype="application/geo+json",
+        )
+    except Exception as e:
+        logger.error(
+            f"GetLayerBuildings: Error: {e}\n{traceback.format_exc()}",
+            stack_info=True,
+        )
+        return func.HttpResponse(
+            "Error loading building footprints.", status_code=500
+        )
+
+
+@app.route(
     route="GetBuildingsInAoi",
     auth_level=AUTH_LEVEL,
     methods=["POST"],
@@ -2541,13 +2563,18 @@ async def GetBuildingsInAoi(req: func.HttpRequest) -> func.HttpResponse:
     queuing a very large per-building-crop run — see
     docs/OptionB_AOI_Integration_Plan.md "Biggest pitfalls" #5.
 
-    Body: { imageLayerId, aoi?, buildingIds? }
+    Body: { imageLayerId, aoi?, buildingIds?, returnIds? }
+
+    With ``returnIds: true`` and an ``aoi``, the response also carries
+    ``buildingIds`` -- the ids intersecting the AOI, with the same predicate a
+    run uses -- so the labeling map can highlight exactly those buildings.
     """
     try:
         req_body = req.get_json()
         image_layer_id = req_body.get("imageLayerId")
         aoi = req_body.get("aoi")
         building_ids = req_body.get("buildingIds")
+        return_ids = bool(req_body.get("returnIds"))
 
         if not image_layer_id:
             return func.HttpResponse(
@@ -2564,9 +2591,12 @@ async def GetBuildingsInAoi(req: func.HttpRequest) -> func.HttpResponse:
             aoi,
             building_ids,
         )
-        return func.HttpResponse(
-            json.dumps({"count": count}), status_code=200
-        )
+        result = {"count": count}
+        if return_ids and aoi:
+            result["buildingIds"] = await asyncio.to_thread(
+                postgis_query.building_ids_in_aoi, image_layer_id, aoi
+            )
+        return func.HttpResponse(json.dumps(result), status_code=200)
     except ValueError as e:
         return func.HttpResponse(str(e), status_code=400)
     except Exception as e:
@@ -3057,9 +3087,14 @@ async def PutCancelModelQueueMessage(
                 )
             )
         else:
-            output = await asyncio.to_thread(
-                TrainPreprocessor(existing_model_data).send_to_queue,
-                status=config.get_status_types().CANCELLED.value,
+            # A model still "training": only possible for records created
+            # before training was removed. No training task can be running
+            # any more, so mark it cancelled directly.
+            output = existing_model_data
+            output.status = config.get_status_types().CANCELLED.value
+            output.statusMessage = MetadataUtils.append_status_message(
+                output.statusMessage,
+                "Training is not available in this deployment; marked cancelled",
             )
 
         await asyncio.to_thread(
@@ -3663,6 +3698,8 @@ async def GetBuildingFootprintsGeoJSON(
         sample (int, optional): Maximum number of buildings to return
             (default 200). Clamped to the inclusive range [1, 2000] to bound
             response size and server-side memory.
+        bbox (str, optional): ``minx,miny,maxx,maxy`` in EPSG:4326. When given,
+            only footprints in this box are read, before sampling.
     """
     logger.info(
         "GetBuildingFootprintsGeoJSON HTTP trigger function processed a request."
@@ -3680,6 +3717,20 @@ async def GetBuildingFootprintsGeoJSON(
         # Clamp to a sane range so callers can't accidentally pull the
         # entire dataset (which can be millions of features) into memory.
         sample_size = max(1, min(requested_sample, 2000))
+
+        bbox = None
+        if req.params.get("bbox"):
+            from shapely.geometry import box
+
+            try:
+                minx, miny, maxx, maxy = (
+                    float(v) for v in req.params["bbox"].split(",")
+                )
+            except ValueError:
+                return func.HttpResponse(
+                    "bbox must be minx,miny,maxx,maxy.", status_code=400
+                )
+            bbox = gpd.GeoSeries([box(minx, miny, maxx, maxy)], crs="EPSG:4326")
 
         if not project_id or not image_layer_id:
             return func.HttpResponse(
@@ -3708,7 +3759,7 @@ async def GetBuildingFootprintsGeoJSON(
             footprints_url, suffix=".gpkg"
         )
 
-        gdf = await asyncio.to_thread(gpd.read_file, tmp_path)
+        gdf = await asyncio.to_thread(gpd.read_file, tmp_path, bbox=bbox)
 
         # Random sample (fixed random_state so repeated calls return the
         # same subset; the visualizer page shouldn't reshuffle on refresh).
@@ -4722,6 +4773,38 @@ async def PutAoiAssessment(req: func.HttpRequest) -> func.HttpResponse:
         except ValueError as val_err:
             return func.HttpResponse(f"Invalid AOI: {val_err}", status_code=400)
 
+        aoi_json = mapping(aoi_geom)
+        from hastegeo.core.utils.aoi_analysis import analyze_aoi
+        from hastegeo.core.utils.imagery_catalog import imagery_for_aoi
+
+        # Enforce server-side what the preview shows: never queue work that
+        # cannot be assessed, and never run the same AOI twice at once.
+        imagery, bldg_count, duplicate_id = await asyncio.gather(
+            asyncio.to_thread(imagery_for_aoi, image_layer_id, aoi_json),
+            asyncio.to_thread(
+                postgis_query.count_buildings_in_aoi, image_layer_id, aoi_json
+            ),
+            asyncio.to_thread(
+                assessment_store.find_active_duplicate, image_layer_id, aoi_json
+            ),
+        )
+        if duplicate_id:
+            return _json_response(
+                {
+                    "error": "An assessment for this AOI is already running.",
+                    "assessmentId": duplicate_id,
+                },
+                status_code=409,
+            )
+        analysis = await asyncio.to_thread(
+            analyze_aoi, aoi_geom, area_km2, imagery, bldg_count, config.aoi_max_units
+        )
+        if not analysis["canSubmit"]:
+            return _json_response(
+                {"error": "AOI cannot be assessed.", "state": analysis["state"]},
+                status_code=422,
+            )
+
         # Resolved parameters are frozen into the assessment so a later
         # environment change cannot alter a running job.
         ast_config = {
@@ -4873,7 +4956,13 @@ async def PutCancelAoiAssessment(req: func.HttpRequest) -> func.HttpResponse:
     methods=["POST"],
 )
 async def GetAoiAssessmentPreview(req: func.HttpRequest) -> func.HttpResponse:
-    """Area, catalogued TIF count and building count for an AOI. Read-only."""
+    """Read-only AOI analysis: area, imagery coverage, buildings, workload.
+
+    Uses catalogue metadata and spatial indexes only; no raster is opened and
+    no inference is queued. Backwards compatible: ``areaKm2``,
+    ``imageryCount`` and ``buildingCount`` keep their original meaning.
+    """
+    from hastegeo.core.utils.aoi_analysis import analyze_aoi
     from hastegeo.core.utils.aoi_validate import validate_aoi
     from hastegeo.core.utils.imagery_catalog import imagery_for_aoi
     from shapely.geometry import mapping
@@ -4893,17 +4982,22 @@ async def GetAoiAssessmentPreview(req: func.HttpRequest) -> func.HttpResponse:
         except ValueError as val_err:
             return func.HttpResponse(f"Invalid AOI: {val_err}", status_code=400)
         aoi_json = mapping(aoi_geom)
-        imagery = await asyncio.to_thread(imagery_for_aoi, image_layer_id, aoi_json)
-        bldg_count = await asyncio.to_thread(
-            postgis_query.count_buildings_in_aoi, image_layer_id, aoi_json
+        # The two queries are independent; run them concurrently.
+        imagery, bldg_count = await asyncio.gather(
+            asyncio.to_thread(imagery_for_aoi, image_layer_id, aoi_json),
+            asyncio.to_thread(
+                postgis_query.count_buildings_in_aoi, image_layer_id, aoi_json
+            ),
         )
-        return _json_response(
-            {
-                "areaKm2": round(area_km2, 4),
-                "imageryCount": len(imagery),
-                "buildingCount": bldg_count,
-            }
+        analysis = await asyncio.to_thread(
+            analyze_aoi,
+            aoi_geom,
+            area_km2,
+            imagery,
+            bldg_count,
+            config.aoi_max_units,
         )
+        return _json_response(analysis)
     except Exception as e:
         logger.error(
             f"GetAoiAssessmentPreview error: {e}\n{traceback.format_exc()}",
@@ -5018,6 +5112,71 @@ async def GetAoiAssessmentMapData(req: func.HttpRequest) -> func.HttpResponse:
             stack_info=True,
         )
         return func.HttpResponse("Error retrieving map data.", status_code=500)
+
+
+@app.route(
+    route="GetCurrentBuildingDamage",
+    auth_level=AUTH_LEVEL,
+    methods=["GET"],
+)
+async def GetCurrentBuildingDamage(req: func.HttpRequest) -> func.HttpResponse:
+    """Latest damage per building as GeoJSON polygons (original footprints,
+    class, color, confidence). Shared by HASTE and the Texas Mapbox app.
+
+    Query: imageLayerId (optional; omit for a statewide view, then bbox is
+    required), bbox=minLon,minLat,maxLon,maxLat,
+    limit (default 50000, max 100000), cursor (previous ``nextCursor``).
+    Add ``format=parquet`` to download the layer as GeoParquet instead.
+    """
+    from hastegeo.core.utils import current_damage
+
+    image_layer_id = req.params.get("imageLayerId") or None
+    try:
+        bbox = _bbox_param(req)
+        limit = max(1, min(int(req.params.get("limit", "50000")), 100000))
+        if image_layer_id is None and bbox is None:
+            raise ValueError("Provide imageLayerId or bbox.")
+        if image_layer_id is None and req.params.get("format") == "parquet":
+            raise ValueError("format=parquet requires imageLayerId.")
+    except ValueError as e:
+        return func.HttpResponse(str(e) or "Invalid parameter.", status_code=400)
+
+    try:
+        if req.params.get("format") == "parquet":
+            import os
+            import tempfile
+
+            def _build():
+                with tempfile.TemporaryDirectory() as d:
+                    path = os.path.join(d, "current_damage.parquet")
+                    current_damage.export_geoparquet(image_layer_id, path)
+                    with open(path, "rb") as fh:
+                        return fh.read()
+
+            body = await asyncio.to_thread(_build)
+            return func.HttpResponse(
+                body,
+                mimetype="application/vnd.apache.parquet",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{image_layer_id}_current_damage.parquet"'
+                },
+            )
+        body = await asyncio.to_thread(
+            current_damage.get_current_geojson_text,
+            image_layer_id,
+            bbox=bbox,
+            limit=limit,
+            after_building_id=req.params.get("cursor"),
+        )
+        return func.HttpResponse(
+            body, status_code=200, mimetype="application/geo+json"
+        )
+    except Exception as e:
+        logger.error(
+            f"GetCurrentBuildingDamage error: {e}\n{traceback.format_exc()}",
+            stack_info=True,
+        )
+        return func.HttpResponse("Error retrieving current building damage.", status_code=500)
 
 
 @app.route(

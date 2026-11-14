@@ -84,6 +84,40 @@ def create_assessment(assessment: Dict[str, Any], conn=None) -> Dict[str, Any]:
             connection.close()
 
 
+def find_active_duplicate(
+    image_layer_id: str, aoi_geojson: Dict[str, Any], conn=None
+) -> Optional[str]:
+    """Id of a non-finished assessment on this layer with an identical AOI.
+
+    Prevents double-clicks and repeated submissions from running the same
+    inference twice.
+    """
+    owns_conn = conn is None
+    connection = conn or get_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT assessment_id
+                FROM hg_assessments
+                WHERE image_layer_id = %s
+                  AND status <> ALL(%s)
+                  AND ST_Equals(
+                      aoi_geometry,
+                      ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326)
+                  )
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (image_layer_id, list(TERMINAL_STATUSES), json.dumps(aoi_geojson)),
+            )
+            row = cursor.fetchone()
+    finally:
+        if owns_conn:
+            connection.close()
+    return row[0] if row else None
+
+
 def get_assessment(assessment_id: str, conn=None) -> Optional[Dict[str, Any]]:
     """Retrieve an assessment by ID with GeoJSON AOI geometry.
 

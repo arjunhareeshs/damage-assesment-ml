@@ -71,11 +71,6 @@ const HelpDocsNav = ({ helpSections, selectedKey }) => {
           ariaLabel="ExpandSections"
           options={helpSectionsForComboBox}
           label="Help Docs Sections"
-          onKeyUp={(e) => {
-            if (e.key === "Enter") {
-              handleSectionAddition();
-            }
-          }}
           onItemClick={(e, option) => {
             if (option) {
               handleSelection(option);

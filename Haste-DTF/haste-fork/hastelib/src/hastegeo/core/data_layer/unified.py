@@ -50,13 +50,19 @@ class UnifiedDataLayer:
         data=None,
         data_file_path=None,
         data_format="json",
+        extra_partition_keys=None,
     ):
+        kwargs = {}
+        # Only passed when used: not every backend's save() accepts it.
+        if extra_partition_keys:
+            kwargs["extra_partition_keys"] = extra_partition_keys
         self.data_layer.save(
             identifier=identifier,
             data_type=data_type,
             data=data,
             data_file_path=data_file_path,
             data_format=data_format,
+            **kwargs,
         )
 
     def save_chunk(

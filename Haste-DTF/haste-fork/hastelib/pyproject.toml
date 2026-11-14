@@ -51,7 +51,6 @@ dependencies = [
   "adlfs",
   "pyyaml",
   "boto3",
-  "tensorboard",
   "tenacity",
   "email_validator",
   "typing-extensions"

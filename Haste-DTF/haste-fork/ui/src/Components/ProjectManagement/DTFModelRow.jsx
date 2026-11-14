@@ -109,6 +109,23 @@ const DTFModelRow = ({
         },
       },
       {
+        key: "downloadGeoparquet",
+        text: "Download results (.parquet)",
+        iconProps: { iconName: "download" },
+        // Written per AOI run since this release; older runs don't have one.
+        disabled: !model.parquetUrl,
+        title: model.parquetUrl ? undefined : "No GeoParquet for this run (older run)",
+        onClick: () => {
+          fileDownload(
+            buildUrl(
+              `GetModelArtifact?projectId=${projectId}` +
+                `&modelId=${model.modelId}&kind=parquet`
+            ),
+            setDialog
+          );
+        },
+      },
+      {
         key: "downloadGeopackage",
         text: "Download Geopackage (.gpkg)",
         iconProps: { iconName: "download" },

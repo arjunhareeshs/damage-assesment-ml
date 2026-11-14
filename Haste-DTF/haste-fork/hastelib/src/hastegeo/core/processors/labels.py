@@ -17,6 +17,7 @@ from ..models.projects import (
 )
 from ..utils.gdal_security import harden_gdal
 from ..utils.metadata import MetadataUtils
+from ..utils.tiles import mask_nodata
 
 # Harden GDAL drivers before any rasterio read (GDAL CVE compensating
 # control — docs/known-vulnerabilities.md Root Cause C).
@@ -78,7 +79,9 @@ class LabelTaskGenerator:
         xyz_url = ""
         if imagery_url:
             urlencoded_imagery_url = requests.utils.quote(imagery_url, safe="")
-            xyz_url = f"{self.titiler_endpoint}cog/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}?scale=1&url={urlencoded_imagery_url}"
+            xyz_url = mask_nodata(
+                f"{self.titiler_endpoint}cog/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}?scale=1&url={urlencoded_imagery_url}"
+            )
         return xyz_url
 
     def generate_task_files(self):

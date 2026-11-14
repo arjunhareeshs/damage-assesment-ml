@@ -1,10 +1,13 @@
 import { ActionButton } from "@fluentui/react";
 import PropTypes from "prop-types";
+import { useNavigate } from "react-router-dom";
 
 const HelpDocsPrevNext = ({ prevNext }) => {
   HelpDocsPrevNext.propTypes = {
     prevNext: PropTypes.object.isRequired
   };
+
+  const navigate = useNavigate();
 
   const goTo = (url) => {
     navigate(url);

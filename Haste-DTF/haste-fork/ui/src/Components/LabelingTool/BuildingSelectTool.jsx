@@ -1,124 +1,204 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 //
-// AOI-scoped DamageTriageFormer (Option B, AOI-scoped —
-// docs/OptionB_AOI_Integration_Plan.md Module 6.1's "Case 2: analyst
-// selected/clicked specific buildings"). Renders this layer's building
-// footprints (via the existing GetBuildingFootprintsGeoJSON endpoint) as a
-// clickable vector layer; clicking a building toggles it into
-// selectedBuildingIds. This is a real, working implementation of the
-// building-click-selection path — CustomSelection.jsx/PolygonMultiEdit
-// (also in this folder) is a single-polygon vertex-dragging tool, not a
-// multi-building click-selector, and isn't reused here for that reason.
+// The layer's building footprints on the labeling map.
 //
-// Renders no visible React output itself (map layers only) — mirrors the
-// shape of loadStudyArea/loadPredictedDamageLayer in Visualizer.jsx, just
-// as a component so it can own its own effect lifecycle independent of
-// LabelingTool.jsx's drawingManager effect.
+// What the analyst sees here is exactly what a DamageTriageFormer run works
+// on: the footprints come from hg_buildings (GetLayerBuildings) -- the same
+// rows, with the same ids, that an AOI run resolves -- rather than the old
+// random 2,000-building sample, which silently left buildings off the map.
+//
+//   * every footprint is outlined as soon as the map loads, so it is clear
+//     what can be assessed;
+//   * buildings intersecting the drawn area are filled amber -- the backend
+//     decides which, with the run's own ST_Intersects predicate;
+//   * in "Select buildings" mode, clicking toggles a building (blue). The map
+//     follows selectedBuildingIds, so "Clear" in the panel clears it here too.
+//
+// Renders no React output itself (map layers only).
 import { useEffect, useRef } from "react";
 import PropTypes from "prop-types";
-import { apiGet } from "../../util/api";
+import { apiGet, apiPost } from "../../util/api";
 
 const SELECTED_COLOR = "#0078d4";
-const UNSELECTED_COLOR = "rgba(255, 255, 255, 0.01)";
+const IN_AOI_COLOR = "#ffb900";
+const OUTLINE_COLOR = "#ffffff";
+// Fully transparent polygons don't receive clicks; this is invisible but hit-testable.
+const CLICKABLE_TRANSPARENT = "rgba(255, 255, 255, 0.01)";
 
 const BuildingSelectTool = ({
   mapRef,
-  projectId,
   imageLayerId,
   active,
+  aoiGeoJson,
+  selectedBuildingIds,
   setSelectedBuildingIds,
+  onBuildingsLoaded,
 }) => {
   BuildingSelectTool.propTypes = {
-    // The Azure Maps atlas.Map instance is read from mapRef.current inside
-    // the effect below, not dereferenced at render time (React refs should
-    // only be read in effects/handlers, not during render) — mirrors how
-    // LabelingTool.jsx passes mapRef to LabelingToolLeftPanel.
+    // The atlas.Map instance, read inside effects only.
     mapRef: PropTypes.object.isRequired,
-    projectId: PropTypes.string.isRequired,
+    projectId: PropTypes.string,
     imageLayerId: PropTypes.string.isRequired,
+    // "Select buildings" mode: clicks toggle selection only while true.
     active: PropTypes.bool.isRequired,
+    aoiGeoJson: PropTypes.object,
+    selectedBuildingIds: PropTypes.array.isRequired,
     setSelectedBuildingIds: PropTypes.func.isRequired,
+    // Called with { total, shown, truncated } once footprints are loaded,
+    // or { error } if they could not be.
+    onBuildingsLoaded: PropTypes.func,
   };
 
-  const layersRef = useRef([]);
-  const loadedRef = useRef(false);
+  const dataSourceRef = useRef(null);
+  const activeRef = useRef(active);
 
-  // Lazily load footprints the first time selection mode is turned on —
-  // most sessions never use this path, so there's no reason to pay for it
-  // on every map load.
+  useEffect(() => {
+    activeRef.current = active;
+  }, [active]);
+
+  // Load all footprints once the map exists.
   useEffect(() => {
     const map = mapRef.current;
-    if (!map || !active || loadedRef.current) return;
-    loadedRef.current = true;
+    if (!map || dataSourceRef.current) return undefined;
     let cancelled = false;
 
     async function load() {
       try {
-        const featureCollection = await apiGet(
-          `GetBuildingFootprintsGeoJSON?projectId=${projectId}&imageLayerId=${imageLayerId}&sample=2000`
+        const collection = await apiGet(
+          `GetLayerBuildings?imageLayerId=${encodeURIComponent(imageLayerId)}`
         );
-        if (cancelled || !featureCollection?.features?.length) return;
+        if (cancelled) return;
+        const features = (collection && collection.features) || [];
+        features.forEach((f) => {
+          f.properties = { ...f.properties, selected: false, inAoi: false };
+        });
 
         const dataSource = new window.atlas.source.DataSource();
         map.sources.add(dataSource);
-        dataSource.add(featureCollection);
+        dataSource.add({ type: "FeatureCollection", features });
+        dataSourceRef.current = dataSource;
 
         const fillLayer = new window.atlas.layer.PolygonLayer(dataSource, null, {
           fillColor: [
             "case",
             ["boolean", ["get", "selected"], false],
             SELECTED_COLOR,
-            UNSELECTED_COLOR,
+            ["boolean", ["get", "inAoi"], false],
+            IN_AOI_COLOR,
+            CLICKABLE_TRANSPARENT,
           ],
-          fillOpacity: 0.5,
-          visible: active,
+          fillOpacity: [
+            "case",
+            ["boolean", ["get", "selected"], false],
+            0.55,
+            ["boolean", ["get", "inAoi"], false],
+            0.45,
+            1,
+          ],
         });
         fillLayer.customId = "buildingSelectFill";
         map.layers.add(fillLayer);
 
         const outlineLayer = new window.atlas.layer.LineLayer(dataSource, null, {
-          strokeColor: SELECTED_COLOR,
-          strokeWidth: 1,
-          visible: active,
+          strokeColor: [
+            "case",
+            ["boolean", ["get", "selected"], false],
+            SELECTED_COLOR,
+            ["boolean", ["get", "inAoi"], false],
+            IN_AOI_COLOR,
+            OUTLINE_COLOR,
+          ],
+          strokeWidth: 1.5,
         });
         outlineLayer.customId = "buildingSelectOutline";
         map.layers.add(outlineLayer);
 
-        layersRef.current = [fillLayer, outlineLayer];
-
         map.events.add("click", fillLayer, (e) => {
-          if (!e.shapes || !e.shapes.length) return;
-          const shape = e.shapes[0];
-          const shapeProperties = shape.getProperties();
-          const buildingId = shapeProperties.id;
-          const wasSelected = Boolean(shapeProperties.selected);
-          shape.setProperties({ ...shapeProperties, selected: !wasSelected });
+          if (!activeRef.current || !e.shapes || !e.shapes.length) return;
+          const buildingId = e.shapes[0].getProperties().id;
           setSelectedBuildingIds((prev) =>
-            wasSelected
+            prev.includes(buildingId)
               ? prev.filter((id) => id !== buildingId)
               : [...prev, buildingId]
           );
         });
+
+        if (onBuildingsLoaded) {
+          onBuildingsLoaded({
+            total: collection.total ?? features.length,
+            shown: features.length,
+            truncated: Boolean(collection.truncated),
+          });
+        }
+        // Apply any AOI / selection that arrived before the footprints did.
+        applySelection(selectedBuildingIds);
+        refreshAoi(aoiGeoJson);
       } catch (error) {
-        console.error(
-          "Error loading building footprints for selection:",
-          error
-        );
+        console.error("Error loading building footprints:", error);
+        if (onBuildingsLoaded) onBuildingsLoaded({ error: true });
       }
     }
     load();
-
     return () => {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mapRef, active]);
+  }, [imageLayerId]);
 
-  // Show/hide the layer as selection mode is toggled, without reloading it.
+  function applySelection(ids) {
+    const dataSource = dataSourceRef.current;
+    if (!dataSource) return;
+    const selected = new Set(ids);
+    dataSource.getShapes().forEach((shape) => {
+      const shapeProps = shape.getProperties();
+      const isSelected = selected.has(shapeProps.id);
+      if (Boolean(shapeProps.selected) !== isSelected) {
+        shape.setProperties({ ...shapeProps, selected: isSelected });
+      }
+    });
+  }
+
+  function setInAoi(ids) {
+    const dataSource = dataSourceRef.current;
+    if (!dataSource) return;
+    dataSource.getShapes().forEach((shape) => {
+      const shapeProps = shape.getProperties();
+      const inAoi = ids.has(shapeProps.id);
+      if (Boolean(shapeProps.inAoi) !== inAoi) {
+        shape.setProperties({ ...shapeProps, inAoi });
+      }
+    });
+  }
+
+  const aoiRequestRef = useRef(0);
+  function refreshAoi(aoi) {
+    if (!dataSourceRef.current) return;
+    const request = ++aoiRequestRef.current;
+    if (!aoi) {
+      setInAoi(new Set());
+      return;
+    }
+    apiPost("GetBuildingsInAoi", { imageLayerId, aoi, returnIds: true })
+      .then((result) => {
+        if (request !== aoiRequestRef.current) return; // a newer AOI won
+        setInAoi(new Set((result && result.buildingIds) || []));
+      })
+      .catch((error) => {
+        console.error("Error finding buildings in the drawn area:", error);
+      });
+  }
+
+  // Highlight the buildings inside the drawn area whenever it changes.
   useEffect(() => {
-    layersRef.current.forEach((layer) => layer.setOptions({ visible: active }));
-  }, [active]);
+    refreshAoi(aoiGeoJson);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [aoiGeoJson]);
+
+  // Keep the map's blue highlight in step with the selection (incl. "Clear").
+  useEffect(() => {
+    applySelection(selectedBuildingIds);
+  }, [selectedBuildingIds]);
 
   return null;
 };

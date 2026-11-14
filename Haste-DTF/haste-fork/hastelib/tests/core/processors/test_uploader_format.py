@@ -49,10 +49,20 @@ class TestResolveDataFormat(unittest.TestCase):
 
     def test_rejects_unknown_format(self):
         u = _make_uploader()
-        for v in ("zip", "shp", "json", "tif/../etc/passwd"):
+        for v in ("shp", "hdf", "gdb", "tif/../etc/passwd"):
             with self.subTest(v=v):
                 with self.assertRaises(ValueError):
                     u._resolve_data_format(v)
+
+
+    def test_accepts_footprint_formats(self):
+        u = _make_uploader()
+        for given, expected in (
+            ("geojson", "geojson"), ("json", "geojson"), ("ZIP", "zip"),
+            ("parquet", "parquet"), ("geoparquet", "parquet"),
+        ):
+            with self.subTest(given=given):
+                self.assertEqual(u._resolve_data_format(given), expected)
 
 
 class TestUploadSizeAndContentChecks(unittest.TestCase):

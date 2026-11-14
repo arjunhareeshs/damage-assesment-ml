@@ -11,6 +11,7 @@ import {
   centrateMap,
   AOI_DRAWING_MODE,
 } from "./LabelingToolHelper.js";
+import { addOpenBasemap } from "../../util/basemap";
 import { getAzureMapsAuthOptions, isAzureMapsPlaceholder } from "../../util/azureMapsAuth";
 import { useParams, useSearchParams } from "react-router-dom";
 import LabelingToolLeftPanel from "./LabelingToolLeftPanel.jsx";
@@ -49,6 +50,10 @@ const LabelingTool = ({ setModalComponent }) => {
   const preImageryRef = useRef(null);
   const postImageryRef = useRef(null);
   const labelingToolDataRef = useRef([]);
+  // Zooms the map back out to the whole imagery ("Full image" button).
+  const fitImageryRef = useRef(null);
+  // { total, shown, truncated } or { error } once the footprints load.
+  const [layerBuildings, setLayerBuildings] = useState(null);
   const [primaryClasses, setPrimaryClasses] = useState([]);
   const [drawingCount, setDrawingCount] = useState(0);
   const [isMapReady, setIsMapReady] = useState(false);
@@ -263,6 +268,9 @@ const LabelingTool = ({ setModalComponent }) => {
         bearing: 0,
       });
 
+      // Satellite landscape under the imagery when Azure Maps isn't set up.
+      addOpenBasemap(map);
+
       loadImagery(
         labelingToolDataRef.current.imagery.preEventTileUrl,
         map,
@@ -296,7 +304,26 @@ const LabelingTool = ({ setModalComponent }) => {
 
       const bbox = loadStudyArea(map, labelingToolDataRef.current);
       setDrawingManager(drawingManagerTemp);
-      centrateMap(bbox, map, 2500);
+      // Show the whole imagery, then keep the camera on it: panning and
+      // zooming out stop just past the image, so the view can't drift off
+      // into an empty world map. maxBounds is taken from the fitted
+      // viewport (not the raw image bbox) because a tall image on a wide
+      // screen needs a wider window than its own bbox to be seen whole.
+      centrateMap(bbox, map, 0);
+      const fitted = map.getCamera().bounds;
+      if (fitted) {
+        const padX = (fitted[2] - fitted[0]) * 0.25;
+        const padY = (fitted[3] - fitted[1]) * 0.25;
+        map.setCamera({
+          maxBounds: [
+            fitted[0] - padX,
+            fitted[1] - padY,
+            fitted[2] + padX,
+            fitted[3] + padY,
+          ],
+        });
+      }
+      fitImageryRef.current = () => centrateMap(bbox, map, 800);
 
       initGuidedTourState("labelingToolGuide", appParams.guidedTourProperties);
       initCurrentTour("labelingToolGuide");
@@ -344,24 +371,11 @@ const LabelingTool = ({ setModalComponent }) => {
             />
 
             <LabelingToolRightPanel
-              primaryClasses={primaryClasses}
-              selectedPrimaryClass={selectedPrimaryClass}
-              setSelectedPrimaryClass={setSelectedPrimaryClass}
               drawingManager={drawingManager}
               setDrawingManager={setDrawingManager}
-              setDialog={setDialog}
-              labelingToolDataRef={labelingToolDataRef}
-              setIsLoading={setIsLoading}
-              setHasUnsavedChanges={setHasUnsavedChanges}
-              hasUnsavedChanges={hasUnsavedChanges}
               setModalComponent={setModalComponent}
               projectId={projectId}
-              drawingCount={drawingCount}
-              setDrawingCount={setDrawingCount}
-              selectedShape={selectedShape}
               imageLayerId={imageLayerId}
-              undo={undo}
-              redo={redo}
               aoiGeoJson={aoiGeoJson}
               setAoiGeoJson={setAoiGeoJson}
               buildingSelectActive={buildingSelectActive}
@@ -371,13 +385,23 @@ const LabelingTool = ({ setModalComponent }) => {
               assessmentId={assessmentId}
               onAssessmentCreated={handleAssessmentCreated}
               setShowAssessmentDashboard={setShowAssessmentDashboard}
+              onFitImagery={() => fitImageryRef.current && fitImageryRef.current()}
+              layerBuildings={layerBuildings}
+              getStudyArea={() =>
+                labelingToolDataRef.current && labelingToolDataRef.current.features
+                  ? { type: "FeatureCollection", features: labelingToolDataRef.current.features }
+                  : null
+              }
             />
             <BuildingSelectTool
               mapRef={mapRef}
               projectId={projectId}
               imageLayerId={imageLayerId}
               active={buildingSelectActive}
+              aoiGeoJson={aoiGeoJson}
+              selectedBuildingIds={selectedBuildingIds}
               setSelectedBuildingIds={setSelectedBuildingIds}
+              onBuildingsLoaded={setLayerBuildings}
             />
             <AoiAssessmentMapLayer
               mapRef={mapRef}

@@ -64,3 +64,55 @@ class TestSavePolygonAsGeojson(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestExtractAoiPolygon(unittest.TestCase):
+    """``extract_aoi_polygon`` keeps every real imagery region."""
+
+    def _tif(self, blocks):
+        import numpy as np
+        import rasterio
+        from rasterio.transform import from_origin
+
+        data = np.zeros((3, 400, 400), dtype=np.uint8)
+        for r0, r1, c0, c1 in blocks:
+            data[:, r0:r1, c0:c1] = 200
+        tmp = tempfile.NamedTemporaryFile(suffix=".tif", delete=False)
+        tmp.close()
+        self.addCleanup(os.remove, tmp.name)
+        with rasterio.open(
+            tmp.name, "w", driver="GTiff", width=400, height=400, count=3,
+            dtype="uint8", crs="EPSG:4326",
+            transform=from_origin(-102.0, 35.5, 0.001, 0.001),
+        ) as dst:
+            dst.write(data)
+        return tmp.name
+
+    def test_two_separate_tiles_are_both_kept_and_specks_dropped(self):
+        from hastegeo.core.utils.aoi import extract_aoi_polygon
+
+        north = (0, 100, 0, 400)    # 100 x 400 px
+        south = (250, 400, 0, 400)  # 150 x 400 px, larger; gap between
+        speck = (180, 182, 10, 12)  # 4 px of noise in the gap
+        geom = extract_aoi_polygon(self._tif([north, south, speck]))
+
+        self.assertEqual(geom.geom_type, "MultiPolygon")
+        self.assertEqual(len(geom.geoms), 2)
+        # Both tiles' centres are inside; the gap and the speck are not.
+        self.assertTrue(geom.contains(shapely.geometry.Point(-101.8, 35.45)))
+        self.assertTrue(geom.contains(shapely.geometry.Point(-101.8, 35.18)))
+        self.assertFalse(geom.contains(shapely.geometry.Point(-101.8, 35.32)))
+        self.assertFalse(geom.contains(shapely.geometry.Point(-101.989, 35.319)))
+
+    def test_single_tile_is_a_polygon(self):
+        from hastegeo.core.utils.aoi import extract_aoi_polygon
+
+        geom = extract_aoi_polygon(self._tif([(50, 350, 50, 350)]))
+        self.assertEqual(geom.geom_type, "Polygon")
+        self.assertAlmostEqual(geom.area, 0.3 * 0.3, places=3)
+
+    def test_all_nodata_raises(self):
+        from hastegeo.core.utils.aoi import extract_aoi_polygon
+
+        with self.assertRaises(ValueError):
+            extract_aoi_polygon(self._tif([]))

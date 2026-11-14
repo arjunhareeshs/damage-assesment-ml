@@ -1,5 +1,7 @@
 # Use the official Azurite image from Microsoft
-FROM mcr.microsoft.com/azure-storage/azurite:latest
+# Pinned to what `latest` pointed to on 2026-11-05, so the image only
+# changes when this line does.
+FROM mcr.microsoft.com/azure-storage/azurite:3.37.0
 
 # Expose the necessary ports
 EXPOSE 10000 10001 10002

@@ -63,7 +63,8 @@ const RunDtfAoiButton = ({
         const body = { imageLayerId };
         if (selectedBuildingIds && selectedBuildingIds.length) {
           body.buildingIds = selectedBuildingIds;
-        } else {
+        }
+        if (aoiGeoJson) {
           body.aoi = aoiGeoJson;
         }
         const result = await apiPost("GetBuildingsInAoi", body);
@@ -103,7 +104,8 @@ const RunDtfAoiButton = ({
       };
       if (selectedBuildingIds && selectedBuildingIds.length) {
         body.buildingIds = selectedBuildingIds;
-      } else {
+      }
+      if (aoiGeoJson) {
         body.aoi = aoiGeoJson;
       }
       await apiPut("PutRunDTFAoiInferenceQueueMessage", body);

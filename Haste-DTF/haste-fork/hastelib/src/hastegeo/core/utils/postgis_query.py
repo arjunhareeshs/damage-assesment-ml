@@ -33,11 +33,12 @@ def buildings_in_aoi(
 ) -> list[dict]:
     """Resolve which buildings are in scope for an AOI-scoped DTF run.
 
-    ``building_ids`` takes precedence when non-empty (an explicit
-    click-selection, "Method 2 style" per plan.pdf); otherwise every
-    footprint that intersects ``aoi_geojson`` (a GeoJSON Polygon/
-    MultiPolygon in EPSG:4326, drawn on the map) is returned. Exactly one
-    of the two must be supplied.
+    ``building_ids`` alone selects exactly those ids (an explicit
+    click-selection, "Method 2 style" per plan.pdf); ``aoi_geojson`` alone
+    (a GeoJSON Polygon/MultiPolygon in EPSG:4326, drawn on the map) selects
+    every footprint that intersects it. When both are supplied the AOI still
+    applies: only the selected ids that intersect it are returned. At least
+    one of the two must be supplied.
 
     Returns:
         ``[{"building_id": str, "geometry": <GeoJSON dict, EPSG:4326>}, ...]``
@@ -51,7 +52,20 @@ def buildings_in_aoi(
     connection = conn or get_connection()
     try:
         with connection.cursor() as cursor:
-            if building_ids:
+            if building_ids and aoi_geojson:
+                cursor.execute(
+                    """
+                    SELECT building_id, ST_AsGeoJSON(geometry)
+                    FROM hg_buildings
+                    WHERE image_layer_id = %s AND building_id = ANY(%s)
+                      AND ST_Intersects(
+                          geometry,
+                          ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326)
+                      )
+                    """,
+                    (image_layer_id, list(building_ids), json.dumps(aoi_geojson)),
+                )
+            elif building_ids:
                 cursor.execute(
                     """
                     SELECT building_id, ST_AsGeoJSON(geometry)
@@ -104,7 +118,19 @@ def count_buildings_in_aoi(
     connection = conn or get_connection()
     try:
         with connection.cursor() as cursor:
-            if building_ids:
+            if building_ids and aoi_geojson:
+                cursor.execute(
+                    """
+                    SELECT count(*) FROM hg_buildings
+                    WHERE image_layer_id = %s AND building_id = ANY(%s)
+                      AND ST_Intersects(
+                          geometry,
+                          ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326)
+                      )
+                    """,
+                    (image_layer_id, list(building_ids), json.dumps(aoi_geojson)),
+                )
+            elif building_ids:
                 cursor.execute(
                     """
                     SELECT count(*) FROM hg_buildings
@@ -125,6 +151,215 @@ def count_buildings_in_aoi(
                     (image_layer_id, json.dumps(aoi_geojson)),
                 )
             return int(cursor.fetchone()[0])
+    finally:
+        if owns_conn:
+            connection.close()
+
+
+# Upper bound on footprints sent to the labeling map in one response. Far
+# above a typical image layer (hundreds to a few thousand buildings); beyond
+# it the map shows the first N and says so, rather than the browser stalling.
+MAX_MAP_BUILDINGS = 20000
+
+
+def layer_buildings_feature_collection(
+    image_layer_id: str,
+    bbox: Optional[tuple] = None,
+    limit: int = MAX_MAP_BUILDINGS,
+    conn=None,
+) -> dict:
+    """The layer's building footprints as a GeoJSON FeatureCollection.
+
+    Read from ``hg_buildings`` -- the same rows a DamageTriageFormer run
+    resolves its buildings from -- so what the analyst sees and clicks on the
+    map is exactly what a run covers, with the same ids. Unlike the old
+    random-sample endpoint, nothing is left out unless the layer exceeds
+    ``limit``; then the first ``limit`` (by id, so stable between calls) are
+    returned with ``truncated: true``.
+
+    Args:
+        image_layer_id: Layer whose buildings to return.
+        bbox: Optional ``(minx, miny, maxx, maxy)`` in EPSG:4326; only
+            footprints whose bounding box overlaps it are returned.
+        limit: Maximum number of features.
+
+    Returns:
+        ``{"type": "FeatureCollection", "features": [...], "total": int,
+        "truncated": bool}``. Each feature has ``properties.id``.
+    """
+    owns_conn = conn is None
+    connection = conn or get_connection()
+    try:
+        with connection.cursor() as cursor:
+            params: list = [image_layer_id]
+            bbox_sql = ""
+            if bbox is not None:
+                bbox_sql = (
+                    " AND geometry && ST_MakeEnvelope(%s, %s, %s, %s, 4326)"
+                )
+                params.extend(float(v) for v in bbox)
+            params.append(int(limit))
+            # count(*) OVER () is evaluated before LIMIT, so it is the total
+            # number of matching buildings, not just the returned ones.
+            cursor.execute(
+                f"""
+                SELECT building_id, ST_AsGeoJSON(geometry), count(*) OVER ()
+                FROM hg_buildings
+                WHERE image_layer_id = %s{bbox_sql}
+                ORDER BY building_id
+                LIMIT %s
+                """,
+                tuple(params),
+            )
+            rows = cursor.fetchall()
+    finally:
+        if owns_conn:
+            connection.close()
+
+    features = [
+        {
+            "type": "Feature",
+            "geometry": json.loads(geometry),
+            "properties": {"id": building_id},
+        }
+        for building_id, geometry, _ in rows
+    ]
+    total = int(rows[0][2]) if rows else 0
+    return {
+        "type": "FeatureCollection",
+        "features": features,
+        "total": total,
+        "truncated": total > len(features),
+    }
+
+
+def building_ids_in_aoi(
+    image_layer_id: str,
+    aoi_geojson: dict,
+    limit: int = 100000,
+    conn=None,
+) -> list[str]:
+    """Ids of the layer's buildings that intersect ``aoi_geojson``.
+
+    Same ``ST_Intersects`` predicate as :func:`buildings_in_aoi`, so the
+    buildings highlighted on the map are exactly the ones an AOI run would
+    assess.
+    """
+    if not aoi_geojson:
+        raise ValueError("building_ids_in_aoi requires aoi_geojson.")
+    owns_conn = conn is None
+    connection = conn or get_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT building_id FROM hg_buildings
+                WHERE image_layer_id = %s
+                  AND ST_Intersects(
+                      geometry,
+                      ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326)
+                  )
+                LIMIT %s
+                """,
+                (image_layer_id, json.dumps(aoi_geojson), int(limit)),
+            )
+            return [row[0] for row in cursor.fetchall()]
+    finally:
+        if owns_conn:
+            connection.close()
+
+
+_RUN_RESULTS_DDL = """
+CREATE TABLE IF NOT EXISTS hg_dtf_run_results (
+    model_id          TEXT NOT NULL,
+    building_id       TEXT NOT NULL,
+    image_layer_id    TEXT NOT NULL,
+    project_id        TEXT,
+    damage_class      INTEGER,
+    damage_class_name TEXT,
+    confidence        DOUBLE PRECISION,
+    probabilities     JSONB,
+    crop_url          TEXT,
+    mask_url          TEXT,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (model_id, building_id)
+);
+CREATE INDEX IF NOT EXISTS hg_dtf_run_results_building_idx
+    ON hg_dtf_run_results (image_layer_id, building_id);
+"""
+_RUN_RESULTS_READY = False
+
+
+def ensure_run_results_table(connection) -> None:
+    """Create ``hg_dtf_run_results`` if missing (same DDL as migration 0005).
+
+    Migrations only run when the database is first created, so a database
+    that predates 0005 gets the table here, once per process.
+    """
+    global _RUN_RESULTS_READY
+    if _RUN_RESULTS_READY:
+        return
+    with connection.cursor() as cursor:
+        cursor.execute(_RUN_RESULTS_DDL)
+    connection.commit()
+    _RUN_RESULTS_READY = True
+
+
+def record_run_results(
+    image_layer_id: str,
+    model_id: str,
+    rows: list[dict],
+    project_id: Optional[str] = None,
+    conn=None,
+) -> int:
+    """Store one DamageTriageFormer run's per-building results.
+
+    The history behind ``hg_buildings`` (which only keeps the current
+    result): one row per (run, building). Re-recording a run replaces its
+    rows. ``rows`` items: ``building_id``, ``class``, ``class_name``,
+    ``confidence``, and optionally ``probabilities`` (list or dict),
+    ``crop_url``, ``mask_url``. Returns the number of rows written.
+    """
+    if not rows:
+        return 0
+    owns_conn = conn is None
+    connection = conn or get_connection()
+    try:
+        ensure_run_results_table(connection)
+        with connection.cursor() as cursor:
+            for row in rows:
+                probabilities = row.get("probabilities")
+                cursor.execute(
+                    """
+                    INSERT INTO hg_dtf_run_results
+                        (model_id, building_id, image_layer_id, project_id,
+                         damage_class, damage_class_name, confidence,
+                         probabilities, crop_url, mask_url)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)
+                    ON CONFLICT (model_id, building_id) DO UPDATE SET
+                        damage_class = EXCLUDED.damage_class,
+                        damage_class_name = EXCLUDED.damage_class_name,
+                        confidence = EXCLUDED.confidence,
+                        probabilities = EXCLUDED.probabilities,
+                        crop_url = EXCLUDED.crop_url,
+                        mask_url = EXCLUDED.mask_url,
+                        created_at = now()
+                    """,
+                    (
+                        str(model_id),
+                        str(row["building_id"]),
+                        image_layer_id,
+                        project_id,
+                        row.get("class"),
+                        row.get("class_name"),
+                        row.get("confidence"),
+                        json.dumps(probabilities) if probabilities is not None else None,
+                        row.get("crop_url") or None,
+                        row.get("mask_url") or None,
+                    ),
+                )
+        connection.commit()
+        return len(rows)
     finally:
         if owns_conn:
             connection.close()
@@ -151,6 +386,8 @@ def update_building_predictions(
     Returns:
         Number of rows updated.
     """
+    # A failed/unclassified row must never overwrite a good earlier result.
+    rows = [r for r in rows if r.get("class") is not None and r["class"] >= 0]
     owns_conn = conn is None
     connection = conn or get_connection()
     try:
@@ -158,6 +395,7 @@ def update_building_predictions(
             cursor.executemany(
                 """
                 UPDATE hg_buildings SET
+                    result_status = 'completed',
                     damage_class = %(class)s,
                     damage_class_name = %(class_name)s,
                     confidence = %(confidence)s,

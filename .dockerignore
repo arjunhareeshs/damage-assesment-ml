@@ -1,0 +1,8 @@
+# Allow-list: the build context stays small however much data sits in the repo.
+*
+!Dockerfile
+!run_local_aoi_assessment.py
+!Haste-DTF/haste-fork/hastelib/src
+!Haste-DTF/Damage-TriageFormer/src
+**/__pycache__
+**/*.pyc

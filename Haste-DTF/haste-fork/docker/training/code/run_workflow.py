@@ -1,7 +1,11 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 
-"""Helper script for running the entire workflow."""
+"""Run the segmentation-model inference workflow (inference, merge, visualizer).
+
+Model training (create_masks.py + fine_tune.py) was removed: the image only
+runs models that were trained elsewhere.
+"""
 
 import argparse
 import glob
@@ -40,52 +44,19 @@ def main():
     parser.add_argument(
         "--step",
         type=str,
-        choices=["training", "inference"],
-        default="all",
-        help="Step to execute (default: all)",
+        choices=["inference"],
+        default="inference",
+        help=(
+            "Step to execute. Only inference remains: model training was "
+            "removed from this image (models arrive pre-trained)."
+        ),
     )
-
     args = parser.parse_args()
 
     with open(args.config, "r") as f:
         config = yaml.safe_load(f)
 
-    if args.step == "training" or args.step == "all":
-        if not os.path.exists(config.get("labels").get("fn")):
-            log_progress("Error running create_masks.py")
-            raise RuntimeError(
-                f"Labels not found at {config.get('labels').get('fn')}"
-            )
-        run_subprocess(
-            [
-                "python",
-                "create_masks.py",
-                "--config",
-                args.config,
-                "--overwrite",
-            ],
-            "create_masks.py",
-        )
-
-        run_subprocess(
-            ["python", "fine_tune.py", "--config", args.config, "--overwrite"],
-            "fine_tune.py",
-        )
-        # Absence of file is caught by fine_tune.py
-        checkpoint_dir = os.path.join(
-            config.get("experiment_dir"),
-            config.get("training", {}).get("checkpoint_subdir"),
-        )
-        ckpt_files = glob.glob(os.path.join(checkpoint_dir, "*.ckpt"))
-        if not ckpt_files:
-            print("No .ckpt files found in checkpoint_subdir.")
-            log_progress("Error running fine_tune.py")
-            raise RuntimeError(
-                "No checkpoint files created. Please download all artifacts for this model"
-                " and check the stderr and stdout files for more information"
-            )
-
-    if args.step == "inference" or args.step == "all":
+    if args.step == "inference":
         log_progress("Generating predictions")
         run_subprocess(
             ["python", "inference.py", "--config", args.config, "--overwrite"],

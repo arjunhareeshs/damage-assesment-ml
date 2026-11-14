@@ -7,52 +7,27 @@ import { DefaultButton } from "@fluentui/react";
 import React from "react";
 import StatusIndicator from "../OtherComponents/StatusIndicator";
 import { useNavigate } from "react-router-dom";
-import CreateEditModelTrainingModal from "../CreateEditModelTrainingModal";
-import CreateEditEmbeddingModal from "../CreateEditEmbeddingModal";
-import CreateEditDTFModal from "../CreateEditDTFModal";
 
-const ImageLayerInfoMobile = ({ item, setModalComponent, fetchProjectDetails, setComponentState, eventTypes  }) => {
+const ImageLayerInfoMobile = ({ item }) => {
   ImageLayerInfoMobile.propTypes = {
     item: PropTypes.object.isRequired,
-    setModalComponent: PropTypes.func.isRequired,
-    fetchProjectDetails: PropTypes.func.isRequired,
-    setComponentState: PropTypes.func.isRequired,
-    eventTypes: PropTypes.array.isRequired,
+    // Callers still pass these; the buttons that used them (training,
+    // embedding, the whole-layer DTF modal) were removed.
+    setModalComponent: PropTypes.func,
+    fetchProjectDetails: PropTypes.func,
+    setComponentState: PropTypes.func,
+    eventTypes: PropTypes.array,
   };
 
   const navigate = useNavigate();
 
-  // Mirror LayerRow's desktop logic: layers created with the "building"
-  // embedding workflow expose an Embed action (kicks off an embedding job)
-  // instead of the Launch Labeling Tool / Train Model actions.
-  const isBuildingWorkflow = item.workflowType === "building";
-  const embeddingModels =
-    (item.models || []).filter((m) => m.modelType === "embedding") || [];
   const dtfModels =
     (item.models || []).filter((m) => m.modelType === "dtf") || [];
 
-  function handleEmbed() {
-    setModalComponent(
-      <CreateEditEmbeddingModal
-        onClose={() => setModalComponent(null)}
-        projectId={item.projectId}
-        imageLayer={item}
-        fetchProjectDetails={fetchProjectDetails}
-      />
-    );
-  }
-
-  function handleRunDTF() {
-    setModalComponent(
-      <CreateEditDTFModal
-        onClose={() => setModalComponent(null)}
-        projectId={item.projectId}
-        imageLayer={item}
-        fetchProjectDetails={fetchProjectDetails}
-      />
-    );
-  }
-
+  // DamageTriageFormer runs from the Labeling Tool: draw an area (or use the
+  // whole image) and run it per building or as a Large-AOI assessment. The
+  // old whole-layer tile workflow (CreateEditDTFModal) can't load the
+  // crop-mode checkpoint this deployment ships, so it isn't offered here.
   return (
     <React.Fragment key={"imageLayerInfoMobile_" + item.projectId + "_" + item.imageLayerId}>
       <tr>
@@ -80,25 +55,7 @@ const ImageLayerInfoMobile = ({ item, setModalComponent, fetchProjectDetails, se
             />
           </div>
 
-          {isBuildingWorkflow ? (
-            <div style={{ borderBottom: "1px solid #ccc" }} className="pb-2 pt-2">
-              <DefaultButton
-                id={"singleProjectEmbed" + item.imageLayerId}
-                className="dashboard-button"
-                styles={{ root: { width: "100%" } }}
-                onClick={handleEmbed}
-                disabled={
-                  item.status !== "Processed" || !item.buildingFootprintsUrl
-                }
-              >
-                Embed
-              </DefaultButton>
-              <Text className="d-block pt-1" variant="small">
-                Embeddings: {embeddingModels.length}
-              </Text>
-            </div>
-          ) : (
-            <>
+          <>
               <div style={{ borderBottom: "1px solid #ccc" }} className="pb-2 pt-2">
                 <DefaultButton
                   id={"singleProjectLabelingToolLaunch" + item.imageLayerId}
@@ -117,57 +74,21 @@ const ImageLayerInfoMobile = ({ item, setModalComponent, fetchProjectDetails, se
               </div>
 
               <div style={{ borderBottom: "1px solid #ccc" }} className="pb-2 pt-2">
-                <DefaultButton
-                  id={"singleProjectModelTraining" + item.imageLayerId}
-                  className="dashboard-button"
-                  styles={{ root: { width: "100%" } }}
-                  onClick={() =>
-                    setModalComponent(
-                      <CreateEditModelTrainingModal
-                        onClose={() => setModalComponent(null)}
-                        projectId={item.projectId}
-                        imageLayer={item}
-                        fetchProjectDetails={fetchProjectDetails}
-                        setImageLayerComponentState={setComponentState}
-                        guidedTour="createEditModelTrainingModalGuide"
-                        autoLaunchGuidedTour={true}
-                      />
-                    )
-                  }
-                  disabled={item.status !== "Processed" || item.labelProjectCount < 1}
-                >
-                  Train Model
-                </DefaultButton>
+                {/* Model training was removed (pre-trained models only). */}
                 <Text className="d-block pt-1" variant="small">
                   Models: {item.models && item.models.length > 0 ? item.models.length : 0}
                 </Text>
               </div>
-            </>
-          )}
-
-          <div style={{ borderBottom: "1px solid #ccc" }} className="pb-2 pt-2">
-            <DefaultButton
-              id={"singleProjectBuildingValidation" + item.imageLayerId}
-              className="dashboard-button"
-              styles={{ root: { width: "100%" } }}
-              onClick={() =>
-                navigate(`/validation/${item.projectId}/${item.imageLayerId}`)
-              }
-              disabled={!item.buildingFootprintsUrl}
-            >
-              Launch Validation Tool
-            </DefaultButton>
-            <Text className="d-block pt-1" variant="small">
-              Validation labels: {item.validationLabelCount || 0}
-            </Text>
-          </div>
+          </>
 
           <div className="pb-2 pt-2">
             <DefaultButton
               id={"singleProjectRunDTF" + item.imageLayerId}
               className="dashboard-button"
               styles={{ root: { width: "100%" } }}
-              onClick={handleRunDTF}
+              onClick={() =>
+                navigate(`/labeling-tool/${item.projectId}/${item.imageLayerId}`)
+              }
               disabled={item.status !== "Processed" || !item.buildingFootprintsUrl}
             >
               Run DamageTriageFormer

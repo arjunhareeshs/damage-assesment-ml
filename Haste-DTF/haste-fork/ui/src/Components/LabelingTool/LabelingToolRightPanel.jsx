@@ -1,44 +1,24 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
-import { useEffect, useState } from "react";
 import {
   ActionButton,
-  ChoiceGroup,
   DefaultButton,
   PrimaryButton,
-  Slider,
 } from "@fluentui/react";
-import CreateEditModelTrainingModal from "../CreateEditModelTrainingModal";
-import { saveLabels, checkLabelsState } from "./LabelingToolHelper";
 import DrawingToolbar from "./DrawingToolbar";
 import AoiDrawTool from "./AoiDrawTool";
 import RunDtfAoiButton from "./RunDtfAoiButton";
 import AoiAssessmentModal from "./AoiAssessmentModal";
 import PropType from "prop-types";
-import { updateShape } from "./LabelingToolHelper";
-import ImportLabelsModal from "./ImportLabelsModal";
-import { fileDownload } from "../../util/file";
-import { apiGet } from "../../util/api";
+import { useEffect, useState } from "react";
+import { apiPost } from "../../util/api";
 
 const LabelingToolRightPanel = ({
-  primaryClasses,
-  selectedPrimaryClass,
-  setSelectedPrimaryClass,
   drawingManager,
   setDrawingManager,
-  setDialog,
-  labelingToolDataRef,
-  setIsLoading,
-  setHasUnsavedChanges,
-  hasUnsavedChanges,
   setModalComponent,
   projectId,
-  drawingCount,
-  setDrawingCount,
-  selectedShape,
   imageLayerId,
-  undo,
-  redo,
   aoiGeoJson,
   setAoiGeoJson,
   buildingSelectActive,
@@ -48,26 +28,16 @@ const LabelingToolRightPanel = ({
   assessmentId,
   onAssessmentCreated,
   setShowAssessmentDashboard,
+  getStudyArea,
+  onFitImagery,
+  layerBuildings,
 }) => {
   LabelingToolRightPanel.propTypes = {
-    primaryClasses: PropType.array.isRequired,
-    selectedPrimaryClass: PropType.string.isRequired,
-    setSelectedPrimaryClass: PropType.func.isRequired,
     drawingManager: PropType.object.isRequired,
     setDrawingManager: PropType.func.isRequired,
-    setDialog: PropType.func.isRequired,
-    labelingToolDataRef: PropType.object.isRequired,
-    setIsLoading: PropType.func.isRequired,
-    setHasUnsavedChanges: PropType.func.isRequired,
-    hasUnsavedChanges: PropType.bool.isRequired,
     setModalComponent: PropType.func.isRequired,
     projectId: PropType.string.isRequired,
-    drawingCount: PropType.number.isRequired,
-    setDrawingCount: PropType.func.isRequired,
-    selectedShape: PropType.object,
     imageLayerId: PropType.string.isRequired,
-    undo: PropType.func.isRequired,
-    redo: PropType.func.isRequired,
     aoiGeoJson: PropType.object,
     setAoiGeoJson: PropType.func.isRequired,
     buildingSelectActive: PropType.bool.isRequired,
@@ -77,7 +47,33 @@ const LabelingToolRightPanel = ({
     assessmentId: PropType.string,
     onAssessmentCreated: PropType.func,
     setShowAssessmentDashboard: PropType.func,
+    getStudyArea: PropType.func,
+    onFitImagery: PropType.func,
+    layerBuildings: PropType.object,
   };
+
+  // How many footprints fall inside the drawn area, shown right under it so
+  // the analyst sees what a run will cover before starting one.
+  const [aoiCount, setAoiCount] = useState({ state: "idle", count: 0 });
+  useEffect(() => {
+    if (!aoiGeoJson) {
+      setAoiCount({ state: "idle", count: 0 });
+      return undefined;
+    }
+    let cancelled = false;
+    setAoiCount({ state: "loading", count: 0 });
+    apiPost("GetBuildingsInAoi", { imageLayerId, aoi: aoiGeoJson })
+      .then((result) => {
+        if (!cancelled) setAoiCount({ state: "done", count: result.count || 0 });
+      })
+      .catch((error) => {
+        console.error("Error counting buildings in the area:", error);
+        if (!cancelled) setAoiCount({ state: "error", count: 0 });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [aoiGeoJson, imageLayerId]);
 
   function handleRunDtfAoi() {
     setModalComponent(
@@ -108,323 +104,85 @@ const LabelingToolRightPanel = ({
     );
   }
 
-  function handleToggleBuildingSelect() {
-    setBuildingSelectActive((prev) => !prev);
-  }
-
-  function handleClearBuildingSelection() {
-    setSelectedBuildingIds([]);
-  }
-
-  useEffect(() => {
-    if (selectedShape !== null) {
-      updateShape(
-        drawingManager,
-        selectedShape,
-        selectedPrimaryClass,
-      );
-      setHasUnsavedChanges(true);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedPrimaryClass]);
-
-  async function handleSave() {
-
-    var message = "Labels saved successfully";
-    if (checkLabelsState(drawingManager)) {
-      const isSaved = await saveLabels(
-        drawingManager,
-        labelingToolDataRef,
-        setIsLoading,
-        setHasUnsavedChanges
-      );
-
-      if (!isSaved) {
-        message = "There was an error saving the labels";
-      }
-    } else {
-      message = "There are labels without a valid primary class. Please classify or remove them before saving.";
-    };
-
-    const buttons = [
-      {
-        type: "primary",
-        key: "close",
-        text: "Close",
-        onClick: () => {
-          setDialog("", "", []);
-        },
-      },
-    ];
-
-    setDialog("Important", message, buttons);
-  }
-
-  function handlePrimaryClassChange(newClass) {
-    if (selectedShape !== null) {
-      const buttons = [
-        {
-          type: "primary",
-          key: "yes",
-          text: "Yes",
-          onClick: () => {
-            setSelectedPrimaryClass(newClass);
-            setDialog("", "", []);
-            setTimeout(() => {
-              document.getElementById("pointer").click();
-            }, 100);
-          }
-        },
-        {
-          type: "default",
-          key: "no",
-          text: "No",
-          onClick: () => {
-            setDialog("", "", []);
-          },
-        },
-      ];
-      setDialog("Important", "You are about to change the primary class of the selected label. Do you want to continue?", buttons);
-    } else {
-      setSelectedPrimaryClass(newClass);
-    }
-  }
-
-  async function handleSaveAndTrain() {
-    if (checkLabelsState(drawingManager)) {
-      const isSaved = await saveLabels(
-        drawingManager,
-        labelingToolDataRef,
-        setIsLoading,
-        setHasUnsavedChanges
-      );
-
-      if (!isSaved) {
-        const buttons = [
-          {
-            type: "primary",
-            key: "close",
-            text: "Close",
-            onClick: () => {
-              setDialog("", "", []);
-            },
-          },
-        ];
-
-        setDialog("Important", "There was an error saving the labels", buttons);
-      } else {
-        setModalComponent(
-          <CreateEditModelTrainingModal
-            onClose={() => setModalComponent(null)}
-            projectId={projectId}
-            imageLayer={labelingToolDataRef.current}
-            guidedTour="createEditModelTrainingModalGuide"
-            autoLaunchGuidedTour={true}
-          />
-        );
-      }
-    } else {
-      const buttons = [
-        {
-          type: "primary",
-          key: "close",
-          text: "Close",
-          onClick: () => {
-            setDialog("", "", []);
-          },
-        },
-      ];
-      setDialog("Important", "There are labels without a valid primary class. Please classify or remove them before saving.", buttons);
-    }
-  }
-
-  const labelSavingMenuOptions = () => ({
-    items: [
-      {
-        key: "import",
-        text: "Import from GeoJSON",
-        iconProps: { iconName: "Upload" },
-        title: "",
-        onClick: () => {
-          handleImport();
-        },
-      },
-      {
-        key: "exportToGeoJSON",
-        text: "Export to GeoJSON",
-        iconProps: { iconName: "Download" },
-        onClick: () => {
-          handleLabelExport();
-        },
-      },
-      {
-        key: "save",
-        text: "Save",
-        iconProps: { iconName: "Save" },
-        title: drawingCount === 0 ? "Saving requires at least one label" : "",
-        disabled: drawingCount === 0,
-        onClick: () => {
-          handleSave();
-        },
-      },
-      {
-        key: "saveAndTrain",
-        text: "Save and Train",
-        iconProps: { iconName: "SaveAndClose" },
-        title: drawingCount === 0 ? "Training requires at least one label" : "",
-        disabled: drawingCount === 0,
-        onClick: () => {
-          handleSaveAndTrain();
-        },
-      },
-    ],
-  });
-
-  async function handleLabelExport() {
-
-    if (hasUnsavedChanges) {
-      setDialog("Important", "There are unsaved changes. Please save before continue.", [
-        {
-          type: "primary",
-          key: "close",
-          text: "Close",
-          onClick: () => {
-            setDialog("", "", []);
-          },
-        },
-      ]);
-      return false;
-    }
-
-    try {
-      setIsLoading(true, "Exporting Labels to GeoJSON");
-      const project = await apiGet("GetProjectDetails?projectId=" + projectId);
-      const imageLayer = project.imageLayer.find(layer => layer.imageLayerId === imageLayerId);
-
-      if (imageLayer.labelsUrl) {
-        if (import.meta.env.VITE_STORAGE_APIM_URL) {
-          imageLayer.labelsUrl = imageLayer.labelsUrl.replace(
-            /^https?:\/\/[^/]+/,
-            import.meta.env.VITE_STORAGE_APIM_URL
-          );
-        }
-        fileDownload(imageLayer.labelsUrl, setDialog);
-      }
-      setIsLoading(false);
-    } catch (error) {
-      setDialog("Error", "An error occurred while exporting labels.", [
-        {
-          type: "primary",
-          key: "close",
-          text: "Close",
-          onClick: () => {
-            setDialog("", "", []);
-          },
-        },
-      ]);
-    } finally {
-      setIsLoading(false);
-    }
-  }
-
-  function handleImport() {
-
-    const fileInput = document.getElementById("importGeoJSON");
-
-    const handleFileChange = (e) => {
-      const file = e.target.files[0];
-      if (!file) return;
-
-      const reader = new FileReader();
-      reader.onload = (event) => {
-        try {
-          const geojsonData = JSON.parse(event.target.result);
-
-          if (geojsonData.type === "FeatureCollection" && Array.isArray(geojsonData.features)) {
-            setModalComponent(
-              <ImportLabelsModal
-                onClose={() => setModalComponent(null)}
-                geojsonData={geojsonData}
-                labelingToolDataRef={labelingToolDataRef}
-                drawingManager={drawingManager}
-                setDrawingManager={setDrawingManager}
-                setHasUnsavedChanges={setHasUnsavedChanges}
-                primaryClasses={primaryClasses}
-                setDrawingCount={setDrawingCount}
-                undo={undo}
-                redo={redo}
-              />
-            );
-
-            fileInput.value = "";
-          } else {
-            throw new Error("The file is not a valid GeoJSON FeatureCollection.");
-            fileInput.value = "";
-          }
-        } catch (err) {
-          console.error("Error importing GeoJSON:", err);
-          const buttons = [
-            {
-              type: "primary",
-              key: "close",
-              text: "Close",
-              onClick: () => {
-                setDialog("", "", []);
-              },
-            },
-          ];
-
-          setDialog("Important", "The selected file is not a valid GeoJSON.", buttons);
-          fileInput.value = "";
-        }
-      };
-
-      reader.readAsText(file);
-      fileInput.removeEventListener("change", handleFileChange);
-    };
-
-    fileInput.addEventListener("change", handleFileChange);
-    fileInput.click();
-  }
+  const nothingToRun = !aoiGeoJson && selectedBuildingIds.length === 0;
 
   return (
     <>
-      <DrawingToolbar drawingManager={drawingManager} setDrawingManager={setDrawingManager} undo={undo} redo={redo} />
+      <DrawingToolbar
+        drawingManager={drawingManager}
+        setDrawingManager={setDrawingManager}
+        onDrawingStart={() => setBuildingSelectActive(false)}
+        onFitImagery={onFitImagery}
+      />
       <div
         style={{
           position: "absolute",
           right: 10,
           top: 70,
+          width: 260,
           backgroundColor: "rgba(255, 255, 255, 1)",
-          padding: "5px 10px",
+          padding: "10px",
           borderRadius: "5px",
           zIndex: 1000,
         }}
         id="rightPanel"
       >
-        <div className="col-12 d-flex">
-          <ChoiceGroup
-            options={
-              primaryClasses && primaryClasses.length > 0 ? primaryClasses : []
-            }
-            selectedKey={selectedPrimaryClass}
-            label="Primary Class"
-            onChange={(e, option) => {
-              handlePrimaryClassChange(option.key);
-            }}
+        <div className="col-12 d-flex flex-column">
+          <div id="layerBuildingsInfo" style={{ fontSize: 12, color: "#333", marginBottom: 6 }}>
+            {!layerBuildings ? (
+              <span style={{ color: "#666" }}>Loading building footprints...</span>
+            ) : layerBuildings.error ? (
+              <span style={{ color: "#a4262c" }}>Could not load the building footprints.</span>
+            ) : layerBuildings.total === 0 ? (
+              <span style={{ color: "#a4262c" }}>
+                This layer has no building footprints, so there is nothing to
+                assess. Re-create it with a footprints file.
+              </span>
+            ) : (
+              <>
+                <span className="fw-semibold">
+                  {layerBuildings.total.toLocaleString()} buildings
+                </span>{" "}
+                in this image
+                {layerBuildings.truncated
+                  ? ` (showing the first ${layerBuildings.shown.toLocaleString()})`
+                  : ""}
+                <div className="d-flex gap-3 mt-1" style={{ color: "#555" }}>
+                  <span><span style={{ border: "2px solid #888", display: "inline-block", width: 10, height: 10, marginRight: 4 }} />building</span>
+                  <span><span style={{ background: "#ffb900", display: "inline-block", width: 10, height: 10, marginRight: 4 }} />in area</span>
+                  <span><span style={{ background: "#0078d4", display: "inline-block", width: 10, height: 10, marginRight: 4 }} />selected</span>
+                </div>
+              </>
+            )}
+          </div>
+          <AoiDrawTool
+            aoiGeoJson={aoiGeoJson}
+            setAoiGeoJson={setAoiGeoJson}
+            getStudyArea={getStudyArea}
           />
-        </div>
-        <div className="col-12 d-flex mt-2 flex-column pt-2 pb-2">
-          <PrimaryButton
-            id="saveAndTrainButton"
-            split
-            menuProps={labelSavingMenuOptions()}
-            className="w-100"
-            text="Actions"
-          />
-        </div>
-        <div className="col-12 d-flex flex-column pt-2 pb-2 border-top">
-          <AoiDrawTool aoiGeoJson={aoiGeoJson} setAoiGeoJson={setAoiGeoJson} />
+          {aoiGeoJson ? (
+            <div id="aoiBuildingCount" style={{ fontSize: 13, marginTop: 2 }}>
+              {aoiCount.state === "loading" ? (
+                <span style={{ color: "#666" }}>Counting buildings in this area...</span>
+              ) : aoiCount.state === "error" ? (
+                <span style={{ color: "#a4262c" }}>Could not count the buildings in this area.</span>
+              ) : aoiCount.state === "done" ? (
+                <>
+                  <span className="fw-semibold">
+                    {aoiCount.count.toLocaleString()} building
+                    {aoiCount.count === 1 ? "" : "s"}
+                  </span>{" "}
+                  in this area
+                  {aoiCount.count === 0 ? (
+                    <div style={{ fontSize: 12, color: "#666" }}>
+                      No building footprints here. Draw over buildings, or
+                      check the layer&apos;s footprints.
+                    </div>
+                  ) : null}
+                </>
+              ) : null}
+            </div>
+          ) : null}
 
           <DefaultButton
             className="w-100 mt-2"
@@ -435,8 +193,19 @@ const LabelingToolRightPanel = ({
             }
             iconProps={{ iconName: "TouchPointer" }}
             checked={buildingSelectActive}
-            onClick={handleToggleBuildingSelect}
+            onClick={() => {
+              if (!buildingSelectActive && drawingManager) {
+                drawingManager.isAoiDrawing = false;
+                drawingManager.setOptions({ mode: "none" });
+              }
+              setBuildingSelectActive((prev) => !prev);
+            }}
           />
+          <div style={{ fontSize: 12, color: "#666", marginTop: 4 }}>
+            {buildingSelectActive
+              ? "Click a building to select it, click again to deselect."
+              : "Touch individual buildings to pick them one by one."}
+          </div>
           {selectedBuildingIds.length > 0 ? (
             <div className="d-flex align-items-center justify-content-between mt-1">
               <span style={{ fontSize: 12, color: "#333" }}>
@@ -445,22 +214,24 @@ const LabelingToolRightPanel = ({
               </span>
               <ActionButton
                 iconProps={{ iconName: "Cancel" }}
-                onClick={handleClearBuildingSelection}
+                onClick={() => setSelectedBuildingIds([])}
                 styles={{ root: { height: "auto" } }}
               >
                 Clear
               </ActionButton>
             </div>
           ) : null}
+        </div>
 
+        <div className="col-12 d-flex flex-column pt-2 mt-2 border-top">
           <PrimaryButton
             id="runDtfAoiButton"
-            className="w-100 mt-2"
-            text="Run DamageTriageFormer on AOI"
-            disabled={!aoiGeoJson && selectedBuildingIds.length === 0}
+            className="w-100"
+            text="Run DamageTriageFormer"
+            disabled={nothingToRun}
             title={
-              !aoiGeoJson && selectedBuildingIds.length === 0
-                ? "Draw an AOI or select buildings first"
+              nothingToRun
+                ? "Draw an area or select buildings first"
                 : "Classify the selected buildings"
             }
             onClick={handleRunDtfAoi}
@@ -473,16 +244,10 @@ const LabelingToolRightPanel = ({
             disabled={!aoiGeoJson}
             title={
               !aoiGeoJson
-                ? "Draw an AOI polygon or rectangle first"
+                ? "Draw a polygon or rectangle first"
                 : "Launch batched large-AOI assessment"
             }
             onClick={handleRunLargeAoiAssessment}
-            styles={{
-              root: {
-                backgroundColor: "#0078d4",
-                borderColor: "#0078d4",
-              },
-            }}
           />
 
           {assessmentId ? (
@@ -491,12 +256,13 @@ const LabelingToolRightPanel = ({
               className="w-100 mt-2"
               text="View Active Assessment"
               iconProps={{ iconName: "BIDashboard" }}
-              onClick={() => setShowAssessmentDashboard && setShowAssessmentDashboard(true)}
+              onClick={() =>
+                setShowAssessmentDashboard && setShowAssessmentDashboard(true)
+              }
             />
           ) : null}
         </div>
       </div>
-      <input type="file" id="importGeoJSON" className="d-none" accept=".geojson" />
     </>
   );
 };
