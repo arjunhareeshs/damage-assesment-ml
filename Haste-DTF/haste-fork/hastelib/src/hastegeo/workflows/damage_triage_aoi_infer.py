@@ -399,17 +399,17 @@ def write_predictions_gpkg(buildings: list, results: list, output_path: str) -> 
     return len(gdf)
 
 
-def write_predictions_geoparquet(
-    buildings: list, results: list, output_path: str, extra: dict = None
-) -> int:
-    """Write this run's predictions as GeoParquet (WKB geometry, EPSG:4326).
+def write_predictions_geoparquet(buildings: list, results: list, output_path: str) -> int:
+    """Write the results file handed to the display platform (GeoParquet).
 
-    This is the file handed to the downstream platform. It is produced here,
-    at inference time, from data already in the container, so it exists for
-    every run path (Azure Batch job and the local/Docker runner) and needs
-    no database. Only classified buildings are written, one row each:
-    id, class, class name, confidence, the per-class probabilities, crop /
-    mask file names, plus any ``extra`` constant columns (e.g. model_id).
+    One row per scored building, four columns only:
+
+    * ``geometry``     building footprint, WKB polygon, EPSG:4326
+    * ``damage_class`` one of DTF_CATEGORIES; null when unclassified
+    * ``confidence``   0-1 probability of that class; null when unclassified
+    * ``status``       "classified" or "unclassified"
+
+    The platform identifies buildings by geometry, so no id is written.
     Returns the row count.
     """
     import pyarrow as pa  # type: ignore
@@ -418,29 +418,23 @@ def write_predictions_geoparquet(
 
     from hastegeo.core.utils.geoparquet import write_geoparquet
 
-    results_by_id = {r["building_id"]: r for r in results if r["class"] != -1}
-    rows, wkb = [], []
+    results_by_id = {r["building_id"]: r for r in results}
+    classes, confidences, statuses, wkb = [], [], [], []
     for building in buildings:
         result = results_by_id.get(building["building_id"])
         if result is None:
             continue
-        rows.append(result)
+        ok = result["class"] != -1
+        classes.append(result["class_name"] if ok else None)
+        confidences.append(float(result["confidence"]) if ok else None)
+        statuses.append("classified" if ok else "unclassified")
         wkb.append(shapely.to_wkb(shapely_shape(building["geometry"])))
 
     columns = {
-        "building_id": [str(r["building_id"]) for r in rows],
-        "damage_class": pa.array([r["class"] for r in rows], pa.int32()),
-        "damage_class_name": [r["class_name"] for r in rows],
-        "confidence": pa.array([r["confidence"] for r in rows], pa.float64()),
+        "damage_class": pa.array(classes, pa.string()),
+        "confidence": pa.array(confidences, pa.float64()),
+        "status": pa.array(statuses, pa.string()),
     }
-    for i, name in enumerate(DTF_CATEGORIES):
-        columns["prob_" + "_".join(name.lower().split())] = pa.array(
-            [float(r["probs"][i]) for r in rows], pa.float64()
-        )
-    columns["crop_file"] = [r.get("crop_url") or None for r in rows]
-    columns["mask_file"] = [r.get("mask_url") or None for r in rows]
-    for key, value in (extra or {}).items():
-        columns[key] = [str(value)] * len(rows)
     return write_geoparquet(output_path, columns, wkb)
 
 
@@ -541,13 +535,7 @@ def main():
         )
         parquet_path = os.path.join(output_dir, os.path.basename(parquet_name))
         log_progress(f"Writing GeoParquet -> {parquet_path}")
-        n_parquet = write_predictions_geoparquet(
-            buildings, results, parquet_path, extra={"model_id": model_id}
-        )
-        if n_parquet == 0:
-            raise RuntimeError(
-                "No building was classified, so the results GeoParquet is empty."
-            )
+        write_predictions_geoparquet(buildings, results, parquet_path)
 
         manifest = {
             "num_buildings": len(buildings),

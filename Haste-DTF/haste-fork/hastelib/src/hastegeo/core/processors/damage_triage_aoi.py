@@ -421,9 +421,9 @@ class DTFAoiInferencePostprocessor:
     def _publish_results_geoparquet(self, db_rows: list) -> str:
         """Write this run's results as GeoParquet next to its GeoPackage.
 
-        One row per classified building: footprint (WKB, EPSG:4326), class,
-        confidence, the five class probabilities, crop/mask links and the
-        run/layer ids. Geometries come from hg_buildings, so they match the
+        Fallback for manifests from before the job wrote the file itself.
+        One row per classified building: geometry, damage_class, confidence,
+        status. Geometries come from hg_buildings, so they match the
         database exactly. Returns the file's URL ("" if nothing to write).
         """
         if not db_rows:
@@ -444,29 +444,13 @@ class DTFAoiInferencePostprocessor:
             )
         }
         rows = [r for r in db_rows if r["building_id"] in geometries]
-        created_at = MetadataUtils.get_timestamp()
+        # Same four columns as the inference job's file
+        # (workflows/damage_triage_aoi_infer.write_predictions_geoparquet).
         columns = {
-            "building_id": [r["building_id"] for r in rows],
-            "damage_class": pa.array([r["class"] for r in rows], pa.int32()),
-            "damage_class_name": [r["class_name"] for r in rows],
+            "damage_class": pa.array([r["class_name"] for r in rows], pa.string()),
             "confidence": pa.array([r["confidence"] for r in rows], pa.float64()),
+            "status": pa.array(["classified"] * len(rows), pa.string()),
         }
-        for name in DTF_CATEGORIES:
-            column = "prob_" + "_".join(name.lower().split())
-            columns[column] = pa.array(
-                [(r.get("probabilities") or {}).get(name) for r in rows],
-                pa.float64(),
-            )
-        columns.update(
-            {
-                "crop_url": [r.get("crop_url") or None for r in rows],
-                "mask_url": [r.get("mask_url") or None for r in rows],
-                "model_id": [str(self.model_data.modelId)] * len(rows),
-                "image_layer_id": [self.model_data.imageLayerId] * len(rows),
-                "project_id": [self.model_data.projectId] * len(rows),
-                "created_at": [created_at] * len(rows),
-            }
-        )
         filename = f"dtf_aoi_results_{self.model_data.modelId}.parquet"
         with tempfile.TemporaryDirectory() as tmp:
             path = f"{tmp}/{filename}"

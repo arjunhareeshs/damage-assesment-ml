@@ -188,12 +188,7 @@ def main():
     write_predictions_gpkg(buildings, results, str(gpkg_path))
 
     parquet_path = output_dir / "local_aoi_predictions.parquet"
-    n_parquet = write_predictions_geoparquet(
-        buildings, results, str(parquet_path), extra={"model_id": "local_aoi"}
-    )
-    if n_parquet == 0:
-        print("[ERROR] No building was classified; GeoParquet is empty.")
-        sys.exit(1)
+    n_parquet = write_predictions_geoparquet(buildings, results, str(parquet_path))
 
     manifest_path = output_dir / "local_aoi_manifest.json"
     with open(manifest_path, "w") as f:
@@ -209,7 +204,8 @@ def main():
         )
 
     print("\n" + "=" * 70)
-    print(f" DONE. {len(results)} building(s) classified.")
+    n_ok = sum(1 for r in results if r["class"] != -1)
+    print(f" DONE. {n_ok}/{len(results)} building(s) classified.")
     print(f" GeoPackage: {gpkg_path}")
     print(f" GeoParquet: {parquet_path}  ({n_parquet} rows)")
     print(f" Manifest:   {manifest_path}")
