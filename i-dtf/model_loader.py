@@ -45,7 +45,7 @@ def build_model(
     except ImportError as e:
         raise ImportError(
             f"Could not import Damage-TriageFormer Model from src.model.net: {e}\n"
-            "Ensure Damage-TriageFormer submodule is available under Haste-DTF/Damage-TriageFormer."
+            "Ensure the DamageTriageFormer code is available under Haste-DTF/haste-fork/external/damage-triage-former."
         )
 
     with open(config_path, "r", encoding="utf-8") as f:

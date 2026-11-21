@@ -892,6 +892,88 @@ async def PutLayer(req: func.HttpRequest) -> func.HttpResponse:
         )
 
 
+@app.route(route="PutLayerImageryUpdate", auth_level=AUTH_LEVEL, methods=["PUT"])
+async def PutLayerImageryUpdate(req: func.HttpRequest) -> func.HttpResponse:
+    """Merge newer imagery into an existing image layer.
+
+    Body: ``{"projectId", "imageLayerId", "postEventImageryUrls": [new TIFs]}``.
+    The imageryprep run that this queues puts each new TIF on the layer's
+    existing pixel grid, registers it to the old imagery, retires the TIFs
+    it fully covers and rebuilds the mosaic and footprints, keeping the
+    buildings' damage results (``hastegeo.core.utils.imagery_update``).
+    If the update fails, the layer keeps its previous imagery.
+    """
+    logger.info("PutLayerImageryUpdate HTTP trigger function processed a request.")
+    try:
+        body = req.get_json()
+        project_id = body.get("projectId")
+        image_layer_id = body.get("imageLayerId")
+        new_urls = [u for u in (body.get("postEventImageryUrls") or []) if u]
+        for name, value in (("projectId", project_id), ("imageLayerId", image_layer_id)):
+            if not value or not _GUID_RE.match(str(value)):
+                return func.HttpResponse(f"Invalid or missing {name}.", status_code=400)
+        if not new_urls:
+            return func.HttpResponse(
+                "Add at least one new imagery file.", status_code=400
+            )
+
+        try:
+            existing = await asyncio.to_thread(
+                MetadataProcessor(
+                    data_type=config.get_metadata_types().IMAGELAYER.value,
+                    partition_key=project_id,
+                ).load,
+                image_layer_id,
+            )
+        except FileNotFoundError:
+            existing = None
+        if not existing:
+            return func.HttpResponse("Image layer not found.", status_code=404)
+        image_data = ImageLayer(**existing)
+
+        statuses = config.get_status_types()
+        if image_data.status != statuses.COMPLETED.value:
+            return func.HttpResponse(
+                "The image layer must finish processing before its imagery "
+                f"can be updated (status: {image_data.status}).",
+                status_code=409,
+            )
+        if not image_data.postEventImageryUrls:
+            return func.HttpResponse(
+                "This image layer has no imagery to update.", status_code=400
+            )
+
+        url_error = validate_image_layer_imagery_urls(
+            ImageLayer(postEventImageryUrls=new_urls)
+        )
+        if url_error:
+            return func.HttpResponse(url_error, status_code=400)
+
+        image_data.pendingImageryUpdateUrls = new_urls
+        output = await asyncio.to_thread(
+            ImageryPreProcessor(image_data=image_data).queue_for_processing
+        )
+        await asyncio.to_thread(
+            MetadataProcessor(
+                data_type=config.get_metadata_types().IMAGELAYER.value,
+                partition_key=output.projectId,
+            ).save,
+            output.imageLayerId,
+            output.dict(),
+        )
+        return func.HttpResponse(json.dumps(output.dict()), status_code=200)
+
+    except ValidationError as e:
+        logger.error(f"Validation error: {e}\n{traceback.format_exc()}")
+        return func.HttpResponse("Validation error.", status_code=400)
+    except ValueError as e:
+        logger.error(f"Invalid JSON: {e}\n{traceback.format_exc()}")
+        return func.HttpResponse("Invalid JSON in request body.", status_code=400)
+    except Exception as e:
+        logger.error(f"Error queuing imagery update: {e}\n{traceback.format_exc()}")
+        return func.HttpResponse("Error queuing the imagery update.", status_code=500)
+
+
 @app.route(route="DeleteLayer", auth_level=AUTH_LEVEL, methods=["DELETE"])
 async def DeleteLayer(req: func.HttpRequest) -> func.HttpResponse:
     logger.info("DeleteLayer HTTP trigger function processed a request.")

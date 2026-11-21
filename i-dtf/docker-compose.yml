@@ -6,7 +6,7 @@
 #   docker compose run --rm i-dtf python -m i-dtf.predict --input i-dtf/samples --save-json --save-mask
 #
 # Build context is the repo root (not this directory) because the image
-# needs both i-dtf/ and Haste-DTF/Damage-TriageFormer/src -- see Dockerfile.
+# needs both i-dtf/ and Haste-DTF/haste-fork/external/damage-triage-former/src -- see Dockerfile.
 services:
   i-dtf:
     build:

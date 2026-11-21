@@ -3,6 +3,6 @@
 !Dockerfile
 !run_local_aoi_assessment.py
 !Haste-DTF/haste-fork/hastelib/src
-!Haste-DTF/Damage-TriageFormer/src
+!Haste-DTF/haste-fork/external/damage-triage-former/src
 **/__pycache__
 **/*.pyc

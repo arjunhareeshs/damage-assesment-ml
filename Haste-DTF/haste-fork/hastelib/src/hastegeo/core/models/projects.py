@@ -715,6 +715,11 @@ class ImageLayer(BaseModel):
             post-event mosaic, i.e. the imagery's actual AOI excluding
             nodata. Populated by the imageryprep workflow; surfaced as a
             downloadable artifact in the UI.
+        pendingImageryUpdateUrls: New post-event TIF URLs waiting to be
+            merged into the layer by the next imageryprep run.
+        retiredPostEventImageryUrls: TIFs replaced by an imagery update;
+            kept for the record, no longer part of the mosaic.
+        imageryUpdates: History of imagery updates, newest last.
         dependsOn: Dependency tuple specifying parent resource type and ID
 
     Example:
@@ -781,6 +786,15 @@ class ImageLayer(BaseModel):
     buildingFootprintsUrl: Optional[str] = Field(default=None)
     userBuildingFootprintsUrl: Optional[str] = Field(default=None)
     validAreaMaskUrl: Optional[str] = Field(default=None)
+    # Imagery updates (newer TIFs for part of the layer's area). The URLs
+    # in ``pendingImageryUpdateUrls`` are processed by the next imageryprep
+    # run; it moves the TIFs they replace from ``postEventImageryUrls`` to
+    # ``retiredPostEventImageryUrls`` and appends a record to
+    # ``imageryUpdates`` (date, files, what each new TIF replaced, the
+    # updated area). See hastegeo.core.utils.imagery_update.
+    pendingImageryUpdateUrls: Optional[list[str]] = Field(default=None)
+    retiredPostEventImageryUrls: Optional[list[str]] = Field(default_factory=list)
+    imageryUpdates: Optional[list[dict]] = Field(default_factory=list)
     dependsOn: Optional[tuple[str, str]] = Field(
         default=("Project", "projectId")
     )

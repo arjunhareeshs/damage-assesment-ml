@@ -38,9 +38,14 @@ logger = logging.getLogger(__name__)
 
 
 def load_footprints_into_postgis(
-    image_layer, gpkg_local_path: str, conn=None
+    image_layer, gpkg_local_path: str, conn=None, preserve_results: bool = False
 ) -> int:
     """Replace ``image_layer``'s rows in ``hg_buildings`` with ``gpkg_local_path``'s contents.
+
+    With ``preserve_results`` (imagery updates) existing rows are not wiped:
+    buildings still in the file keep their damage results (only geometry,
+    subtype and class are refreshed), new buildings are added, and only
+    buildings no longer in the file are removed.
 
     Args:
         image_layer: an ``ImageLayer`` (or any object exposing
@@ -83,10 +88,17 @@ def load_footprints_into_postgis(
     connection = conn or get_connection()
     try:
         with connection.cursor() as cursor:
-            cursor.execute(
-                "DELETE FROM hg_buildings WHERE image_layer_id = %s",
-                (image_layer_id,),
-            )
+            if preserve_results:
+                cursor.execute(
+                    "DELETE FROM hg_buildings WHERE image_layer_id = %s "
+                    "AND NOT (building_id = ANY(%s))",
+                    (image_layer_id, [r[0] for r in rows]),
+                )
+            else:
+                cursor.execute(
+                    "DELETE FROM hg_buildings WHERE image_layer_id = %s",
+                    (image_layer_id,),
+                )
             if rows:
                 cursor.executemany(
                     """
@@ -321,3 +333,39 @@ def load_footprints_streaming(
         if owns_conn:
             connection.close()
 
+
+
+def mark_imagery_updated(image_layer_id: str, area_geojson: dict, conn=None) -> dict:
+    """Stamp the buildings under an imagery update.
+
+    Sets ``imagery_updated_at`` on every building of the layer that the
+    updated area touches. A damage result written before that time
+    (``updated_at < imagery_updated_at``) was made on imagery the layer no
+    longer shows and should be re-run.
+
+    Returns ``{"buildings": n touched, "results_out_of_date": n of them
+    that already had a damage result}``.
+    """
+    owns_conn = conn is None
+    connection = conn or get_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "ALTER TABLE hg_buildings ADD COLUMN IF NOT EXISTS imagery_updated_at TIMESTAMPTZ"
+            )
+            cursor.execute(
+                """
+                UPDATE hg_buildings
+                SET imagery_updated_at = NOW()
+                WHERE image_layer_id = %s
+                  AND ST_Intersects(geometry, ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326))
+                RETURNING damage_class IS NOT NULL
+                """,
+                (image_layer_id, json.dumps(area_geojson)),
+            )
+            flags = [r[0] for r in cursor.fetchall()]
+        connection.commit()
+        return {"buildings": len(flags), "results_out_of_date": int(sum(flags))}
+    finally:
+        if owns_conn:
+            connection.close()

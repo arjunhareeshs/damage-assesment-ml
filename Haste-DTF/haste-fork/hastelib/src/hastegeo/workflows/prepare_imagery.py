@@ -121,6 +121,8 @@ class ImageryWorkflow:
         self.normalization_means = []
         self.normalization_stds = []
         self.catalog_records = []
+        # Set by download_post_event_for_update (imagery-update mode).
+        self.imagery_update_result = None
         self.building_footprints_path = ""
         # Human-readable error captured when the building-footprint step
         # fails — applies equally to the Overture download path and the
@@ -192,6 +194,65 @@ class ImageryWorkflow:
             raw_prefix=raw_prefix,
             preview_prefix=preview_prefix,
         )
+
+    def download_post_event_for_update(self, new_urls):
+        """Imagery-update mode: merge newer TIFs into the layer's imagery.
+
+        ``self.post_event_urls`` are the layer's current TIFs and
+        ``new_urls`` the update. Both are downloaded, each new TIF is put on
+        the existing imagery's pixel grid and registered to it, and the
+        existing TIFs it fully covers are retired
+        (``hastegeo.core.utils.imagery_update``). Afterwards
+        ``post_event_raw_paths`` holds the files to mosaic (kept first, new
+        on top) and ``imagery_update_result`` what was decided.
+        """
+        import shutil
+
+        from hastegeo.core.utils.imagery_update import UpdateFile, prepare_update
+
+        existing_files = _download_imagery(
+            urls=self.post_event_urls, dst_directory=self.dst_directory
+        )
+        new_dir = os.path.join(self.dst_directory, "imagery_update_download")
+        os.makedirs(new_dir, exist_ok=True)
+        new_files = _download_imagery(urls=new_urls, dst_directory=new_dir)
+        for files, what in ((existing_files, "existing"), (new_files, "new")):
+            if not files:
+                raise RuntimeError(f"Unable to download the {what} imagery")
+            if not _are_all_valid_tif_files(files):
+                raise RuntimeError(f"Invalid files found in the {what} imagery.")
+        existing_urls = _match_files_to_urls(existing_files, self.post_event_urls)
+        new_url_of = _match_files_to_urls(new_files, new_urls)
+        # Same-named old and new files must not overwrite each other.
+        moved = []
+        for f in new_files:
+            target = os.path.join(self.dst_directory, f"update_{os.path.basename(f)}")
+            shutil.move(f, target)
+            moved.append(target)
+        shutil.rmtree(new_dir, ignore_errors=True)
+
+        raw_prefix = self.generate_prefix(POST_EVENT_RAW_PREFIX)
+        preview_prefix = self.generate_prefix(POST_EVENT_PREVIEW_PREFIX)
+        raw_existing, preview_existing = _save_raw_imagery(
+            files_paths=existing_files, generate_preview=True,
+            raw_prefix=raw_prefix, preview_prefix=preview_prefix,
+        )
+        raw_new, preview_new = _save_raw_imagery(
+            files_paths=moved, generate_preview=True,
+            raw_prefix=raw_prefix, preview_prefix=preview_prefix,
+        )
+
+        result = prepare_update(
+            [UpdateFile(p, u) for p, u in zip(raw_existing, existing_urls)],
+            [UpdateFile(p, u) for p, u in zip(raw_new, new_url_of)],
+            work_dir=os.path.join(self.dst_directory, "imagery_update_work"),
+        )
+        self.post_event_raw_paths = result.mosaic_paths
+        self.post_event_preview_paths = [
+            preview_existing[i] for i in result.report["keep_ids"]
+        ] + preview_new
+        self.imagery_update_result = result
+        return result
 
     def process_pre_event(self):
         """Process pre-event imagery.
@@ -506,6 +567,36 @@ class ImageryWorkflow:
         self.building_footprints_path = output_path
         self.building_footprints_error = ""
 
+    def align_building_footprints(self) -> dict:
+        """Shift the layer's footprints onto the roofs of the post-event mosaic.
+
+        Footprint datasets are usually drawn on other imagery and sit a
+        metre or more off the roofs, so every building would be cropped and
+        masked off-centre. The offset is measured from the mosaic itself
+        (``footprint_alignment``) and the GPKG is rewritten in place when
+        a consistent shift is found. Soft-fails: on any error the footprints
+        are kept as they are and the reason is returned for the manifest.
+        """
+        if not self.building_footprints_path or not self.mosaic_post_event_tif_filepath:
+            return {"applied": False, "reason": "no footprints or mosaic"}
+        try:
+            from hastegeo.core.utils.footprint_alignment import (
+                align_footprints_file,
+            )
+
+            shift = align_footprints_file(
+                self.mosaic_post_event_tif_filepath, self.building_footprints_path
+            )
+            return shift.as_dict()
+        except Exception as exc:
+            logger.error(
+                "Footprint alignment failed for image layer %s; keeping "
+                "footprints unshifted",
+                self.image_layer_id,
+                exc_info=True,
+            )
+            return {"applied": False, "reason": f"alignment failed: {exc}"}
+
     def process_user_building_footprints(self):
         """Download, reproject, and clip a user-supplied building-footprint GPKG.
 
@@ -814,6 +905,18 @@ def _download_imagery(urls, dst_directory):
     return downloadedUrls
 
 
+def _match_files_to_urls(files, urls):
+    """The URL each downloaded file came from, matched by file name (the
+    downloader groups URLs by source, so its output order is not the input
+    order). A file whose name matches no URL gets ``None``."""
+    from urllib.parse import unquote, urlparse
+
+    by_name = {}
+    for url in urls:
+        by_name.setdefault(os.path.basename(unquote(urlparse(url).path)), url)
+    return [by_name.get(os.path.basename(f)) for f in files]
+
+
 def _save_raw_imagery(
     files_paths,
     generate_preview=False,
@@ -997,7 +1100,29 @@ def main():
             for f in imagery_workflow.pre_event_preview_paths
         ]
 
-        imagery_workflow.download_post_event()
+        update_urls = (config.get("imagery_update") or {}).get(
+            "new_post_event_imagery_urls"
+        )
+        if update_urls:
+            log_progress(
+                f"Updating imagery: matching {len(update_urls)} new file(s) "
+                "to the existing imagery"
+            )
+            result = imagery_workflow.download_post_event_for_update(update_urls)
+            n_retired = len(result.retired_urls)
+            log_progress(
+                f"New imagery aligned to the existing grid; it replaces "
+                f"{n_retired} existing file(s) and updates "
+                f"{result.report['updated_area_km2']:.3f} km2"
+            )
+            config["imagery_update_report"] = {
+                **result.report,
+                "active_urls": result.active_urls,
+                "retired_urls": result.retired_urls,
+                "new_urls": list(update_urls),
+            }
+        else:
+            imagery_workflow.download_post_event()
         config["raw_post_event_filenames"] = [
             os.path.basename(f) for f in imagery_workflow.post_event_raw_paths
         ]
@@ -1055,6 +1180,11 @@ def main():
             imagery_workflow.process_user_building_footprints()
         else:
             imagery_workflow.download_building_footprints()
+        if imagery_workflow.building_footprints_path:
+            log_progress("Aligning building footprints to the imagery")
+            config["footprint_alignment"] = (
+                imagery_workflow.align_building_footprints()
+            )
         config["building_footprints_filename"] = (
             os.path.basename(imagery_workflow.building_footprints_path)
             if imagery_workflow.building_footprints_path

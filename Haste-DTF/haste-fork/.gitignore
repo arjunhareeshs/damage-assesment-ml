@@ -38,3 +38,7 @@ infra/.whatif*
 
 # Local-only debug pages + sandbox (not part of the repo)
 debug/
+
+# DamageTriageFormer training code: a source package named "data", not a
+# dataset folder. Keep it under version control despite the data/ rule above.
+!external/damage-triage-former/src/data/

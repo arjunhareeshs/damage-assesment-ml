@@ -1,6 +1,0 @@
-# HASTE code owners
-#
-# These owners are requested for review on any pull request that touches
-# matching paths. See https://docs.github.com/articles/about-code-owners.
-
-* @microsoft/haste-maintainers

@@ -33,6 +33,28 @@ from .postgis_connect import get_connection
 logger = logging.getLogger(__name__)
 
 
+_COLUMNS_READY = False
+
+
+def _ensure_columns(cursor) -> None:
+    """Add the imagery-update columns (migration 0006) when missing.
+
+    Existing databases never re-run init scripts, so without this the
+    ``active`` filter below would fail on them. Idempotent and cheap.
+    """
+    global _COLUMNS_READY
+    if _COLUMNS_READY:
+        return
+    cursor.execute(
+        "ALTER TABLE hg_imagery ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE"
+    )
+    cursor.execute("ALTER TABLE hg_imagery ADD COLUMN IF NOT EXISTS retired_at TIMESTAMPTZ")
+    # Commit here: read-only callers never commit, and a rolled-back ALTER
+    # would leave the flag set with the columns missing.
+    cursor.connection.commit()
+    _COLUMNS_READY = True
+
+
 def describe_raster(local_path: str) -> Dict[str, Any]:
     """Header-only description of a GeoTIFF for the imagery catalogue.
 
@@ -92,6 +114,7 @@ def register_imagery_record(
     connection = conn or get_connection()
     try:
         with connection.cursor() as cursor:
+            _ensure_columns(cursor)
             cursor.execute(
                 """
                 INSERT INTO hg_imagery (
@@ -118,7 +141,9 @@ def register_imagery_record(
                     nodata = EXCLUDED.nodata,
                     event_id = EXCLUDED.event_id,
                     role = EXCLUDED.role,
-                    source_version = EXCLUDED.source_version
+                    source_version = EXCLUDED.source_version,
+                    active = TRUE,
+                    retired_at = NULL
                 RETURNING imagery_id
                 """,
                 (
@@ -194,7 +219,8 @@ def imagery_for_aoi(
     aoi_geojson: Dict[str, Any],
     conn=None,
 ) -> List[Dict[str, Any]]:
-    """All catalogued TIFs of an image layer whose footprint intersects the AOI.
+    """All active catalogued TIFs of an image layer whose footprint
+    intersects the AOI (rows retired by an imagery update are skipped).
 
     ``ST_Intersects`` uses the GIST index on ``footprint`` for the bounding-
     box shortlist, then tests exact geometry.
@@ -203,6 +229,7 @@ def imagery_for_aoi(
     connection = conn or get_connection()
     try:
         with connection.cursor() as cursor:
+            _ensure_columns(cursor)
             cursor.execute(
                 """
                 SELECT
@@ -212,6 +239,7 @@ def imagery_for_aoi(
                     role, source_version, transform
                 FROM hg_imagery
                 WHERE image_layer_id = %s
+                  AND active
                   AND ST_Intersects(
                       footprint,
                       ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326)
@@ -246,3 +274,36 @@ def imagery_for_aoi(
         }
         for r in rows
     ]
+
+
+def deactivate_layer_imagery(
+    image_layer_id: str, keep_file_uris: Optional[List[str]] = None, conn=None
+) -> int:
+    """Retire a layer's catalogued rasters, except ``keep_file_uris``.
+
+    Run before registering the rasters of an imagery update: rows are kept
+    for the record (``active = FALSE``, ``retired_at`` set), never deleted,
+    so assessment units that point at them stay valid. Returns the number
+    of rows retired.
+    """
+    owns_conn = conn is None
+    connection = conn or get_connection()
+    try:
+        with connection.cursor() as cursor:
+            _ensure_columns(cursor)
+            cursor.execute(
+                """
+                UPDATE hg_imagery
+                SET active = FALSE, retired_at = NOW()
+                WHERE image_layer_id = %s
+                  AND active
+                  AND NOT (file_uri = ANY(%s))
+                """,
+                (image_layer_id, list(keep_file_uris or [])),
+            )
+            count = cursor.rowcount
+        connection.commit()
+        return count
+    finally:
+        if owns_conn:
+            connection.close()

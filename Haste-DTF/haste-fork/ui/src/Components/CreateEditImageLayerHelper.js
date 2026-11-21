@@ -9,7 +9,7 @@ import {
 } from "../util/validation";
 import { v4 as uuidv4 } from 'uuid';
 
-const imageryOriginOptions = [
+export const imageryOriginOptions = [
     { key: "url", text: "URL" },
     { key: "file", text: "File" },
 ]

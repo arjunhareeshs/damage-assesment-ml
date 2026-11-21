@@ -4,7 +4,8 @@
 #
 # Isolation contract with the rest of the repo:
 #   - This image only ever COPYs two things: this i-dtf/ folder, and the
-#     read-only Damage-TriageFormer/src architecture code it needs to
+#     read-only DamageTriageFormer src/ architecture code it needs to
+#     (Haste-DTF/haste-fork/external/damage-triage-former/src)
 #     reconstruct the model class. It never touches Haste-DTF/haste-fork
 #     or the docker/ compose stack, and nothing outside i-dtf/ is written.
 #   - The model checkpoint + DINOv3 backbone (~2.5GB) are NEVER copied into
@@ -29,7 +30,7 @@
 # COPY --from=... below instead of copying the whole repo into the final
 # image.
 FROM scratch AS dtf_src
-COPY Haste-DTF/Damage-TriageFormer/src /src
+COPY Haste-DTF/haste-fork/external/damage-triage-former/src /src
 
 FROM python:3.11-slim
 
@@ -50,7 +51,7 @@ RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/wh
 COPY i-dtf/requirements.txt /app/i-dtf/requirements.txt
 RUN pip install --no-cache-dir -r /app/i-dtf/requirements.txt
 
-COPY --from=dtf_src /src /app/Haste-DTF/Damage-TriageFormer/src
+COPY --from=dtf_src /src /app/Haste-DTF/haste-fork/external/damage-triage-former/src
 
 # i-dtf application code.
 COPY i-dtf/ /app/i-dtf

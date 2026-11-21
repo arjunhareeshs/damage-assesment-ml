@@ -33,7 +33,7 @@ from transformers import AutoModel, AutoConfig"
 WORKDIR /app
 
 COPY Haste-DTF/haste-fork/hastelib/src /app/Haste-DTF/haste-fork/hastelib/src
-COPY Haste-DTF/Damage-TriageFormer/src /app/Haste-DTF/Damage-TriageFormer/src
+COPY Haste-DTF/haste-fork/external/damage-triage-former/src /app/Haste-DTF/haste-fork/external/damage-triage-former/src
 COPY run_local_aoi_assessment.py /app/run_local_aoi_assessment.py
 
 # WORKDIR here is the env var the hastegeo workflows write logs/ under.

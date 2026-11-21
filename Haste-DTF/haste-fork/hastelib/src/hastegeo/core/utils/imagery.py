@@ -452,6 +452,30 @@ class ImageryUtils:
             return [1, 2, 3]
 
     @staticmethod
+    def _mosaic_nodata_options(tif_files: List[str]) -> dict:
+        """BuildVRT options so adjacent tiles leave no black seam.
+
+        GDAL stacks sources in order, and a source pixel is drawn unless
+        it is nodata. Tiles that declare no nodata and have no alpha band
+        (NAIP quarter-quads, for one) carry black 0-valued collars and
+        overlap their neighbours, so each tile's collar painted over the
+        real pixels of the tile under it: a black strip between adjacent
+        tiles. Declaring 0 as nodata lets the neighbour's pixels show
+        through, and marks truly empty areas as nodata (transparent on the
+        map) instead of black. 0 is already what HASTE treats as no-data
+        (``aoi.extract_aoi_polygon``). Tiles with their own nodata or an
+        alpha band are left to GDAL, which honours both.
+        """
+        for tif_file in tif_files:
+            with rasterio.open(tif_file) as src:
+                has_alpha = any(
+                    ci == rasterio.enums.ColorInterp.alpha for ci in src.colorinterp
+                )
+                if src.nodata is not None or has_alpha:
+                    return {}
+        return {"srcNodata": 0, "VRTNodata": 0}
+
+    @staticmethod
     def mosaic_imagery(
         tif_files: List[str],
         output_file_path: str = None,
@@ -532,7 +556,9 @@ class ImageryUtils:
                 vrt_path = Path(output_file_path).with_suffix(".vrt")
 
                 # Create a VRT (Virtual Raster) file to combine multiple TIFF files into a single virtual dataset
-                vrt_options = gdal.BuildVRTOptions()
+                vrt_options = gdal.BuildVRTOptions(
+                    **ImageryUtils._mosaic_nodata_options(vrt_input_files)
+                )
                 vrt = gdal.BuildVRT(
                     str(vrt_path), vrt_input_files, options=vrt_options
                 )

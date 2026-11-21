@@ -27,47 +27,65 @@ EPOCHS = 10
 LR = 1e-4
 WEIGHT_DECAY = 1e-4
 
+# Model Configuration
+# BACKBONE is the DINOv3 ViT-L/16 backbone: a local directory when one is
+# found (AutoModel/AutoConfig.from_pretrained accept a directory), otherwise
+# a Hugging Face repo id (network fetch). Searched in this order:
+#   1. DTF_BACKBONE_DIR                (HASTE's task runner sets this)
+#   2. models/backbone/dinov3-vitl16/  then the flat models/backbone/
+#      (config.json + model.safetensors directly inside) in every folder
+#      above this file -- e.g. <repo>/models/backbone locally, /app/models
+#      in the standalone AOI image
+#   3. the same two layouts above the current working directory
+#   4. fixed container locations
+#   5. DTF_BACKBONE_REPO, else the public Hugging Face id
+# A folder only counts when it holds config.json AND a weights file, so an
+# interrupted download (empty or config-only folder) is never used.
 from pathlib import Path
 
+_HF_BACKBONE = "facebook/dinov3-vitl16-pretrain-lvd1689m"
+
+
+def _backbone_dir_ready(path):
+    try:
+        path = Path(path)
+        return (
+            path.is_dir()
+            and (path / "config.json").is_file()
+            and any(p.suffix in (".safetensors", ".bin") for p in path.iterdir())
+        )
+    except OSError:
+        return False
+
+
+def _backbone_candidates():
+    env_dir = os.environ.get("DTF_BACKBONE_DIR", "")
+    if env_dir:
+        yield Path(env_dir)
+    for start in (Path(__file__).resolve().parent, Path.cwd()):
+        for folder in (start, *start.parents):
+            yield folder / "models" / "backbone" / "dinov3-vitl16"
+            yield folder / "models" / "backbone"
+            # Legacy checkout layout kept from the earlier vendored copy.
+            yield folder / "Damage assesment" / "damage-assesment-ml" / "models" / "backbone" / "dinov3-vitl16"
+    yield Path("/opt/dtf-backbone")
+    yield Path("/app/models/backbone/dinov3-vitl16")
+    yield Path("/app/models/backbone")
+
+
 def _find_local_backbone():
-    env_backbone = os.getenv("DTF_BACKBONE_DIR")
-    if env_backbone and os.path.isdir(env_backbone):
-        return env_backbone
-
-    candidate_dirs = []
-
-    # 1. Current working directory & parents
-    cwd = Path.cwd()
-    candidate_dirs.append(cwd / "models" / "backbone" / "dinov3-vitl16")
-    for parent in cwd.parents:
-        candidate_dirs.append(parent / "models" / "backbone" / "dinov3-vitl16")
-
-    # 2. File location & parents
-    file_dir = Path(__file__).resolve().parent
-    for parent in file_dir.parents:
-        candidate_dirs.append(parent / "models" / "backbone" / "dinov3-vitl16")
-        candidate_dirs.append(parent / "Damage assesment" / "damage-assesment-ml" / "models" / "backbone" / "dinov3-vitl16")
-
-    # 3. Fixed / container locations
-    candidate_dirs.append(Path("/opt/dtf-backbone"))
-    candidate_dirs.append(Path("/app/models/backbone/dinov3-vitl16"))
-
-    for d in candidate_dirs:
-        if d.is_dir():
-            has_cfg = (d / "config.json").is_file()
-            has_weights = any(
-                (d / fn).is_file() for fn in os.listdir(d) if fn.endswith((".safetensors", ".bin"))
-            )
-            if has_cfg and has_weights:
-                return str(d)
-
+    for candidate in _backbone_candidates():
+        if _backbone_dir_ready(candidate):
+            return str(candidate)
     return None
 
-_local_backbone = _find_local_backbone()
+
+_LOCAL_BACKBONE_DIR = _find_local_backbone()
+_LOCAL_BACKBONE_READY = _LOCAL_BACKBONE_DIR is not None
 BACKBONE = (
-    _local_backbone
-    if _local_backbone
-    else os.environ.get("DTF_BACKBONE_REPO", "facebook/dinov3-vitl16-pretrain-lvd1689m")
+    _LOCAL_BACKBONE_DIR
+    if _LOCAL_BACKBONE_READY
+    else os.environ.get("DTF_BACKBONE_REPO", _HF_BACKBONE)
 )
 PATCH_SIZE = 16
 USE_HIERARCHICAL = True  # Use hierarchical Type+Extent classification

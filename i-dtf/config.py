@@ -4,7 +4,7 @@ from pathlib import Path
 
 # Repository root and path bootstrapping
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DTF_REPO = REPO_ROOT / "Haste-DTF" / "Damage-TriageFormer"
+DTF_REPO = REPO_ROOT / "Haste-DTF" / "haste-fork" / "external" / "damage-triage-former"
 
 # Inject DTF_REPO into sys.path to enable src.* imports
 if str(DTF_REPO) not in sys.path:

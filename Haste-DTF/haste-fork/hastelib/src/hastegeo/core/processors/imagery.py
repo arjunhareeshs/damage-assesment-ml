@@ -252,6 +252,14 @@ class ImageryPostProcessor:
                     MetadataUtils.get_timestamp()
                 )
                 self.image_data.status = task_status
+                if getattr(self.image_data, "pendingImageryUpdateUrls", None):
+                    # A failed update leaves the layer exactly as it was
+                    # (its URLs are only changed on success), so it stays
+                    # usable instead of turning FAILED.
+                    self.image_data.status = (
+                        self.config.get_status_types().COMPLETED.value
+                    )
+                    self.image_data.pendingImageryUpdateUrls = None
                 logs = self._get_image_preprocess_logs()
                 if logs:
                     for log in logs:
@@ -260,7 +268,11 @@ class ImageryPostProcessor:
                                 log.message, timestamp=log.timestamp
                             )
                 self._update_imagery_progress(
-                    "Preprocess job failed", step=self.image_data.currentStep
+                    "Imagery update failed; the layer keeps its previous imagery"
+                    if self.image_data.status
+                    == self.config.get_status_types().COMPLETED.value
+                    else "Preprocess job failed",
+                    step=self.image_data.currentStep,
                 )
                 # Also update the logs for the specific job
                 self.image_data.preprocessJob.logs = (
@@ -299,6 +311,13 @@ class ImageryPostProcessor:
             "catalog_mode": os.getenv("HASTE_IMAGERY_CATALOG_MODE", "").lower()
             in ("1", "true", "yes"),
         }
+        pending_update = getattr(self.image_data, "pendingImageryUpdateUrls", None)
+        if pending_update:
+            # Imagery update: the current TIFs are the base, the new ones
+            # are aligned onto them and replace what they cover.
+            image_preprocess_config["imagery_update"] = {
+                "new_post_event_imagery_urls": list(pending_update),
+            }
         self.storage.save(
             identifier=self.image_data.imageLayerId,
             data=image_preprocess_config,
@@ -430,6 +449,12 @@ class ImageryPostProcessor:
             )
 
         processed_manifest = json.loads(content)
+        update_report = processed_manifest.get("imagery_update_report")
+        if update_report:
+            # Previews and catalogue entries describe the new imagery set;
+            # the old lists would otherwise keep growing with every update.
+            self.image_data.postEventPreviewUrls = []
+            self.image_data.preEventPreviewUrls = []
 
         for pre_event_preview_fn in processed_manifest[
             "preview_pre_event_filenames"
@@ -499,8 +524,14 @@ class ImageryPostProcessor:
             "building_footprints_error", ""
         )
         if building_footprints_filename and not building_footprints_error:
-            self._load_footprints_into_postgis(building_footprints_filename)
+            self._load_footprints_into_postgis(
+                building_footprints_filename, preserve_results=bool(update_report)
+            )
+        if update_report:
+            self._retire_imagery_catalog()
         self._register_imagery_catalog(processed_manifest.get("catalog_records", []))
+        if update_report:
+            self._apply_imagery_update(update_report)
         if building_footprints_error:
             self.image_data.status = (
                 self.config.get_status_types().FAILED.value
@@ -524,7 +555,101 @@ class ImageryPostProcessor:
             imagery_type=self.config.get_artifact_types().VALID_AREA_MASK,
         )
 
-    def _load_footprints_into_postgis(self, building_footprints_filename):
+    def _apply_imagery_update(self, report):
+        """Record a finished imagery update on the layer.
+
+        Retired TIFs move from ``postEventImageryUrls`` to
+        ``retiredPostEventImageryUrls``; the new TIFs join the active list;
+        a history entry records what each new TIF replaced; buildings under
+        the updated area are stamped so out-of-date results can be re-run.
+        """
+        retired = set(report.get("retired_urls") or [])
+        new_urls = list(report.get("new_urls") or [])
+        current = list(self.image_data.postEventImageryUrls or [])
+        self.image_data.postEventImageryUrls = [
+            u for u in current if u not in retired
+        ] + [u for u in new_urls if u not in current]
+        self.image_data.retiredPostEventImageryUrls = list(
+            getattr(self.image_data, "retiredPostEventImageryUrls", None) or []
+        ) + [u for u in current if u in retired]
+
+        url_of = {e["id"]: e.get("url") for e in report.get("existing", [])}
+        files = [
+            {
+                "url": item.get("url"),
+                "file": item.get("file"),
+                "area_km2": item.get("area_km2"),
+                "new_area_share": item.get("new_area_share"),
+                "corresponds_to": [
+                    {**o, "url": url_of.get(o["id"])}
+                    for o in item.get("corresponds_to", [])
+                ],
+                "registration": item.get("registration"),
+            }
+            for item in report.get("incoming", [])
+        ]
+        stale = {"buildings": 0, "results_out_of_date": 0}
+        if report.get("updated_area"):
+            try:
+                stale = postgis_load.mark_imagery_updated(
+                    self.image_data.imageLayerId, report["updated_area"]
+                )
+            except Exception:
+                self.logger.error(
+                    "Could not stamp buildings for the imagery update of layer %s",
+                    self.image_data.imageLayerId,
+                    exc_info=True,
+                )
+        self.image_data.imageryUpdates = list(
+            getattr(self.image_data, "imageryUpdates", None) or []
+        ) + [
+            {
+                "date": MetadataUtils.get_timestamp(),
+                "newUrls": new_urls,
+                "retiredUrls": [u for u in current if u in retired],
+                "keptUnderNewUrls": [
+                    e.get("url")
+                    for e in report.get("existing", [])
+                    if e.get("action") == "keep_under_new"
+                ],
+                "updatedAreaKm2": report.get("updated_area_km2"),
+                "updatedArea": report.get("updated_area"),
+                "files": files,
+                "buildingsInUpdatedArea": stale["buildings"],
+                "resultsOutOfDate": stale["results_out_of_date"],
+            }
+        ]
+        self.image_data.pendingImageryUpdateUrls = None
+        self._update_imagery_progress(
+            f"Imagery updated: {len(new_urls)} new file(s) replaced "
+            f"{len(retired)} file(s) over {report.get('updated_area_km2', 0):.3f} km2; "
+            f"{stale['results_out_of_date']} building result(s) there are now "
+            "out of date and should be re-run",
+            step=self.image_data.currentStep,
+        )
+
+    def _retire_imagery_catalog(self):
+        """Deactivate the layer's previous catalogue rows before an update's
+        rasters are registered (kept for the record, never deleted)."""
+        try:
+            from ..utils.imagery_catalog import deactivate_layer_imagery
+
+            n = deactivate_layer_imagery(self.image_data.imageLayerId)
+            self.logger.info(
+                "Retired %d catalogue row(s) of image layer %s for an imagery update",
+                n,
+                self.image_data.imageLayerId,
+            )
+        except Exception:
+            self.logger.error(
+                "Could not retire catalogue rows of image layer %s",
+                self.image_data.imageLayerId,
+                exc_info=True,
+            )
+
+    def _load_footprints_into_postgis(
+        self, building_footprints_filename, preserve_results=False
+    ):
         """Load the freshly-produced footprints GPKG into ``hg_buildings``.
 
         Runs here (in the API/worker process, which has PostGIS
@@ -561,7 +686,7 @@ class ImageryPostProcessor:
                     tmp.write(chunk)
                 tmp.flush()
                 count = postgis_load.load_footprints_into_postgis(
-                    self.image_data, tmp.name
+                    self.image_data, tmp.name, preserve_results=preserve_results
                 )
             self.logger.info(
                 "Loaded %d buildings into hg_buildings for image layer %s",

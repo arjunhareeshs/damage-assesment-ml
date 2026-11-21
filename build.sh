@@ -27,8 +27,9 @@
 #   haste-ui, and the task images haste-training + haste-imageryprep
 # postgis and nginx are pulled as ready-made images when you start the stack.
 #
-# Also writes DOCKER_GID (the Docker socket's group) to docker/.env: the queue
-# worker needs it to start task containers.
+# Also writes DOCKER_GID (the Docker socket's group, as the current docker
+# context's engine sees it) to docker/.env: the queue worker needs it to start
+# task containers. CPU/bundled builds remove a stale HASTE_HOST_CUDA_DIR.
 #
 # Safe to re-run: unchanged layers come from the cache. A failed attempt (for
 # example a dropped download) is retried, and finished layers are kept.
@@ -108,6 +109,16 @@ set_env_var() {
     rm -f "$tmp"
 }
 
+# Remove KEY from docker/.env (no-op when absent).
+unset_env_var() {
+    local key="$1" env_file="$COMPOSE_DIR/.env" tmp
+    [ -f "$env_file" ] || return 0
+    tmp="$(mktemp)"
+    grep -v "^${key}=" "$env_file" > "$tmp" || true
+    cat "$tmp" > "$env_file"
+    rm -f "$tmp"
+}
+
 files=(-f "$COMPOSE_DIR/docker-compose.yml")
 cuda_dir=""
 if [ "$mode_name" = auto ] || [ "$mode_name" = host ]; then
@@ -143,19 +154,29 @@ case "$mode_name" in
         mode="GPU: torch + torchvision only, CUDA from this machine ($cuda_dir, saved to docker/.env)"
         ;;
     bundled)
+        # CUDA ships inside the image: a host CUDA path left over from an
+        # earlier --host-cuda build must not be mounted into tasks.
+        unset_env_var HASTE_HOST_CUDA_DIR
         files+=(-f "$COMPOSE_DIR/docker-compose.gpu.yml")
         overlay=docker-compose.gpu.yml
         mode="GPU with CUDA 12.4 bundled in the training image"
         ;;
     cpu)
+        unset_env_var HASTE_HOST_CUDA_DIR  # no host CUDA in a CPU build
         overlay=""
         mode="CPU only (CPU torch in haste-training)"
         ;;
 esac
 
-# The queue worker runs as a non-root user and reaches the host's Docker
-# socket through this group; a wrong value means no task container can start.
-sock_gid="$(stat -c %g /var/run/docker.sock 2>/dev/null || true)"
+# The queue worker runs as a non-root user and reaches the Docker socket
+# through this group; a wrong value means no task container can start.
+# Ask the engine that will run HASTE (the current docker context) what group
+# owns the socket it mounts into containers: Docker Desktop's VM (group 0)
+# differs from a system engine's host socket (e.g. 145). Fall back to the
+# host socket only if the engine cannot be asked.
+sock_gid="$(docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+    --entrypoint stat alpine -c %g /var/run/docker.sock 2>/dev/null || true)"
+[ -n "$sock_gid" ] || sock_gid="$(stat -c %g /var/run/docker.sock 2>/dev/null || true)"
 if [ -n "$sock_gid" ]; then
     set_env_var DOCKER_GID "$sock_gid"
     echo "[build.sh] DOCKER_GID=$sock_gid (Docker socket group) saved to docker/.env"

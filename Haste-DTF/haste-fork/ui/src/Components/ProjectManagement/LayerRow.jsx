@@ -13,6 +13,7 @@ import { useNavigate } from "react-router-dom";
 import StatusIndicator from "../OtherComponents/StatusIndicator";
 import ImageLayerInfoMobile from "./ImageLayerInfoMobile";
 import { fileDownload } from "../../util/file";
+import UpdateImageryModal from "../UpdateImageryModal";
 
 const LayerRow = ({
   item,
@@ -128,6 +129,24 @@ const LayerRow = ({
           } else {
             setDialog("Error", "No valid area mask available for this image layer.");
           }
+        },
+      },
+      {
+        key: "updateImagery",
+        text: "Update Imagery",
+        iconProps: { iconName: "Photo2Add" },
+        // Only a finished layer can take an update; while one is running
+        // the layer is processing again.
+        disabled: item.status !== "Processed",
+        onClick: () => {
+          setModalComponent(
+            <UpdateImageryModal
+              imageLayer={item}
+              projectId={projectId}
+              onClose={() => setModalComponent(null)}
+              onUpdated={fetchProjectDetails}
+            />
+          );
         },
       },
       {

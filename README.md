@@ -20,11 +20,8 @@ as **Option B**.
 | | |
 |---|---|
 | **UI / map / ingestion / footprints / reports** | HASTE (`Haste-DTF/haste-fork`) — Azure Functions API, React UI, Azure Batch training/inference workers |
-| **Damage model** | DamageTriageFormer (`Haste-DTF/Damage-TriageFormer`) — DINOv3 ViT-L/16 backbone, gated damage head, 5-class typology, pretrained checkpoint on Hugging Face |
+| **Damage model** | DamageTriageFormer (`Haste-DTF/haste-fork/external/damage-triage-former`) — DINOv3 ViT-L/16 backbone, gated damage head, 5-class typology, pretrained checkpoint on Hugging Face |
 | **Output** | Undamaged / Partial Roof Damage / Total Roof Damage / Partial Structural Damage / Total Structural Collapse, per building, with confidence |
-
-Full background, the three-way system comparison, and the Option A vs.
-Option B trade-off analysis: **[docs/PROJECT_OVERVIEW.md](docs/PROJECT_OVERVIEW.md)**.
 
 ---
 
@@ -48,10 +45,6 @@ to individual building rows — never touching the whole layer. Every new
 prediction lands as `review_status="pending_review"`; the analyst clicks a
 building on the map to see its crop, damage mask, class, and confidence, and
 Accepts or Rejects it. Exports exclude rejected predictions by default.
-
-This is the path documented and built out in
-**[docs/OptionB_AOI_Integration_Plan.md](docs/OptionB_AOI_Integration_Plan.md)** —
-the architecture doc, full file map, and rollout order for everything below.
 
 ```
 Analyst draws AOI on the map (LabelingTool.jsx)
@@ -87,10 +80,7 @@ GetAoiPredictionsGpkg (excludes rejected, on demand)
 ```
 .
 ├── README.md                              this file
-├── docs/
-│   ├── PROJECT_OVERVIEW.md                 system comparison + Option A/B decision
-│   ├── OptionB_Quick_Start.md              original whole-layer integration guide
-│   └── OptionB_AOI_Integration_Plan.md     AOI-scoped architecture + full file map
+├── docs/haste-advancement/                large-AOI spec, implementation plan, repo audit
 └── Haste-DTF/
     ├── haste-fork/                         HASTE platform (Microsoft, MIT) + this project's changes
     │   ├── hastelib/src/hastegeo/          core Python lib: models, processors, workflows, utils
@@ -101,9 +91,9 @@ GetAoiPredictionsGpkg (excludes rejected, on demand)
     │   ├── api/hastefuncqueues/            Azure Functions queue triggers (job workers)
     │   ├── ui/src/Components/              React UI (LabelingTool, Visualizer, BuildingValidation)
     │   ├── db/migrations/                  PostGIS schema (hg_buildings)
-    │   └── docker/                         docker-compose.yml + per-service Dockerfiles
-    └── Damage-TriageFormer/                DamageTriageFormer model: training + inference code
-        └── src/model/                      DINOv3 backbone, gated damage head, net.py
+    │   ├── docker/                         docker-compose.yml + per-service Dockerfiles
+    │   └── external/damage-triage-former/  DTF model: training + inference code
+    │       └── src/model/                  DINOv3 backbone, gated damage head, net.py
 ```
 
 ---
@@ -132,17 +122,7 @@ first, then reinstall from local source over it.
 
 ---
 
-## 5. Docs index
-
-| Doc | What it covers |
-|---|---|
-| [docs/PROJECT_OVERVIEW.md](docs/PROJECT_OVERVIEW.md) | Why this project exists; DAHiTra vs. HASTE vs. DamageTriageFormer; Option A vs. Option B trade-offs, risks, decision tree |
-| [docs/OptionB_Quick_Start.md](docs/OptionB_Quick_Start.md) | The original whole-layer HASTE + DamageTriageFormer integration guide |
-| [docs/OptionB_AOI_Integration_Plan.md](docs/OptionB_AOI_Integration_Plan.md) | The AOI-scoped path: architecture, PostGIS schema, per-building crop pipeline, full new/modified file map, API contracts, rollout order |
-
----
-
-## 6. Status
+## 5. Status
 
 - Whole-layer (`dtf`) path: implemented, was already working prior to this
   project's changes.
@@ -162,6 +142,7 @@ first, then reinstall from local source over it.
 ## License
 
 HASTE (`Haste-DTF/haste-fork`) is Microsoft-licensed, MIT. DamageTriageFormer
-code (`Haste-DTF/Damage-TriageFormer`) is MIT; its pretrained weights and
-benchmark dataset are CC-BY-NC-4.0 (non-commercial use only) — see
-`docs/PROJECT_OVERVIEW.md` §11 for citations and dataset/paper links.
+code (`Haste-DTF/haste-fork/external/damage-triage-former`) is MIT; its
+pretrained weights and benchmark dataset are CC-BY-NC-4.0 (non-commercial use
+only) — see `Haste-DTF/haste-fork/external/damage-triage-former/CITATION.cff`
+for citations.
