@@ -21,6 +21,7 @@ const AoiAssessmentModal = ({
   projectId,
   imageLayerId,
   aoiGeoJson,
+  selectedBuildingIds,
   onAssessmentCreated,
 }) => {
   AoiAssessmentModal.propTypes = {
@@ -28,6 +29,7 @@ const AoiAssessmentModal = ({
     projectId: PropTypes.string.isRequired,
     imageLayerId: PropTypes.string.isRequired,
     aoiGeoJson: PropTypes.object,
+    selectedBuildingIds: PropTypes.arrayOf(PropTypes.string),
     onAssessmentCreated: PropTypes.func.isRequired,
   };
 
@@ -36,6 +38,7 @@ const AoiAssessmentModal = ({
   const [preview, setPreview] = useState(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState("");
+  const hasSelection = (selectedBuildingIds || []).length > 0;
 
   useEffect(() => {
     let cancelled = false;
@@ -74,13 +77,14 @@ const AoiAssessmentModal = ({
   }, [aoiGeoJson, imageLayerId]);
 
   async function handleSubmit() {
-    if (!aoiGeoJson) return;
+    if (!aoiGeoJson && !hasSelection) return;
     setIsLoading(true, "Submitting Large-AOI assessment...");
     try {
       const body = {
         projectId,
         imageLayerId,
-        aoi: aoiGeoJson,
+        aoi: aoiGeoJson || undefined,
+        buildingIds: hasSelection ? selectedBuildingIds : undefined,
         name: name.trim() || undefined,
       };
       const result = await apiPut("PutAoiAssessment", body);
@@ -142,9 +146,14 @@ const AoiAssessmentModal = ({
                   <strong>Scope Preview</strong>
                 </div>
 
-                {!aoiGeoJson ? (
+                {!aoiGeoJson && hasSelection ? (
+                  <p style={{ margin: 0, fontSize: 13 }}>
+                    {selectedBuildingIds.length.toLocaleString()} selected building
+                    {selectedBuildingIds.length === 1 ? "" : "s"} will be assessed.
+                  </p>
+                ) : !aoiGeoJson ? (
                   <p style={{ color: "#a4262c", margin: 0, fontSize: 13 }}>
-                    No AOI drawn yet. Please draw an AOI polygon or rectangle first.
+                    No AOI drawn yet. Draw an AOI polygon or rectangle, or select buildings.
                   </p>
                 ) : previewLoading ? (
                   <div className="d-flex align-items-center gap-2 py-2">
@@ -205,7 +214,7 @@ const AoiAssessmentModal = ({
 
           <p style={{ fontSize: 12, color: "#666", marginBottom: 16 }}>
             The assessment will run in parallel 1024-px tile batches across all intersecting TIFs
-            using DamageTriageFormer. One persistent classification result per building will be stored.
+            using DamageTriageFormer. One result per building is stored and starts as "pending review"; accept or reject results from the map or the assessment panel.
           </p>
 
           <div className="row">
@@ -214,7 +223,7 @@ const AoiAssessmentModal = ({
                 id="submitAoiAssessment"
                 className="me-2"
                 onClick={handleSubmit}
-                disabled={!aoiGeoJson || previewLoading || !!previewError || cannotSubmit}
+                disabled={(!aoiGeoJson && !hasSelection) || previewLoading || !!previewError || cannotSubmit}
               >
                 Submit Assessment
               </PrimaryButton>

@@ -542,9 +542,19 @@ def read_footprints(
     merged = gpd.GeoDataFrame(
         pd.concat(frames, ignore_index=True), geometry="geometry", crs=4326
     )
+    from .building_ids import canonical_building_id
+
     raw_ids = merged["id_raw"].astype("string").str.strip()
-    missing = raw_ids.isna() | (raw_ids == "")
-    raw_ids = raw_ids.mask(missing, pd.Series(merged.index, index=merged.index).astype(str))
+    missing = (raw_ids.isna() | (raw_ids == "")).fillna(True)
+    if missing.any():
+        # No id in the source: derive one from the geometry, so the same
+        # building keeps the same id across re-runs and AOIs (a row index
+        # would change whenever the clip or file order does).
+        raw_ids = raw_ids.astype(object)
+        raw_ids[missing] = [
+            canonical_building_id(g, src)
+            for g, src in zip(merged.geometry[missing], merged["_src"][missing])
+        ]
     if len(sources) > 1:
         raw_ids = merged["_src"] + "-" + raw_ids
     merged["id"] = _unique_ids(raw_ids.astype(str))

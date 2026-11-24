@@ -151,7 +151,7 @@ const ModelRowMobile = ({ models, projectId, imageLayerId, fetchProjectDetails, 
             />
           );
         }
-        if (model.modelType === "dtf") {
+        if (model.modelType === "dtf-aoi") {
           return (
             <DTFModelRow
               key={"dtf_" + index}

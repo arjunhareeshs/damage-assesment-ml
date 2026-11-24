@@ -33,6 +33,8 @@ logger = logging.getLogger(__name__)
 # A building counts as fully inside a window above this coverage; guards
 # against floating-point area noise on reprojected geometries.
 FULL_COVERAGE = 0.9999
+# Context kept around a building too large for one window (pixels).
+OVERSIZE_MARGIN_PX = 32
 
 
 def building_coverage(
@@ -121,9 +123,14 @@ def select_units(
         return []
 
     to_storage, to_raster = _transformers(raster_crs)
+    # Edge length (raster CRS units) for densifying boxes before
+    # reprojection, so a reprojected window follows its true outline.
+    seg = abs(raster_transform.a) * 64
 
     def _to_storage(geom):
-        return geom if to_storage is None else transform(to_storage.transform, geom)
+        if to_storage is None:
+            return geom
+        return transform(to_storage.transform, geom.segmentize(seg))
 
     def _to_raster(geom):
         return geom if to_raster is None else transform(to_raster.transform, geom)
@@ -136,6 +143,8 @@ def select_units(
         return []
 
     # Buildings that intersect both this raster's footprint and the AOI.
+    # Coverage is measured in the raster's own CRS (metres for projected
+    # imagery): exact window rectangles, no degree-area distortion.
     active_ids: List[str] = []
     active_geoms: List[Any] = []
     for b in eligible_buildings:
@@ -144,7 +153,7 @@ def select_units(
             b_geom = shape(b_geom)
         if b_geom.intersects(r_footprint) and b_geom.intersects(aoi_geom):
             active_ids.append(str(b["building_id"]))
-            active_geoms.append(b_geom)
+            active_geoms.append(_to_raster(b_geom))
 
     if not active_ids:
         return []
@@ -157,16 +166,15 @@ def select_units(
     # 1. Regular grid windows
     for win in compute_tile_windows(raster_width, raster_height, tile_size):
         col_off, row_off = int(win.col_off), int(win.row_off)
-        win_geom = _to_storage(
-            box(*rasterio.windows.bounds(win, raster_transform))
-        )
+        win_r = box(*rasterio.windows.bounds(win, raster_transform))
+        win_geom = _to_storage(win_r)
         if not win_geom.intersects(aoi_geom):
             continue
 
         unit_buildings = []
-        for idx in sorted(tree.query(win_geom, predicate="intersects")):
+        for idx in sorted(tree.query(win_r, predicate="intersects")):
             b_id = active_ids[idx]
-            cov = building_coverage(active_geoms[idx], win_geom)
+            cov = building_coverage(active_geoms[idx], win_r)
             if cov > 0:
                 unit_buildings.append(
                     {"building_id": b_id, "coverage_fraction": cov}
@@ -188,38 +196,41 @@ def select_units(
             "buildings": unit_buildings,
         })
 
-    # 2. Building-centred units for buildings no grid window holds whole
+    # 2. Buildings no grid window holds whole: one window centred on the
+    #    building. A building larger than one window gets a window around
+    #    its whole outline (plus OVERSIZE_MARGIN_PX); the region workflow
+    #    reads that window downsampled to tile_size, so the model sees the
+    #    entire building instead of the part one grid window happened to cut.
     inv_transform = ~raster_transform
     occupied = {(u["col_off"], u["row_off"]) for u in units}
-    for b_id, b_geom in zip(active_ids, active_geoms):
+    for b_id, b_r in zip(active_ids, active_geoms):
         if best_coverage[b_id] >= FULL_COVERAGE:
             continue
 
-        b_px = transform(
-            lambda x, y: inv_transform * (x, y), _to_raster(b_geom)
-        )
+        b_px = transform(lambda x, y: inv_transform * (x, y), b_r)
         min_c, min_r, max_c, max_r = b_px.bounds
-        if (max_c - min_c) > tile_size or (max_r - min_r) > tile_size:
-            logger.info(
-                "Building %s is larger than one %d px window; scored from "
-                "its best grid window only", b_id, tile_size,
-            )
-            continue
-
-        c_off = int(round((min_c + max_c) / 2.0 - tile_size / 2.0))
-        r_off = int(round((min_r + max_r) / 2.0 - tile_size / 2.0))
-        c_off = max(0, min(c_off, max(0, raster_width - tile_size)))
-        r_off = max(0, min(r_off, max(0, raster_height - tile_size)))
-        if (c_off, r_off) in occupied:
-            continue
-        w = min(tile_size, raster_width - c_off)
-        h = min(tile_size, raster_height - r_off)
+        oversize = (max_c - min_c) > tile_size or (max_r - min_r) > tile_size
+        if oversize:
+            c0 = max(0, int(min_c) - OVERSIZE_MARGIN_PX)
+            r0 = max(0, int(min_r) - OVERSIZE_MARGIN_PX)
+            c1 = min(raster_width, int(max_c) + 1 + OVERSIZE_MARGIN_PX)
+            r1 = min(raster_height, int(max_r) + 1 + OVERSIZE_MARGIN_PX)
+            c_off, r_off, w, h = c0, r0, c1 - c0, r1 - r0
+            kind = "building_oversize"
+        else:
+            c_off = int(round((min_c + max_c) / 2.0 - tile_size / 2.0))
+            r_off = int(round((min_r + max_r) / 2.0 - tile_size / 2.0))
+            c_off = max(0, min(c_off, max(0, raster_width - tile_size)))
+            r_off = max(0, min(r_off, max(0, raster_height - tile_size)))
+            if (c_off, r_off) in occupied:
+                continue
+            w = min(tile_size, raster_width - c_off)
+            h = min(tile_size, raster_height - r_off)
+            kind = "building_centred"
 
         centred = rasterio.windows.Window(c_off, r_off, w, h)
-        c_geom = _to_storage(
-            box(*rasterio.windows.bounds(centred, raster_transform))
-        )
-        cov = building_coverage(b_geom, c_geom)
+        c_r = box(*rasterio.windows.bounds(centred, raster_transform))
+        cov = building_coverage(b_r, c_r)
         if cov <= best_coverage[b_id]:
             continue
 
@@ -230,8 +241,8 @@ def select_units(
             "row_off": r_off,
             "width": w,
             "height": h,
-            "bounds": c_geom,
-            "kind": "building_centred",
+            "bounds": _to_storage(c_r),
+            "kind": kind,
             "buildings": [{"building_id": b_id, "coverage_fraction": cov}],
         })
         occupied.add((c_off, r_off))

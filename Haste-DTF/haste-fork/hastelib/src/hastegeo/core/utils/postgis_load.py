@@ -37,91 +37,176 @@ from .postgis_connect import get_connection
 logger = logging.getLogger(__name__)
 
 
-def load_footprints_into_postgis(
-    image_layer, gpkg_local_path: str, conn=None, preserve_results: bool = False
-) -> int:
-    """Replace ``image_layer``'s rows in ``hg_buildings`` with ``gpkg_local_path``'s contents.
+LOAD_CHUNK = int(os.getenv("HASTE_FOOTPRINT_LOAD_CHUNK", "50000"))
+_MISSING_IDS = ("", "none", "nan", "null")
 
-    With ``preserve_results`` (imagery updates) existing rows are not wiped:
-    buildings still in the file keep their damage results (only geometry,
-    subtype and class are refreshed), new buildings are added, and only
-    buildings no longer in the file are removed.
 
-    Args:
-        image_layer: an ``ImageLayer`` (or any object exposing
-            ``.imageLayerId`` / ``.projectId``).
-        gpkg_local_path: local path to the footprints GeoPackage, with the
-            schema written by ``hastegeo.core.utils.footprints``
-            (``id``, ``geometry``, ``subtype``, ``class``).
-        conn: optional existing psycopg2 connection. Tests inject a mock;
-            production callers omit it and a connection is opened and
-            closed here.
+def _ensure_building_columns(cursor) -> None:
+    for ddl in (
+        "ALTER TABLE hg_buildings ADD COLUMN IF NOT EXISTS imagery_updated_at TIMESTAMPTZ",
+        "ALTER TABLE hg_buildings ADD COLUMN IF NOT EXISTS footprint_source TEXT",
+        "ALTER TABLE hg_buildings ADD COLUMN IF NOT EXISTS footprint_version TEXT",
+    ):
+        cursor.execute(ddl)
 
-    Returns:
-        Number of building rows written.
+
+def _footprint_rows(
+    gpkg_local_path: str, source: str, chunk_size: int, stats: dict
+):
+    """Yield lists of ``(building_id, wkb, subtype, class)`` per chunk.
+
+    Reads ``chunk_size`` features at a time (never the whole file). A
+    missing id becomes ``canonical_building_id``; a repeated id gets a
+    ``-2``, ``-3`` suffix so no building silently overwrites another.
     """
+    from .building_ids import canonical_building_id
+
+    info = pyogrio.read_info(gpkg_local_path)
+    total = int(info.get("features") or 0)
+    if info.get("crs") is None and total:
+        raise ValueError(f"{gpkg_local_path} has no CRS; cannot load into PostGIS.")
+    seen: Set[str] = set()
+    for offset in range(0, total, chunk_size):
+        gdf = pyogrio.read_dataframe(
+            gpkg_local_path, skip_features=offset, max_features=chunk_size
+        )
+        if gdf.crs is not None and gdf.crs.to_epsg() != 4326:
+            gdf = gdf.to_crs(epsg=4326)
+        ids = gdf["id"] if "id" in gdf.columns else [None] * len(gdf)
+        subtypes = gdf["subtype"] if "subtype" in gdf.columns else [None] * len(gdf)
+        classes = gdf["class"] if "class" in gdf.columns else [None] * len(gdf)
+        rows = []
+        for raw_id, geom, subtype, klass in zip(ids, gdf.geometry, subtypes, classes):
+            if geom is None or geom.is_empty:
+                stats["skipped_empty"] += 1
+                continue
+            bid = None if raw_id is None else str(raw_id).strip()
+            if not bid or bid.lower() in _MISSING_IDS:
+                bid = canonical_building_id(geom, source)
+                stats["derived_ids"] += 1
+            if bid in seen:
+                n = 2
+                while f"{bid}-{n}" in seen:
+                    n += 1
+                bid = f"{bid}-{n}"
+                stats["duplicate_ids"] += 1
+            seen.add(bid)
+            rows.append((
+                bid,
+                shapely.to_wkb(geom, hex=True),
+                None if subtype is None or subtype != subtype else str(subtype),
+                None if klass is None or klass != klass else str(klass),
+            ))
+        yield rows
+
+
+def load_footprints_into_postgis(
+    image_layer,
+    gpkg_local_path: str,
+    conn=None,
+    preserve_results: bool = False,
+    footprint_source: Optional[str] = None,
+    footprint_version: Optional[str] = None,
+    chunk_size: int = LOAD_CHUNK,
+) -> int:
+    """Make ``hg_buildings`` hold exactly the buildings in ``gpkg_local_path``.
+
+    The file is read in chunks and staged into a temporary table with
+    batched inserts, then applied in ONE transaction (all or nothing):
+
+    * buildings no longer in the file are removed;
+    * buildings in the file are inserted or updated (geometry, subtype,
+      class, footprint source/version). Existing damage results are never
+      wiped;
+    * results that may no longer hold are flagged, not deleted, by setting
+      ``imagery_updated_at`` (a result older than it is out of date):
+      every existing building on a full re-preparation (the imagery itself
+      was replaced), only buildings whose outline changed on an imagery
+      update (``preserve_results``; the updated area is stamped separately
+      by ``mark_imagery_updated``).
+
+    Returns the number of buildings now loaded for the layer.
+    """
+    from psycopg2.extras import execute_values
+
     image_layer_id = image_layer.imageLayerId
     project_id = image_layer.projectId
-
-    gdf = gpd.read_file(gpkg_local_path)
-    if gdf.crs is None:
-        raise ValueError(
-            f"{gpkg_local_path} has no CRS; cannot load into PostGIS."
-        )
-    if gdf.crs.to_epsg() != 4326:
-        gdf = gdf.to_crs(epsg=4326)
-
-    rows = [
-        (
-            str(row.get("id")),
-            image_layer_id,
-            project_id,
-            row.geometry.wkt,
-            row.get("subtype"),
-            row.get("class"),
-        )
-        for _, row in gdf.iterrows()
-        if row.geometry is not None and not row.geometry.is_empty
-    ]
+    source = footprint_source or "unknown"
+    stats = {"skipped_empty": 0, "derived_ids": 0, "duplicate_ids": 0}
 
     owns_conn = conn is None
     connection = conn or get_connection()
     try:
         with connection.cursor() as cursor:
-            if preserve_results:
-                cursor.execute(
-                    "DELETE FROM hg_buildings WHERE image_layer_id = %s "
-                    "AND NOT (building_id = ANY(%s))",
-                    (image_layer_id, [r[0] for r in rows]),
-                )
-            else:
-                cursor.execute(
-                    "DELETE FROM hg_buildings WHERE image_layer_id = %s",
-                    (image_layer_id,),
-                )
-            if rows:
-                cursor.executemany(
-                    """
-                    INSERT INTO hg_buildings
-                        (building_id, image_layer_id, project_id, geometry,
-                         subtype, class)
-                    VALUES
-                        (%s, %s, %s, ST_SetSRID(ST_GeomFromText(%s), 4326),
-                         %s, %s)
-                    ON CONFLICT (image_layer_id, building_id) DO UPDATE SET
-                        geometry = EXCLUDED.geometry,
-                        subtype = EXCLUDED.subtype,
-                        class = EXCLUDED.class
-                    """,
+            _ensure_building_columns(cursor)
+            cursor.execute(
+                "CREATE TEMP TABLE _hg_fp_stage (building_id TEXT PRIMARY KEY, "
+                "geometry geometry(Geometry, 4326), subtype TEXT, class TEXT) "
+                "ON COMMIT DROP"
+            )
+            staged = 0
+            for rows in _footprint_rows(gpkg_local_path, source, chunk_size, stats):
+                if not rows:
+                    continue
+                execute_values(
+                    cursor,
+                    "INSERT INTO _hg_fp_stage (building_id, geometry, subtype, class) "
+                    "VALUES %s",
                     rows,
+                    template="(%s, ST_SetSRID(ST_GeomFromWKB(decode(%s, 'hex')), 4326), %s, %s)",
+                    page_size=5000,
                 )
-            connection.commit()
+                staged += len(rows)
+            cursor.execute(
+                """
+                DELETE FROM hg_buildings b
+                WHERE b.image_layer_id = %s
+                  AND NOT EXISTS (
+                      SELECT 1 FROM _hg_fp_stage s WHERE s.building_id = b.building_id
+                  )
+                """,
+                (image_layer_id,),
+            )
+            removed = cursor.rowcount
+            cursor.execute(
+                """
+                INSERT INTO hg_buildings
+                    (building_id, image_layer_id, project_id, geometry,
+                     subtype, class, footprint_source, footprint_version)
+                SELECT building_id, %s, %s, geometry, subtype, class, %s, %s
+                FROM _hg_fp_stage
+                ON CONFLICT (image_layer_id, building_id) DO UPDATE SET
+                    geometry = EXCLUDED.geometry,
+                    subtype = EXCLUDED.subtype,
+                    class = EXCLUDED.class,
+                    footprint_source = EXCLUDED.footprint_source,
+                    footprint_version = EXCLUDED.footprint_version,
+                    imagery_updated_at = CASE
+                        WHEN %s THEN NOW()
+                        WHEN NOT ST_Equals(hg_buildings.geometry, EXCLUDED.geometry)
+                            THEN NOW()
+                        ELSE hg_buildings.imagery_updated_at
+                    END
+                """,
+                (
+                    image_layer_id, project_id, footprint_source,
+                    footprint_version, not preserve_results,
+                ),
+            )
+        connection.commit()
         logger.info(
-            "Loaded %d footprints into hg_buildings for image layer %s",
-            len(rows),
-            image_layer_id,
+            "Loaded %d footprints into hg_buildings for image layer %s "
+            "(removed %d no longer present; %d ids derived from geometry, "
+            "%d duplicate ids suffixed, %d empty geometries skipped; source "
+            "%s %s)",
+            staged, image_layer_id, removed, stats["derived_ids"],
+            stats["duplicate_ids"], stats["skipped_empty"], source,
+            footprint_version or "",
         )
-        return len(rows)
+        return staged
+    except Exception:
+        connection.rollback()
+        raise
     finally:
         if owns_conn:
             connection.close()
@@ -147,17 +232,9 @@ def compute_canonical_building_id(
                     seen_ids.add(cand)
                 return cand
 
-    # Derive sha1(footprint_source + "|" + rounded_wkb)
-    try:
-        rounded_geom = shapely.set_precision(geom, grid_size=1e-7)
-    except Exception:
-        rounded_geom = geom
+    from .building_ids import canonical_building_id
 
-    wkb_bytes = shapely.wkb.dumps(rounded_geom)
-    h = hashlib.sha1()
-    h.update(f"{footprint_source}|".encode("utf-8"))
-    h.update(wkb_bytes)
-    derived_id = h.hexdigest()
+    derived_id = canonical_building_id(geom, footprint_source)
     if seen_ids is not None:
         seen_ids.add(derived_id)
     return derived_id

@@ -49,6 +49,18 @@ def _ensure_columns(cursor) -> None:
         "ALTER TABLE hg_imagery ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE"
     )
     cursor.execute("ALTER TABLE hg_imagery ADD COLUMN IF NOT EXISTS retired_at TIMESTAMPTZ")
+    # Migration 0008: footprints are valid-data outlines, which can be
+    # MultiPolygons (disjoint imaged areas), not only Polygons.
+    cursor.execute(
+        "SELECT type FROM geometry_columns "
+        "WHERE f_table_name = 'hg_imagery' AND f_geometry_column = 'footprint'"
+    )
+    row = cursor.fetchone()
+    if row and str(row[0]).upper() == "POLYGON":
+        cursor.execute(
+            "ALTER TABLE hg_imagery ALTER COLUMN footprint "
+            "TYPE geometry(Geometry, 4326) USING footprint"
+        )
     # Commit here: read-only callers never commit, and a rolled-back ALTER
     # would leave the flag set with the columns missing.
     cursor.connection.commit()
@@ -80,13 +92,28 @@ def describe_raster(local_path: str) -> Dict[str, Any]:
             "nodata": src.nodata,
         }
 
-    poly = box(bounds.left, bounds.bottom, bounds.right, bounds.top)
-    if crs and crs.to_epsg() != 4326:
-        to_storage = pyproj.Transformer.from_crs(crs, STORAGE_CRS, always_xy=True)
-        # densify so a reprojected edge follows the true (curved) boundary
-        poly = transform(to_storage.transform, poly.segmentize(
-            max(bounds.right - bounds.left, bounds.top - bounds.bottom) / 16
-        ))
+    # The footprint is the outline of the pixels that hold data, not the
+    # raster rectangle: a TIF's black/nodata collar must not make it "cover"
+    # an AOI it has no imagery for. Falls back to the rectangle only if the
+    # outline cannot be traced.
+    try:
+        from .imagery_update import valid_data_footprint
+
+        poly = valid_data_footprint(local_path)
+        if poly.is_empty:
+            raise ValueError("empty valid-data outline")
+    except Exception:
+        logger.warning(
+            "Could not trace the valid-data outline of %s; cataloguing its "
+            "full extent instead", local_path, exc_info=True,
+        )
+        poly = box(bounds.left, bounds.bottom, bounds.right, bounds.top)
+        if crs and crs.to_epsg() != 4326:
+            to_storage = pyproj.Transformer.from_crs(crs, STORAGE_CRS, always_xy=True)
+            # densify so a reprojected edge follows the true (curved) boundary
+            poly = transform(to_storage.transform, poly.segmentize(
+                max(bounds.right - bounds.left, bounds.top - bounds.bottom) / 16
+            ))
     meta["footprint"] = mapping(poly)
     return meta
 

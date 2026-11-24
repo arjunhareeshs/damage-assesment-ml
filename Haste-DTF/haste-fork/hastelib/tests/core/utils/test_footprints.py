@@ -171,140 +171,226 @@ class TestDownloadBuildingFootprints(unittest.TestCase):
                 output_path="/tmp/foo.geojson",
             )
 
-    @patch("hastegeo.core.utils.footprints.geodataframe")
-    def test_filters_to_polygons_and_writes(self, mock_geodataframe):
-        """The downloader should restrict to (id, geometry, subtype, class)
-        and Polygon/MultiPolygon rows, set EPSG:4326, and write a .gpkg."""
-        import os
-        import tempfile
+    @staticmethod
+    def _batches(gdf):
+        """Stand-in for record_batch_reader: the frame as Arrow batches."""
+        import pyarrow as pa
 
-        # Build a tiny geodataframe stand-in. We just need the chained
-        # operations to look like the real ones — patching geopandas
-        # internals would couple too tightly.
-        from unittest.mock import MagicMock
+        table = pa.table(gdf.to_arrow(geometry_encoding="WKB"))
+        return lambda *a, **k: iter(table.to_batches(max_chunksize=1))
 
-        gdf = MagicMock()
-        # gdf[["id", "geometry", "subtype", "class"]] -> filtered_gdf
-        filtered = MagicMock()
-        gdf.__getitem__.side_effect = (
-            lambda key: filtered if isinstance(key, list) else gdf
-        )
-        # filtered[mask] returns final gdf with .shape / .set_crs / .to_file
-        final = MagicMock()
-        final.shape = (3, 4)
-        filtered.geometry.geom_type.isin.return_value = [True, True, True]
-        filtered.__getitem__.return_value = final
-        mock_geodataframe.return_value = gdf
+    # download_building_footprints reads through _overture_batches (footer
+    # pruning); these tests stand in for it with the frame's batches.
 
-        from hastegeo.core.utils.footprints import download_building_footprints
-
-        with tempfile.TemporaryDirectory() as tmp:
-            output = os.path.join(tmp, "out.gpkg")
-            count = download_building_footprints(
-                bbox=(-156.7, 20.87, -156.66, 20.89),
-                output_path=output,
-            )
-
-        self.assertEqual(count, 3)
-        mock_geodataframe.assert_called_once_with(
-            "building", (-156.7, 20.87, -156.66, 20.89)
-        )
-        gdf.__getitem__.assert_called_with(
-            ["id", "geometry", "subtype", "class"]
-        )
-        final.set_crs.assert_called_once_with(epsg=4326, inplace=True)
-        final.to_file.assert_called_once_with(output, driver="GPKG")
-
-    @patch("hastegeo.core.utils.footprints.geodataframe")
-    def test_aoi_polygon_filters_buildings_outside_mask(
-        self, mock_geodataframe
-    ):
-        """When aoi_polygon is provided, footprints not intersecting the
-        polygon are dropped. This is the core fix for the bbox-cornered
-        nodata problem: the Overture query is bbox-only, so without this
-        filter buildings in the unflown corners of a tilted image come
-        through unfiltered."""
+    def _run(self, gdf, **kw):
         import os
         import tempfile
 
         import geopandas as gpd
-        import shapely.geometry
-        from hastegeo.core.utils.footprints import download_building_footprints
+        from hastegeo.core.utils import footprints
 
-        # Three buildings: two inside the AOI strip, one in the
-        # bbox-corner outside the AOI. The AOI is a narrow rectangle on
-        # the west side of the bbox.
-        bbox = (0.0, 0.0, 10.0, 10.0)
-        aoi = shapely.geometry.box(0.0, 0.0, 5.0, 10.0)
-        gdf = gpd.GeoDataFrame(
-            {
-                "id": ["in-1", "in-2", "out-1"],
-                "subtype": ["", "", ""],
-                "class": ["", "", ""],
-                "geometry": [
-                    shapely.geometry.box(1.0, 1.0, 1.5, 1.5),
-                    shapely.geometry.box(4.0, 4.0, 4.5, 4.5),
-                    shapely.geometry.box(7.0, 7.0, 7.5, 7.5),
-                ],
-            },
-            crs="EPSG:4326",
-        )
-        mock_geodataframe.return_value = gdf
-
-        with tempfile.TemporaryDirectory() as tmp:
+        with patch.object(footprints, "_overture_batches", side_effect=self._batches(gdf)) as reader, \
+                patch.object(footprints, "get_latest_release", return_value="2026-02-18.0"), \
+                tempfile.TemporaryDirectory() as tmp:
             output = os.path.join(tmp, "out.gpkg")
-            count = download_building_footprints(
-                bbox=bbox,
-                output_path=output,
-                aoi_polygon=aoi,
-            )
-            self.assertEqual(count, 2)
-            # Read the gpkg back and verify only the inside buildings
-            # survived — the out-1 corner building must have been
-            # dropped by the polygon filter.
+            count = footprints.download_building_footprints(output_path=output, **kw)
             written = gpd.read_file(output)
-            self.assertEqual(set(written["id"]), {"in-1", "in-2"})
+        return count, written, reader
 
-    @patch("hastegeo.core.utils.footprints.geodataframe")
-    def test_aoi_polygon_keeps_straddling_buildings_whole(
-        self, mock_geodataframe
-    ):
-        """A footprint straddling the AOI boundary is kept as the WHOLE
-        building, never sliced at the edge: a building the boundary crosses
-        must be assessed in full. Same rule as
-        clip_and_normalize_user_footprints."""
-        import os
-        import tempfile
-
+    def _frame(self, ids, boxes):
         import geopandas as gpd
         import shapely.geometry
-        from hastegeo.core.utils.footprints import download_building_footprints
 
-        aoi = shapely.geometry.box(0.0, 0.0, 5.0, 10.0)
-        # Building spans 4 → 6: half inside, half outside.
-        gdf = gpd.GeoDataFrame(
-            {
-                "id": ["straddler"],
-                "subtype": [""],
-                "class": [""],
-                "geometry": [shapely.geometry.box(4.0, 4.0, 6.0, 6.0)],
-            },
+        return gpd.GeoDataFrame(
+            {"id": ids, "subtype": [""] * len(ids), "class": [""] * len(ids)},
+            geometry=[shapely.geometry.box(*b) for b in boxes],
             crs="EPSG:4326",
         )
-        mock_geodataframe.return_value = gdf
 
-        with tempfile.TemporaryDirectory() as tmp:
-            output = os.path.join(tmp, "out.gpkg")
-            count = download_building_footprints(
-                bbox=(0.0, 0.0, 10.0, 10.0),
-                output_path=output,
-                aoi_polygon=aoi,
+    def test_filters_to_polygons_and_writes(self):
+        import geopandas as gpd
+        import shapely.geometry
+
+        gdf = gpd.GeoDataFrame(
+            {"id": ["a", "b", "pt"], "subtype": [""] * 3, "class": [""] * 3},
+            geometry=[
+                shapely.geometry.box(0, 0, 1, 1),
+                shapely.geometry.box(2, 2, 3, 3),
+                shapely.geometry.Point(5, 5),
+            ],
+            crs="EPSG:4326",
+        )
+        count, written, reader = self._run(gdf, bbox=(0, 0, 10, 10))
+        self.assertEqual(count, 2)
+        self.assertEqual(set(written["id"]), {"a", "b"})
+        self.assertEqual(written.crs.to_epsg(), 4326)
+        self.assertEqual(reader.call_args.kwargs["release"], "2026-02-18.0")
+        self.assertEqual(
+            reader.call_args.kwargs["columns"],
+            ["id", "geometry", "subtype", "class", "sources"],
+        )
+        # Provenance column is always written (None when Overture gives none).
+        self.assertIn("source_dataset", written.columns)
+
+    def test_geometry_source_dataset(self):
+        from hastegeo.core.utils.footprints import _geometry_source_dataset
+
+        self.assertEqual(
+            _geometry_source_dataset([
+                {"property": "/properties/height", "dataset": "OpenStreetMap"},
+                {"property": "", "dataset": "Microsoft ML Buildings"},
+            ]),
+            "Microsoft ML Buildings",
+        )
+        self.assertEqual(
+            _geometry_source_dataset([{"property": None, "dataset": "OpenStreetMap"}]),
+            "OpenStreetMap",
+        )
+        self.assertIsNone(_geometry_source_dataset(None))
+        self.assertIsNone(_geometry_source_dataset([]))
+
+    def test_aoi_polygon_filters_buildings_outside_mask(self):
+        """Footprints not intersecting the AOI polygon are dropped (the
+        Overture query is bbox-only)."""
+        import shapely.geometry
+
+        gdf = self._frame(
+            ["in-1", "in-2", "out-1"],
+            [(1, 1, 1.5, 1.5), (4, 4, 4.5, 4.5), (7, 7, 7.5, 7.5)],
+        )
+        aoi = shapely.geometry.box(0.0, 0.0, 5.0, 10.0)
+        count, written, _ = self._run(gdf, bbox=(0, 0, 10, 10), aoi_polygon=aoi)
+        self.assertEqual(count, 2)
+        self.assertEqual(set(written["id"]), {"in-1", "in-2"})
+
+    def test_aoi_polygon_keeps_straddling_buildings_whole(self):
+        """A footprint crossing the AOI boundary is kept whole, not clipped."""
+        import shapely.geometry
+
+        gdf = self._frame(["straddle"], [(4, 4, 6, 6)])
+        aoi = shapely.geometry.box(0.0, 0.0, 5.0, 10.0)
+        count, written, _ = self._run(gdf, bbox=(0, 0, 10, 10), aoi_polygon=aoi)
+        self.assertEqual(count, 1)
+        self.assertAlmostEqual(written.geometry.iloc[0].area, 4.0)
+
+    def test_disjoint_regions_read_in_one_pass(self):
+        """Two imagery regions far apart are read in ONE scan (the release is
+        scanned once) whose filter is both regions' bounding boxes."""
+        import shapely.geometry
+
+        gdf = self._frame(["a", "b"], [(0.1, 0.1, 0.2, 0.2), (50.1, 50.1, 50.2, 50.2)])
+        aoi = shapely.geometry.MultiPolygon(
+            [shapely.geometry.box(0, 0, 1, 1), shapely.geometry.box(50, 50, 51, 51)]
+        )
+        count, written, reader = self._run(gdf, bbox=(0, 0, 51, 51), aoi_polygon=aoi)
+        self.assertEqual(reader.call_count, 1)
+        boxes = sorted(reader.call_args.args[1])  # one pass, both boxes
+        self.assertEqual(boxes, [(0.0, 0.0, 1.0, 1.0), (50.0, 50.0, 51.0, 51.0)])
+        self.assertEqual(count, 2)
+        self.assertEqual(sorted(written["id"]), ["a", "b"])
+
+    def test_multi_box_filter_is_an_or_of_boxes(self):
+        """The combined filter keeps rows in either box and drops rows in
+        neither (checked on a real Arrow table, not a mock)."""
+        import pyarrow as pa
+        import pyarrow.dataset as pads
+        from unittest.mock import patch as _patch
+
+        from hastegeo.core.utils import footprints
+
+        table = pa.table({
+            "id": ["in-a", "in-b", "between"],
+            "bbox": pa.array(
+                [{"xmin": 0.1, "ymin": 0.1, "xmax": 0.2, "ymax": 0.2},
+                 {"xmin": 50.1, "ymin": 50.1, "xmax": 50.2, "ymax": 50.2},
+                 {"xmin": 25.0, "ymin": 25.0, "xmax": 25.1, "ymax": 25.1}]),
+            "geometry": pa.array([b"", b"", b""], pa.binary()),
+        })
+        captured = {}
+        real = pads.dataset(table)
+
+        def fake_dataset(*a, **k):
+            return real
+
+        class Spy:
+            def to_batches(self, filter=None, columns=None):
+                captured["rows"] = real.to_table(filter=filter).column("id").to_pylist()
+                return iter([])
+
+            schema = real.schema
+
+        with _patch.object(footprints.ds, "dataset", return_value=Spy()), \
+                _patch.object(footprints, "_dataset_path", return_value="x/"), \
+                _patch.object(footprints.fsspec, "filesystem"), \
+                _patch.object(footprints.fs, "PyFileSystem"):
+            footprints.record_batch_reader(
+                "building", [(0, 0, 1, 1), (50, 50, 51, 51)], release="r"
             )
-            self.assertEqual(count, 1)
-            written = gpd.read_file(output)
-            # Geometry is untouched: it still reaches x=6, past the AOI edge.
-            bounds = list(written.geometry.iloc[0].bounds)
-            self.assertEqual(bounds, [4.0, 4.0, 6.0, 6.0])
+        self.assertEqual(sorted(captured["rows"]), ["in-a", "in-b"])
+
+    def test_overture_reader_prunes_row_groups_and_filters_rows(self):
+        """_overture_batches on real parquet files (in-memory filesystem):
+        row groups outside every box are never read, rows are filtered
+        exactly, and two boxes are served in one pass."""
+        import fsspec
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        import shapely
+        from unittest.mock import patch as _patch
+
+        from hastegeo.core.utils import footprints
+
+        mem = fsspec.filesystem("memory")
+        root = "/overture/theme=buildings/type=building/"
+
+        def write(name, rows):
+            geoms = [shapely.box(x, y, x + 0.01, y + 0.01) for _, x, y in rows]
+            table = pa.table({
+                "id": [r[0] for r in rows],
+                "geometry": pa.array([shapely.to_wkb(g) for g in geoms], pa.binary()),
+                "bbox": pa.array([{"xmin": x, "ymin": y, "xmax": x + 0.01, "ymax": y + 0.01}
+                                  for _, x, y in rows]),
+                "subtype": ["residential"] * len(rows),
+                "class": [None] * len(rows),
+            })
+            with mem.open(root + name, "wb") as f:
+                pq.write_table(table, f, row_group_size=2)  # 2 rows per row group
+
+        # file a: row group 0 near box A, row group 1 far away
+        write("part-a.parquet", [("a1", 0.1, 0.1), ("a-edge", 0.95, 0.1), ("far1", 30, 30), ("far2", 31, 31)])
+        # file b: only near box B; file c: nowhere near either box
+        write("part-b.parquet", [("b1", 50.1, 50.1), ("b-out", 50.5, 52.0)])
+        write("part-c.parquet", [("c1", -40, -40), ("c2", -41, -41)])
+        reads = []
+        orig = pq.ParquetFile.read_row_groups
+
+        def spy(self, row_groups, *a, **k):
+            reads.append(list(row_groups))
+            return orig(self, row_groups, *a, **k)
+
+        mem_open = mem.open
+        with _patch.object(footprints.fsspec, "filesystem", return_value=mem), \
+                _patch.object(footprints, "_dataset_path", return_value=root), \
+                _patch.object(mem, "open", side_effect=lambda p, mode="rb", **k: mem_open(p, mode)), \
+                _patch.object(pq.ParquetFile, "read_row_groups", spy):
+            batches = list(footprints._overture_batches(
+                "building", [(0, 0, 1, 1), (50, 50, 51, 51)], release="r",
+                columns=["id", "geometry", "subtype", "class"],
+            ))
+        ids = sorted(i for b in batches for i in b.column("id").to_pylist())
+        self.assertEqual(ids, ["a-edge", "a1", "b1"])  # b-out shares b1's row group but is outside
+        self.assertEqual(sorted(reads), [[0], [0]])      # one row group from a, one from b, none from c
+        self.assertEqual(batches[0].schema.names, ["id", "geometry", "subtype", "class"])
+        self.assertEqual(
+            batches[0].schema.field("geometry").metadata,
+            {b"ARROW:extension:name": b"geoarrow.wkb"},
+        )
+
+    def test_nothing_found_still_writes_an_empty_file(self):
+        gdf = self._frame([], [])
+        count, written, _ = self._run(gdf, bbox=(0, 0, 1, 1))
+        self.assertEqual(count, 0)
+        self.assertEqual(len(written), 0)
 
 
 class TestClipAndNormalizeUserFootprints(unittest.TestCase):
@@ -436,9 +522,15 @@ class TestClipAndNormalizeUserFootprints(unittest.TestCase):
 
             self.assertEqual(count, 2)
             out = gpd.read_file(output_path)
-            # id synthesized from row index, others present but null
+            # id derived from geometry (stable across re-clips), others null
+            ids = out["id"].astype(str).tolist()
+            self.assertEqual(len(set(ids)), 2)
+            self.assertTrue(all(len(i) == 40 for i in ids))
+            # Same input clipped again -> the same ids.
+            again = os.path.join(tmp, "again.gpkg")
+            clip_and_normalize_user_footprints(input_path, self._aoi(), again)
             self.assertEqual(
-                sorted(out["id"].astype(str).tolist()), ["0", "1"]
+                sorted(ids), sorted(gpd.read_file(again)["id"].astype(str))
             )
             self.assertTrue(out["subtype"].isna().all())
             self.assertTrue(out["class"].isna().all())

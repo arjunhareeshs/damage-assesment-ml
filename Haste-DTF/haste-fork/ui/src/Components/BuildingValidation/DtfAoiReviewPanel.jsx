@@ -36,11 +36,11 @@ const DtfAoiReviewPanel = ({ imageLayerId, building, onClose, onReviewed }) => {
   const [reviewStatus, setReviewStatus] = useState(building.review_status);
 
   async function handleExport() {
-    if (!building.model_id) return;
+    if (!building.assessment_id) return;
     setIsExporting(true);
     try {
       const result = await apiGet(
-        `GetAoiPredictionsGpkg?imageLayerId=${imageLayerId}&modelId=${building.model_id}`
+        `GetAoiAssessmentExport?assessmentId=${building.assessment_id}&format=gpkg`
       );
       fileDownload(result.url, setDialog);
     } catch (error) {
@@ -53,8 +53,9 @@ const DtfAoiReviewPanel = ({ imageLayerId, building, onClose, onReviewed }) => {
   async function handleReview(newStatus) {
     setIsSubmitting(true);
     try {
-      await apiPut("PutBuildingDTFReview", {
+      await apiPut("PutAoiAssessmentReview", {
         imageLayerId,
+        assessmentId: building.assessment_id,
         buildingId: building.id,
         reviewStatus: newStatus,
       });
@@ -154,7 +155,7 @@ const DtfAoiReviewPanel = ({ imageLayerId, building, onClose, onReviewed }) => {
 
       <DefaultButton
         className="w-100 mt-2"
-        disabled={isExporting || !building.model_id}
+        disabled={isExporting || !building.assessment_id}
         onClick={handleExport}
         iconProps={{ iconName: "Download" }}
         title="Export this AOI run's current predictions (excludes rejected buildings)"

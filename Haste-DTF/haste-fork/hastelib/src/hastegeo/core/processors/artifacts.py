@@ -53,17 +53,14 @@ class ArtifactProcessor:
             **self.config.artifact_storage_config,
         )
         self.logger = Logger.get_logger(__name__)
-        self.queue_client = AzureQueueHandler(
-            self.config.queue_config["queue_connection_string"],
-            self.config.queue_config["zip_queue_name"],
-            self.config.queue_config["queue_account_url"],
-        )
+        # The zip queue and the task runner are created on first use: storing
+        # an artifact and handing out its download URL (the export endpoints)
+        # needs neither, and building a LocalRunner in the API process fails
+        # there (it creates /shared/azurite/task_work, which only the queue
+        # worker mounts).
+        self._queue_client = None
+        self._runner = None
         self.model_data = model
-        self.runner = UnifiedRunner(
-            runner_type=self.config.runner_type,
-            config=self.config,
-            pool_id=self.config.get_azure_batch_config()["imageprep_pool_id"],
-        )
         self.model_artifacts = model_artifacts
         if self.model_data is not None:
             safe_name = _slugify_model_name(self.model_data.name)
@@ -76,6 +73,34 @@ class ArtifactProcessor:
             self.inference_zip_name = self.config.get_artifact_types().INFERENCE_ARTIFACTS_ZIP.value.substitute(
                 modelName=safe_name
             )
+
+    @property
+    def queue_client(self):
+        if self._queue_client is None:
+            self._queue_client = AzureQueueHandler(
+                self.config.queue_config["queue_connection_string"],
+                self.config.queue_config["zip_queue_name"],
+                self.config.queue_config["queue_account_url"],
+            )
+        return self._queue_client
+
+    @queue_client.setter
+    def queue_client(self, value):
+        self._queue_client = value
+
+    @property
+    def runner(self):
+        if self._runner is None:
+            self._runner = UnifiedRunner(
+                runner_type=self.config.runner_type,
+                config=self.config,
+                pool_id=self.config.get_azure_batch_config()["imageprep_pool_id"],
+            )
+        return self._runner
+
+    @runner.setter
+    def runner(self, value):
+        self._runner = value
 
     def get_download_url(
         self,

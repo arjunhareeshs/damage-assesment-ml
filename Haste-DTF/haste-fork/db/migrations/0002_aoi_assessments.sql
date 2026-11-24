@@ -93,7 +93,7 @@ CREATE TABLE IF NOT EXISTS hg_processing_units (
     width                 INTEGER NOT NULL,
     height                INTEGER NOT NULL,
     bounds                GEOMETRY(Polygon, 4326) NOT NULL,
-    kind                  TEXT NOT NULL DEFAULT 'grid', -- 'grid' | 'building_centred'
+    kind                  TEXT NOT NULL DEFAULT 'grid', -- 'grid' | 'building_centred' | 'building_oversize'
     status                TEXT NOT NULL DEFAULT 'pending',
     attempts              INTEGER NOT NULL DEFAULT 0,
     valid_pixel_fraction  DOUBLE PRECISION,

@@ -2,7 +2,7 @@
 # Licensed under the MIT License.
 
 """Shared PostgreSQL/PostGIS connection helper for the ``hg_buildings``
-table (the AOI-scoped DamageTriageFormer path, ``modelType="dtf-aoi"``).
+table (the Large-AOI DamageTriageFormer assessment path).
 
 Mirrors the connection pattern in
 ``hastegeo.core.data_layer.azure_postgresql_data_layer`` but is kept

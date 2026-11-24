@@ -16,15 +16,28 @@ if importlib.util.find_spec("docker") is None:  # pragma: no cover
 # The helpers under test don't touch Azure. Where the SDK isn't installed
 # (bare dev hosts), stub it only for the duration of this import so the
 # stubs never leak into other test modules.
+# Stub each missing module on its own: a partial install (e.g. only
+# azure-storage-blob, pulled in by adlfs) must still import cleanly.
+def _missing(name):
+    try:
+        return importlib.util.find_spec(name) is None
+    except ModuleNotFoundError:
+        return True
+
+
 _stubs = {}
-if importlib.util.find_spec("azure") is None:  # pragma: no cover
-    for name in ("azure", "azure.storage", "azure.storage.blob", "azure.storage.queue"):
-        mod = types.ModuleType(name)
-        mod.__path__ = []
-        _stubs[name] = mod
-    _stubs["azure.storage.blob"].BlobClient = MagicMock()
-    _stubs["azure.storage.blob"].BlobServiceClient = MagicMock()
-    _stubs["azure.storage.queue"].QueueServiceClient = MagicMock()
+for _name, _attrs in (
+    ("azure", ()),
+    ("azure.storage", ()),
+    ("azure.storage.blob", ("BlobClient", "BlobServiceClient")),
+    ("azure.storage.queue", ("QueueServiceClient",)),
+):
+    if _missing(_name):  # pragma: no cover
+        _mod = types.ModuleType(_name)
+        _mod.__path__ = []
+        for _attr in _attrs:
+            setattr(_mod, _attr, MagicMock())
+        _stubs[_name] = _mod
 with patch.dict(sys.modules, _stubs):
     local = __import__("hastegeo.core.runners.local", fromlist=["_"])
 LOG = logging.getLogger("test")
@@ -45,6 +58,25 @@ class TestHostCudaVolume(unittest.TestCase):
     def test_relative_path_rejected(self):
         with patch.dict(os.environ, {"HASTE_HOST_CUDA_DIR": "nvidia"}):
             self.assertEqual(local._host_cuda_volume(LOG), {})
+
+
+class TestGpuImages(unittest.TestCase):
+    def test_only_model_image_gets_gpu_by_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            for image in ("haste-training", "haste-training:latest",
+                          "myacr.azurecr.io/haste-training:v2"):
+                self.assertTrue(local._image_wants_gpu(image), image)
+            for image in ("haste-imageryprep:latest", "haste-imageryprep", "", None):
+                self.assertFalse(local._image_wants_gpu(image), image)
+
+    def test_list_is_configurable(self):
+        with patch.dict(os.environ, {"HASTE_GPU_IMAGES": "haste-training, haste-imageryprep"}):
+            self.assertTrue(local._image_wants_gpu("haste-imageryprep:latest"))
+
+    def test_gpu_switch(self):
+        for value, expected in (("1", True), ("true", True), ("0", False), ("", False)):
+            with patch.dict(os.environ, {"HASTE_ENABLE_GPU": value}):
+                self.assertEqual(local._gpu_enabled(), expected, value)
 
 
 class TestGpuAttachError(unittest.TestCase):

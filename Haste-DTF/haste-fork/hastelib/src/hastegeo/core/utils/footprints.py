@@ -27,6 +27,7 @@ import pyarrow.dataset as ds
 import pyarrow.fs as fs
 from geopandas import GeoDataFrame
 
+from .building_ids import canonical_building_id  # noqa: F401 (re-exported)
 from .gdal_security import harden_gdal
 
 logger = logging.getLogger(__name__)
@@ -70,6 +71,32 @@ type_theme_map = {
 # (clip_and_normalize_user_footprints) so the two produce identical
 # schemas.
 _FOOTPRINT_OUTPUT_COLUMNS = ("id", "geometry", "subtype", "class")
+# Which dataset each Overture building's geometry came from (OpenStreetMap,
+# Microsoft ML Buildings, Google Open Buildings, Esri, ...). Overture merges
+# them, and each was traced on different imagery, so each has its own offset
+# from the roofs; footprint_alignment registers every source separately.
+SOURCE_DATASET_COLUMN = "source_dataset"
+
+
+def _geometry_source_dataset(sources) -> Optional[str]:
+    """Dataset name of the entry describing the whole feature/geometry.
+
+    Overture's ``sources`` is a list of ``{property, dataset, ...}``; the
+    entry with an empty ``property`` covers the feature itself (its geometry).
+    """
+    if sources is None:
+        return None
+    try:
+        entries = list(sources)
+    except TypeError:
+        return None
+    if not entries:
+        return None
+    for entry in entries:
+        if isinstance(entry, dict) and not entry.get("property"):
+            return entry.get("dataset")
+    first = entries[0]
+    return first.get("dataset") if isinstance(first, dict) else None
 
 
 def get_all_overture_types() -> List[str]:
@@ -77,21 +104,31 @@ def get_all_overture_types() -> List[str]:
 
 
 def record_batch_reader(
-    overture_type, bbox=None
+    overture_type, bbox=None, *, release: Optional[str] = None, columns=None
 ) -> Optional[pa.RecordBatchReader]:
-    """Return a pyarrow RecordBatchReader for the desired bounding box and Azure path."""
-    path = _dataset_path(overture_type)
+    """Return a pyarrow RecordBatchReader for the desired bounding box(es)
+    and Azure path.
 
+    ``bbox`` is one ``(xmin, ymin, xmax, ymax)`` or a list of them; several
+    boxes are OR-ed into ONE filter, so the dataset (every file footer of the
+    release) is scanned once however many disjoint areas are asked for, and
+    row groups outside all boxes are still skipped. ``release`` pins the
+    Overture release (default: latest); ``columns`` limits what is read.
+    """
+    path = _dataset_path(overture_type, release)
+
+    boxes = []
     if bbox:
-        xmin, ymin, xmax, ymax = bbox
-        filter = (
+        boxes = [bbox] if not isinstance(bbox[0], (list, tuple)) else list(bbox)
+    filter = None
+    for xmin, ymin, xmax, ymax in boxes:
+        one = (
             (pc.field("bbox", "xmin") < xmax)
             & (pc.field("bbox", "xmax") > xmin)
             & (pc.field("bbox", "ymin") < ymax)
             & (pc.field("bbox", "ymax") > ymin)
         )
-    else:
-        filter = None
+        filter = one if filter is None else (filter | one)
 
     # Temporarily clear Azure storage env vars to prevent adlfs from using
     # local Azurite config when connecting to public Overture Maps blob storage
@@ -111,13 +148,16 @@ def record_batch_reader(
         if saved_account:
             os.environ["AZURE_STORAGE_ACCOUNT"] = saved_account
 
-    batches = dataset.to_batches(filter=filter)
+    batches = dataset.to_batches(filter=filter, columns=columns)
 
     # to_batches() can yield many empty batches; downstream consumers like
     # ParquetWriter emit a row group per batch which bloats output files.
     non_empty_batches = (b for b in batches if b.num_rows > 0)
 
-    geoarrow_schema = geoarrow_schema_adapter(dataset.schema)
+    schema = dataset.schema
+    if columns:
+        schema = pa.schema([schema.field(c) for c in columns])
+    geoarrow_schema = geoarrow_schema_adapter(schema)
     return pa.RecordBatchReader.from_batches(
         geoarrow_schema, non_empty_batches
     )
@@ -209,6 +249,101 @@ def _dataset_path(overture_type: str, release: str = None) -> str:
     return f"release/{release}/theme={theme}/type={overture_type}/"
 
 
+# Parallel footer reads when pruning Overture files. Each read is one or two
+# small range requests; latency, not bandwidth, is what they wait on.
+FOOTER_READ_THREADS = int(os.getenv("HASTE_OVERTURE_FOOTER_THREADS", "32"))
+
+
+def _box_overlap(stats: dict, boxes) -> bool:
+    """True if a row group's bbox statistics overlap any query box."""
+    return any(
+        stats["xmin"][0] < x1 and stats["xmax"][1] > x0
+        and stats["ymin"][0] < y1 and stats["ymax"][1] > y0
+        for x0, y0, x1, y1 in boxes
+    )
+
+
+def _row_filter(boxes):
+    expr = None
+    for xmin, ymin, xmax, ymax in boxes:
+        one = (
+            (pc.field("bbox", "xmin") < xmax)
+            & (pc.field("bbox", "xmax") > xmin)
+            & (pc.field("bbox", "ymin") < ymax)
+            & (pc.field("bbox", "ymax") > ymin)
+        )
+        expr = one if expr is None else (expr | one)
+    return expr
+
+
+def _overture_batches(overture_type, boxes, *, release=None, columns=None):
+    """Batches of Overture rows inside any of ``boxes``, downloading only the
+    row groups whose ``bbox`` statistics overlap one.
+
+    The pyarrow dataset scan this replaces opened every file of the release
+    (512 for buildings) and pulled far more than the footers through the
+    fsspec handler, so a small AOI took minutes at laptop bandwidth and
+    buffered GBs. Here footers are read in parallel, row groups are pruned
+    on their statistics, and only matching ones are fetched, one file at a
+    time (memory: one file's matching row groups). Rows are then filtered
+    exactly on ``bbox``.
+    """
+    import pyarrow.parquet as pq
+    from concurrent.futures import ThreadPoolExecutor
+
+    path = _dataset_path(overture_type, release)
+    saved_conn_str = os.environ.pop("AZURE_STORAGE_CONNECTION_STRING", None)
+    saved_account = os.environ.pop("AZURE_STORAGE_ACCOUNT", None)
+    try:
+        az = fsspec.filesystem("az", account_name=OVERTURE_ACCOUNT_NAME, anon=True)
+        files = sorted(f for f in az.ls(path, detail=False) if f.endswith(".parquet"))
+
+        # cache_type="none": fetch exactly the ranges parquet asks for. The
+        # default read-ahead cache doubled the time of each footer read.
+        def matching(f):
+            with az.open(f, "rb", cache_type="none") as fh:
+                md = pq.ParquetFile(fh).metadata
+            if md.num_row_groups == 0:
+                return f, []
+            names = [md.row_group(0).column(i).path_in_schema for i in range(md.num_columns)]
+            ix = {k: names.index("bbox." + k) for k in ("xmin", "xmax", "ymin", "ymax")}
+            keep = []
+            for r in range(md.num_row_groups):
+                rg = md.row_group(r)
+                st = {k: rg.column(i).statistics for k, i in ix.items()}
+                if any(s is None or not s.has_min_max for s in st.values()):
+                    keep.append(r)  # no statistics: cannot rule it out
+                    continue
+                if _box_overlap({k: (s.min, s.max) for k, s in st.items()}, boxes):
+                    keep.append(r)
+            return f, keep
+
+        with ThreadPoolExecutor(max(1, FOOTER_READ_THREADS)) as pool:
+            plan = [(f, rgs) for f, rgs in pool.map(matching, files) if rgs]
+        logger.info(
+            "Overture %s: %d of %d files have row groups in the AOI (%d row groups)",
+            overture_type, len(plan), len(files), sum(len(r) for _, r in plan),
+        )
+        row_filter = _row_filter(boxes)
+        for f, rgs in plan:
+            with az.open(f, "rb", cache_type="none") as fh:
+                table = pq.ParquetFile(fh).read_row_groups(
+                    rgs, columns=sorted(set(columns or []) | {"bbox"}) if columns else None
+                )
+            table = table.filter(row_filter)
+            if columns:
+                table = table.select(columns)
+            schema = geoarrow_schema_adapter(table.schema)
+            for batch in table.to_batches():
+                if batch.num_rows:
+                    yield pa.RecordBatch.from_arrays(batch.columns, schema=schema)
+    finally:
+        if saved_conn_str:
+            os.environ["AZURE_STORAGE_CONNECTION_STRING"] = saved_conn_str
+        if saved_account:
+            os.environ["AZURE_STORAGE_ACCOUNT"] = saved_account
+
+
 def keep_intersecting_whole(footprints, aoi_polygon):
     """Footprints that touch ``aoi_polygon`` (EPSG:4326), geometry untouched.
 
@@ -235,35 +370,52 @@ def keep_intersecting_whole(footprints, aoi_polygon):
     return footprints[footprints.intersects(aoi.iloc[0])]
 
 
+def _region_bboxes(bbox, aoi_polygon) -> List[Tuple[float, float, float, float]]:
+    """One query box per disjoint AOI region, so imagery tiles kilometres
+    apart do not pull every building in between."""
+    if aoi_polygon is None or aoi_polygon.is_empty:
+        return [tuple(bbox)]
+    parts = list(getattr(aoi_polygon, "geoms", [aoi_polygon]))
+    return [tuple(p.bounds) for p in parts if not p.is_empty]
+
+
 def download_building_footprints(
     bbox: Tuple[float, float, float, float],
     output_path: str,
     *,
     overwrite: bool = False,
     aoi_polygon=None,
+    release: Optional[str] = None,
 ) -> int:
     """Download Overture Maps building footprints for an AOI to a GeoPackage.
 
     The output gpkg contains only Polygon/MultiPolygon features in EPSG:4326
-    with columns ``id``, ``geometry``, ``subtype``, ``class`` (the columns
-    HASTE's downstream merge step expects).
+    with columns ``id``, ``geometry``, ``subtype``, ``class``.
+
+    Memory is bounded: Overture is read batch by batch, each batch is
+    filtered to the AOI polygon and appended to the GeoPackage, so only one
+    file's matching row groups are ever held. A multi-part AOI is read in ONE
+    pass whose filter is the union of its parts' bounding boxes (imagery tiles
+    kilometres apart do not pull every building in between), and only row
+    groups whose statistics overlap a box are downloaded
+    (``_overture_batches``).
 
     Args:
-        bbox: AOI bounding box (xmin, ymin, xmax, ymax) in EPSG:4326. The
-            bbox alone is the only filter Overture supports server-side,
-            so this still gates how much data is pulled.
+        bbox: AOI bounding box (xmin, ymin, xmax, ymax) in EPSG:4326, used
+            when there is no ``aoi_polygon``.
         output_path: Destination ``.gpkg`` filename.
         overwrite: If False and the file already exists, raise FileExistsError.
-        aoi_polygon: Optional shapely geometry in EPSG:4326. If provided,
-            footprints entirely outside it are dropped; every footprint
-            that touches it, even partly, is kept WHOLE (never sliced at
-            the edge), so a building crossing the boundary is assessed as
-            the whole building. Same rule as the user-supplied path
-            (``clip_and_normalize_user_footprints``).
+        aoi_polygon: Optional shapely geometry in EPSG:4326. Footprints
+            entirely outside it are dropped; every footprint that touches it
+            is kept WHOLE (never sliced at the edge).
+        release: Overture release to read (default: the latest). Pass it
+            explicitly to record which dataset version was used.
 
     Returns:
         Number of features written.
     """
+    import pyogrio
+
     if not output_path.endswith(".gpkg"):
         raise ValueError("output_path must end with .gpkg")
     if os.path.exists(output_path):
@@ -274,35 +426,47 @@ def download_building_footprints(
             )
         os.remove(output_path)
 
-    footprints = geodataframe("building", bbox)
-    footprints = footprints[list(_FOOTPRINT_OUTPUT_COLUMNS)]
-    footprints = footprints[
-        footprints.geometry.geom_type.isin(["Polygon", "MultiPolygon"])
-    ]
-    footprints.set_crs(epsg=4326, inplace=True)
-
-    if aoi_polygon is not None:
-        before = int(footprints.shape[0])
-        # Same selection as clip_and_normalize_user_footprints, so the two
-        # paths produce structurally-equivalent GPKGs.
-        footprints = keep_intersecting_whole(footprints, aoi_polygon)
-        after = int(footprints.shape[0])
-        logger.info(
-            "AOI-polygon filter kept %d of %d bbox-matched footprints whole "
-            "(dropped %d entirely outside the valid-area mask)",
-            after,
-            before,
-            before - after,
-        )
-
-    footprints.to_file(output_path, driver="GPKG")
-
-    logger.info(
-        "Wrote %d Overture building footprints to %s",
-        footprints.shape[0],
-        output_path,
+    release = release or get_latest_release()
+    columns = list(_FOOTPRINT_OUTPUT_COLUMNS)
+    out_columns = columns + [SOURCE_DATASET_COLUMN]
+    seen: set = set()
+    written = 0
+    scanned = 0
+    batches = _overture_batches(
+        "building", _region_bboxes(bbox, aoi_polygon), release=release,
+        columns=columns + ["sources"],
     )
-    return int(footprints.shape[0])
+    for batch in batches:
+        chunk = gpd.GeoDataFrame.from_arrow(pa.Table.from_batches([batch]))
+        scanned += len(chunk)
+        chunk = chunk[chunk.geometry.geom_type.isin(["Polygon", "MultiPolygon"])]
+        chunk = chunk.set_crs(epsg=4326, allow_override=True)
+        if "sources" in chunk.columns:
+            chunk[SOURCE_DATASET_COLUMN] = chunk["sources"].map(_geometry_source_dataset)
+        else:
+            chunk[SOURCE_DATASET_COLUMN] = None
+        if aoi_polygon is not None:
+            chunk = keep_intersecting_whole(chunk, aoi_polygon)
+        chunk = chunk[~chunk["id"].isin(seen)]
+        if chunk.empty:
+            continue
+        seen.update(chunk["id"].tolist())
+        pyogrio.write_dataframe(
+            chunk[out_columns], output_path, driver="GPKG",
+            append=os.path.exists(output_path),
+        )
+        written += len(chunk)
+
+    if not os.path.exists(output_path):
+        gpd.GeoDataFrame(
+            {"id": [], "subtype": [], "class": [], SOURCE_DATASET_COLUMN: []},
+            geometry=[], crs=4326,
+        ).to_file(output_path, driver="GPKG")
+    logger.info(
+        "Wrote %d Overture building footprints (release %s; %d scanned in "
+        "the bounding boxes) to %s", written, release, scanned, output_path,
+    )
+    return written
 
 
 def clip_and_normalize_user_footprints(
@@ -406,8 +570,10 @@ def clip_and_normalize_user_footprints(
     # results' for every user GPKG with int ids (which is most GIS
     # data). Normalizing here makes the two paths interchangeable.
     if "id" not in clipped.columns:
-        clipped = clipped.reset_index(drop=True)
-        clipped["id"] = clipped.index.astype(str)
+        clipped = clipped.copy()
+        clipped["id"] = [
+            canonical_building_id(g, "user") for g in clipped.geometry
+        ]
     else:
         clipped["id"] = clipped["id"].astype(str)
     if "subtype" not in clipped.columns:
@@ -467,6 +633,11 @@ def _main():
             "the bbox-only result is still written."
         ),
     )
+    parser.add_argument(
+        "--meta-out",
+        default=None,
+        help="Optional path; a JSON {source, version} describing the dataset is written there",
+    )
     args = parser.parse_args()
 
     try:
@@ -499,12 +670,19 @@ def _main():
             )
             aoi_polygon = None
 
+    release = get_latest_release()
     count = download_building_footprints(
         bbox=(xmin, ymin, xmax, ymax),
         output_path=args.output_path,
         overwrite=args.overwrite,
         aoi_polygon=aoi_polygon,
+        release=release,
     )
+    if args.meta_out:
+        import json
+
+        with open(args.meta_out, "w") as f:
+            json.dump({"source": "overture", "version": release}, f)
     sys.stdout.write(f"{count}\n")
     sys.stdout.flush()
 

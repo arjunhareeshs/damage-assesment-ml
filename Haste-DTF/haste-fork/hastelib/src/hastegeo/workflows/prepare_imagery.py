@@ -140,6 +140,10 @@ class ImageryWorkflow:
         # (and on building_footprints_error).
         self.valid_area_mask_path = ""
         self.valid_area_mask_error = ""
+        # Which footprint dataset the layer's buildings came from, recorded
+        # in the manifest and on every hg_buildings row.
+        self.footprint_source = ""
+        self.footprint_version = ""
 
     def generate_prefix(self, prefix: Template):
         """Generate a prefix for the output files based on the project ID and image layer ID."""
@@ -360,6 +364,16 @@ class ImageryWorkflow:
         from hastegeo.core.utils.imagery_catalog import describe_raster
 
         self.catalog_records = []
+        if len(self.post_event_raw_paths) == 1 and self.mosaic_post_event_tif_filepath:
+            # One source TIF: its per-TIF COG would duplicate the mosaic.
+            self.catalog_records.append(
+                {
+                    "filename": os.path.basename(self.mosaic_post_event_tif_filepath),
+                    "source_filename": os.path.basename(self.post_event_raw_paths[0]),
+                    "meta": describe_raster(self.mosaic_post_event_tif_filepath),
+                }
+            )
+            return
         prefix = self.generate_prefix(POST_EVENT_MOSAIC_PREFIX)
         for i, raw_path in enumerate(self.post_event_raw_paths):
             cog_path = _create_mosaic_cog(
@@ -500,6 +514,11 @@ class ImageryWorkflow:
         # when the mask is missing (the bbox-only result is still useful).
         if self.valid_area_mask_path:
             cmd.append(f"--aoi-geojson={self.valid_area_mask_path}")
+        import tempfile
+
+        meta_fd, meta_path = tempfile.mkstemp(suffix=".json", prefix="footprints_meta_")
+        os.close(meta_fd)
+        cmd.append(f"--meta-out={meta_path}")
         timeout_seconds = int(
             os.getenv("HASTE_FOOTPRINTS_TIMEOUT_SECONDS", "1800")
         )
@@ -557,6 +576,16 @@ class ImageryWorkflow:
             )
             return
 
+        try:
+            with open(meta_path) as f:
+                meta = json.load(f)
+            self.footprint_source = meta.get("source", "overture")
+            self.footprint_version = meta.get("version", "")
+        except Exception:
+            self.footprint_source, self.footprint_version = "overture", ""
+        finally:
+            if os.path.exists(meta_path):
+                os.remove(meta_path)
         count = (result.stdout or "").strip().splitlines()
         count_msg = count[-1] if count else "?"
         logger.info(
@@ -573,21 +602,50 @@ class ImageryWorkflow:
         Footprint datasets are usually drawn on other imagery and sit a
         metre or more off the roofs, so every building would be cropped and
         masked off-centre. The offset is measured from the mosaic itself
-        (``footprint_alignment``) and the GPKG is rewritten in place when
-        a consistent shift is found. Soft-fails: on any error the footprints
-        are kept as they are and the reason is returned for the manifest.
+        (``footprint_alignment``): by default a local tie-point field, per
+        footprint source dataset, so offsets that change across the image
+        are followed. The GPKG is rewritten only when the shifted outlines
+        fit the roof edges better than before (fit_before / fit_after in the
+        report). Soft-fails: on any error the footprints are kept as they
+        are and the reason is returned for the manifest.
+
+        * User-supplied footprints are treated as authoritative (often
+          surveyed) and are not moved unless ``HASTE_ALIGN_USER_FOOTPRINTS``
+          is true; the shift is still measured and reported.
+        * When a shift is applied, the unshifted file is kept next to it
+          (``*_unaligned.gpkg``, uploaded with the outputs) so the change can
+          be audited or undone.
         """
         if not self.building_footprints_path or not self.mosaic_post_event_tif_filepath:
             return {"applied": False, "reason": "no footprints or mosaic"}
+        user_supplied = bool(self.user_building_footprints_url)
+        move_user = os.getenv("HASTE_ALIGN_USER_FOOTPRINTS", "false").lower() in (
+            "1", "true", "yes",
+        )
         try:
             from hastegeo.core.utils.footprint_alignment import (
                 align_footprints_file,
             )
 
-            shift = align_footprints_file(
-                self.mosaic_post_event_tif_filepath, self.building_footprints_path
+            original = (
+                os.path.splitext(self.building_footprints_path)[0]
+                + "_unaligned.gpkg"
             )
-            return shift.as_dict()
+            shift = align_footprints_file(
+                self.mosaic_post_event_tif_filepath,
+                self.building_footprints_path,
+                apply=not user_supplied or move_user,
+                keep_original_path=original,
+            )
+            report = shift.as_dict()
+            if user_supplied and not move_user and shift.applied is False:
+                report["note"] = (
+                    "user-supplied footprints are not moved; set "
+                    "HASTE_ALIGN_USER_FOOTPRINTS=true to apply the measured shift"
+                )
+            if os.path.exists(original):
+                report["original_filename"] = os.path.basename(original)
+            return report
         except Exception as exc:
             logger.error(
                 "Footprint alignment failed for image layer %s; keeping "
@@ -759,6 +817,21 @@ class ImageryWorkflow:
                     f"{exc}"
                 )
                 return
+
+            # Version the user dataset by content, so a changed file is a
+            # different version even under the same URL.
+            import hashlib
+            from urllib.parse import unquote, urlparse
+
+            digest = hashlib.sha256()
+            with open(staged_path, "rb") as fh:
+                for block in iter(lambda: fh.read(1 << 20), b""):
+                    digest.update(block)
+            self.footprint_source = "user:" + (
+                os.path.basename(unquote(urlparse(self.user_building_footprints_url).path))
+                or "footprints"
+            )
+            self.footprint_version = "sha256:" + digest.hexdigest()[:16]
 
             try:
                 from hastegeo.core.utils.footprints import (
@@ -1198,6 +1271,8 @@ def main():
         config[
             "building_footprints_error"
         ] = imagery_workflow.building_footprints_error
+        config["footprint_source"] = imagery_workflow.footprint_source
+        config["footprint_version"] = imagery_workflow.footprint_version
         # Valid-area mask is generated as a side-effect of the same AOI
         # extraction. It's surfaced as a downloadable artifact in the UI;
         # a missing mask is logged but not treated as a layer-failure on

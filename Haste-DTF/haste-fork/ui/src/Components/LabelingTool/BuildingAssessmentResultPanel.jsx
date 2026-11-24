@@ -2,9 +2,16 @@
 // Licensed under the MIT License.
 import { useEffect, useState } from "react";
 import PropTypes from "prop-types";
-import { ActionButton, Spinner, SpinnerSize, Text } from "@fluentui/react";
+import {
+  ActionButton,
+  DefaultButton,
+  PrimaryButton,
+  Spinner,
+  SpinnerSize,
+  Text,
+} from "@fluentui/react";
 import { FontIcon } from "@fluentui/react/lib/Icon";
-import { apiGet } from "../../util/api";
+import { apiGet, apiPut } from "../../util/api";
 import {
   DTF_CATEGORIES,
   DTF_CLASS_COLORS,
@@ -23,6 +30,10 @@ const BuildingAssessmentResultPanel = ({
   };
 
   const [history, setHistory] = useState([]);
+  const [reviewStatus, setReviewStatus] = useState(buildingProperties.review_status);
+  const [reviewBusy, setReviewBusy] = useState(false);
+  const [reviewError, setReviewError] = useState("");
+  const assessmentId = buildingProperties.assessment_id;
   const [historyLoading, setHistoryLoading] = useState(false);
 
   const buildingId =
@@ -63,6 +74,37 @@ const BuildingAssessmentResultPanel = ({
       cancelled = true;
     };
   }, [buildingId, imageLayerId]);
+
+  useEffect(() => {
+    setReviewStatus(buildingProperties.review_status);
+    setReviewError("");
+  }, [buildingProperties]);
+
+  async function handleReview(newStatus) {
+    setReviewBusy(true);
+    setReviewError("");
+    try {
+      await apiPut("PutAoiAssessmentReview", {
+        imageLayerId,
+        assessmentId,
+        buildingId,
+        reviewStatus: newStatus,
+      });
+      setReviewStatus(newStatus);
+      setHistory((prev) =>
+        prev.map((h) =>
+          h.assessment_id === assessmentId ? { ...h, review_status: newStatus } : h
+        )
+      );
+    } catch (err) {
+      console.error("Error updating review status:", err);
+      setReviewError("Could not update the review status.");
+    } finally {
+      setReviewBusy(false);
+    }
+  }
+
+  const reviewable = resultStatus === "completed" && Boolean(assessmentId);
 
   const classColor =
     damageClass != null && damageClass >= 0 && damageClass < DTF_CLASS_COLORS.length
@@ -138,6 +180,18 @@ const BuildingAssessmentResultPanel = ({
           <span style={{ color: statusColor, fontWeight: 600 }}>{resultStatus}</span>
         </div>
 
+        {reviewStatus && (
+          <div className="d-flex justify-content-between" style={{ fontSize: 12 }}>
+            <span style={{ color: "#666" }}>Review:</span>
+            <span style={{ fontWeight: 600 }}>
+              {reviewStatus.replace("_", " ")}
+              {buildingProperties.reviewed_by && reviewStatus !== "pending_review"
+                ? ` (${buildingProperties.reviewed_by})`
+                : ""}
+            </span>
+          </div>
+        )}
+
         {boundaryIntersecting && (
           <div className="mt-1" style={{ fontSize: 11, color: "#e65100" }}>
             <FontIcon iconName="Warning" style={{ marginRight: 4 }} />
@@ -145,6 +199,24 @@ const BuildingAssessmentResultPanel = ({
           </div>
         )}
       </div>
+
+      {reviewable && (
+        <div className="d-flex gap-2 mt-2">
+          <PrimaryButton
+            text="Accept"
+            disabled={reviewBusy || reviewStatus === "accepted"}
+            onClick={() => handleReview("accepted")}
+          />
+          <DefaultButton
+            text="Reject"
+            disabled={reviewBusy || reviewStatus === "rejected"}
+            onClick={() => handleReview("rejected")}
+          />
+        </div>
+      )}
+      {reviewError && (
+        <div style={{ fontSize: 11, color: "#a4262c", marginTop: 4 }}>{reviewError}</div>
+      )}
 
       {/* History section */}
       <div className="border-top pt-2 mt-2">
@@ -168,6 +240,9 @@ const BuildingAssessmentResultPanel = ({
                 </span>
                 <span className="fw-semibold">
                   {h.damage_class_name || (h.damage_class != null ? DTF_CATEGORIES[h.damage_class] : h.result_status)}
+                  {h.review_status && h.review_status !== "unclassified"
+                    ? ` · ${h.review_status.replace("_", " ")}`
+                    : ""}
                 </span>
               </div>
             ))}

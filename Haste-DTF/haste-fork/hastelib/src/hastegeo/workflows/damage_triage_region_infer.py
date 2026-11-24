@@ -29,21 +29,24 @@ import numpy as np
 import rasterio
 import rasterio.features
 import rasterio.windows
+from rasterio.enums import Resampling
 import torch
 from shapely.geometry import shape
 from shapely.wkt import loads as wkt_loads
 
 from hastegeo.core.utils.crop_service import _reproject_geometry
-from hastegeo.core.utils.dtf_preprocess import PREPROCESSING_VERSION
+from hastegeo.core.utils.dtf_preprocess import PREPROCESSING_VERSION, resolve_normalization
 from hastegeo.core.utils.logs import Logger as HasteLogger
 from hastegeo.workflows.damage_triage_infer import (
     DTF_IM_SIZE,
     _find_local_checkpoint,
-    MIN_CROP_FOOTPRINT_PX,
     build_dtf_model,
     compute_model_digest,
     crop_box_from_mask,
+    model_spec,
     read_tile,
+    rgb_band_indexes,
+    valid_pixel_mask,
     resolve_crops_per_forward,
     resolve_device,
     score_crops,
@@ -105,7 +108,7 @@ def run_batch_inference(config: Dict[str, Any]) -> Dict[str, Any]:
         WORKDIR, config.get("files", {}).get("imagery", "")
     )
     units = config.get("units", [])
-    normalization = config.get("normalization") or "imagenet"
+    normalization = resolve_normalization(config.get("normalization"))
     masks_per_forward = config.get("masks_per_forward")
     min_valid_fraction = config.get("min_valid_pixel_fraction")
     if min_valid_fraction is None:
@@ -141,19 +144,15 @@ def run_batch_inference(config: Dict[str, Any]) -> Dict[str, Any]:
         device,
         strict_region_check=True,
         allow_crop_mode=True,
+        selftest=True,
     )
+    spec = model_spec(model)
     crop_mode = getattr(model, "crop_mode", False) is True
     crops_per_forward = None
     if crop_mode:
         # Sized from the memory that is free right now; masks_per_forward is
-        # the upper bound. A crop-mode checkpoint is trained on ImageNet-
-        # normalised input, whatever the config asks for.
+        # the upper bound.
         crops_per_forward = resolve_crops_per_forward(device, masks_per_forward)
-        if normalization != "imagenet":
-            logger.warning(
-                "normalization=%r ignored: the crop-mode checkpoint needs imagenet",
-                normalization,
-            )
     # Units prepared ahead on CPU threads while the GPU scores the current one.
     prefetch = max(1, int(os.getenv("HASTE_REGION_PREFETCH_UNITS", "2")))
     log_progress(
@@ -198,19 +197,36 @@ def run_batch_inference(config: Dict[str, Any]) -> Dict[str, Any]:
         unit_id = u["unit_id"]
 
         win = rasterio.windows.Window(col_off, row_off, w, h)
-        # Windowed raster read only (no full-image load!)
-        tile = read_tile(raster, win, tile_size=DTF_IM_SIZE)
         tile_transform = rasterio.windows.transform(win, raster.transform)
+        if w > DTF_IM_SIZE or h > DTF_IM_SIZE:
+            # A building larger than one window ("building_oversize" unit):
+            # read the whole window downsampled to fit DTF_IM_SIZE, so the
+            # model sees the entire building, not a cut-off part.
+            scale = max(w, h) / float(DTF_IM_SIZE)
+            out_w = min(DTF_IM_SIZE, max(1, int(round(w / scale))))
+            out_h = min(DTF_IM_SIZE, max(1, int(round(h / scale))))
+            data = raster.read(
+                rgb_band_indexes(raster), window=win, out_shape=(3, out_h, out_w),
+                resampling=Resampling.average,
+            )
+            tile = np.zeros((3, DTF_IM_SIZE, DTF_IM_SIZE), dtype=data.dtype)
+            tile[:, :out_h, :out_w] = data
+            # Pixel (0,0) keeps the window's upper-left corner; only the
+            # pixel size changes, so masks rasterised with this transform
+            # land on the same ground as the averaged pixels.
+            tile_transform = tile_transform * tile_transform.scale(w / out_w, h / out_h)
+            valid_real = valid_pixel_mask(raster, win, data, out_shape=(out_h, out_w))
+            w, h = out_w, out_h
+        else:
+            # Windowed raster read only (no full-image load!)
+            tile = read_tile(raster, win, tile_size=DTF_IM_SIZE)
+            valid_real = valid_pixel_mask(raster, win, tile[:, :h, :w])
 
-        # Valid pixels: inside the real (unpadded) window, and not nodata in
-        # all three bands. Without a declared nodata value, all-zero RGB
-        # (black collar at imagery edges) counts as nodata - the same rule
-        # utils/aoi.py uses for the valid-area mask.
-        nodata_val = raster.nodata
-        invalid_value = nodata_val if nodata_val is not None else 0
-        valid_tile_mask = ~np.all(tile == invalid_value, axis=0)
-        valid_tile_mask[h:, :] = False
-        valid_tile_mask[:, w:] = False
+        # Valid pixels: inside the real (unpadded) window and holding image
+        # data -- the file's nodata / alpha / internal mask when it declares
+        # one, else not all-zero RGB (black collar), as utils/aoi.py does.
+        valid_tile_mask = np.zeros((DTF_IM_SIZE, DTF_IM_SIZE), dtype=bool)
+        valid_tile_mask[:h, :w] = valid_real
 
         items = []  # masks (mask mode) or boxes (crop mode)
         bldg_meta = []
@@ -231,7 +247,7 @@ def run_batch_inference(config: Dict[str, Any]) -> Dict[str, Any]:
                 invert=True,
             )
             mask_sum = int(mask_bool.sum())
-            if mask_sum == 0 or (crop_mode and mask_sum < MIN_CROP_FOOTPRINT_PX):
+            if mask_sum == 0 or (crop_mode and mask_sum < spec.min_footprint_px):
                 continue
 
             valid_frac = float((mask_bool & valid_tile_mask).sum() / mask_sum)
@@ -246,7 +262,7 @@ def run_batch_inference(config: Dict[str, Any]) -> Dict[str, Any]:
                 continue
 
             if crop_mode:
-                box = crop_box_from_mask(mask_bool, w, h)
+                box = crop_box_from_mask(mask_bool, w, h, spec.crop_margin_px)
                 if box is None:
                     continue
                 items.append(box)
@@ -360,6 +376,7 @@ def run_batch_inference(config: Dict[str, Any]) -> Dict[str, Any]:
         "imagery_id": imagery_id,
         "model_digest": actual_digest,
         "preprocessing_version": PREPROCESSING_VERSION,
+        "preprocessing": spec.as_dict(),
         "total_units": len(units),
         "completed_units": completed_units,
         "failed_units": failed_units,

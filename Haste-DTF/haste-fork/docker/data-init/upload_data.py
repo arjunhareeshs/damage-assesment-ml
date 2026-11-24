@@ -46,12 +46,10 @@ def create_queues():
         "local-zip-queue",
         "local-inference-queue",
         "local-embedding-queue",
-        "local-dtf-queue",
-        "local-dtf-aoi-queue",
+        "local-assessment-queue",
         "local-image-queue-poison",
         "local-embedding-queue-poison",
-        "local-dtf-queue-poison",
-        "local-dtf-aoi-queue-poison"
+        "local-assessment-queue-poison",
     ]
     
     success_count = 0

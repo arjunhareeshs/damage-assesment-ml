@@ -40,19 +40,17 @@ const LayerRow = ({
   const navigate = useNavigate();
   const { setIsLoading, appParams } = useContext(AppContext);
 
-  // Option B: DamageTriageFormer inference isn't tied to a workflowType —
-  // like Building Validation, it only needs a processed imagery layer +
-  // cached building footprints, so the button is available regardless of
-  // whether this layer uses the building-labeling or standard workflow.
+  // Legacy per-AOI DTF runs (modelType "dtf-aoi") can no longer be started;
+  // this only counts old records that still exist. New runs are Large-AOI
+  // assessments, launched from the Labeling Tool.
   const dtfModels =
     (item.models || []).filter(
-      (m) => m.modelType === "dtf" || m.modelType === "dtf-aoi"
+      (m) => m.modelType === "dtf-aoi"
     ) || [];
 
-  // DamageTriageFormer runs from the Labeling Tool: draw an area (or use the
-  // whole image) and run it per building or as a Large-AOI assessment. The
-  // old whole-layer tile workflow (CreateEditDTFModal) can't load the
-  // crop-mode checkpoint this deployment ships, so it isn't offered here.
+  // DamageTriageFormer runs from the Labeling Tool as a Large-AOI assessment
+  // (draw an area or use the whole image). The whole-layer and per-AOI DTF
+  // workflows were removed.
   async function handleDeletion() {
     setDialog();
     setIsLoading(true, "Removing Image Layer");
@@ -279,8 +277,16 @@ const LayerRow = ({
             onClick={() =>
               navigate(`/labeling-tool/${projectId}/${item.imageLayerId}`)
             }
-            disabled={item.status !== "Processed" || !item.buildingFootprintsUrl}
-            title="Opens the Labeling Tool: draw an area (or use the whole image) and run DamageTriageFormer on it"
+            disabled={
+              item.status !== "Processed" ||
+              !item.buildingFootprintsUrl ||
+              Boolean(item.buildingFootprintsError)
+            }
+            title={
+              item.buildingFootprintsError
+                ? `Buildings unavailable: ${item.buildingFootprintsError}`
+                : "Opens the Labeling Tool: draw an area (or use the whole image) and run DamageTriageFormer on it"
+            }
           >
             Run DamageTriageFormer
           </DefaultButton>{" "}

@@ -6,7 +6,7 @@
 One ``hg_assessments`` row is one job. Each queue message advances it by
 one step, and the processor re-enqueues itself (with the queue's default
 visibility delay) until a terminal status is reached — the same
-poll-by-queue pattern as ``processors/damage_triage_aoi.py``, but with all
+poll-by-queue pattern as the other queue processors, but with all
 job state durable in PostGIS instead of in the queue message:
 
     submitted -> discovering -> tiling -> queued -> running
@@ -271,7 +271,10 @@ class AoiAssessmentPostprocessor:
             return
 
         n_buildings = postgis_query.count_buildings_in_aoi(
-            image_layer_id=image_layer_id, aoi_geojson=aoi, conn=self.conn
+            image_layer_id=image_layer_id,
+            aoi_geojson=aoi,
+            building_ids=(ast.get("config") or {}).get("building_ids") or None,
+            conn=self.conn,
         )
         if n_buildings == 0:
             self.logger.info("Zero buildings in AOI for %s", self.assessment_id)
@@ -311,7 +314,8 @@ class AoiAssessmentPostprocessor:
 
         imagery = imagery_for_aoi(image_layer_id, aoi, conn=self.conn)
         buildings = assessment_store.eligible_buildings_with_overlap(
-            image_layer_id, aoi, conn=self.conn
+            image_layer_id, aoi, conn=self.conn,
+            building_ids=cfg.get("building_ids") or None,
         )
         b_geoms = [shape(b["geometry"]) for b in buildings]
         tree = STRtree(b_geoms) if b_geoms else None
@@ -505,6 +509,9 @@ class AoiAssessmentPostprocessor:
                 "imagery": {
                     "http_url": _uri_without_query(batch_config["file_uri"]),
                     "file_path": batch_config["files"]["imagery"],
+                    # Imagery URLs are immutable (task-scoped paths): every
+                    # batch of this TIF can share one download.
+                    "cache": True,
                 },
             }
 
@@ -591,8 +598,10 @@ class AoiAssessmentPostprocessor:
 
     def _handle_aggregating(self, ast: Dict[str, Any]) -> None:
         image_layer_id = ast["image_layer_id"]
+        cfg = ast.get("config") or {}
         buildings = assessment_store.eligible_buildings_with_overlap(
-            image_layer_id, ast["aoi_geometry"], conn=self.conn
+            image_layer_id, ast["aoi_geometry"], conn=self.conn,
+            building_ids=cfg.get("building_ids") or None,
         )
         failed_ids = set(
             assessment_store.buildings_without_completed_units(self.assessment_id, conn=self.conn)
@@ -610,6 +619,11 @@ class AoiAssessmentPostprocessor:
             model_digest=ast.get("model_digest"),
             preprocessing_version=ast.get("preprocessing_version"),
         )
+        require_review = bool(cfg.get("require_review", True))
+        for r in results:
+            r["review_status"] = assessment_store.initial_review_status(
+                r["result_status"], require_review
+            )
         assessment_store.upsert_damage_assessments(
             self.assessment_id, results, conn=self.conn
         )

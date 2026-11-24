@@ -438,8 +438,7 @@ class Model(BaseModel):
     inferenceStatusMessage: Optional[str] = Field(default="")
     predictedDamageLayerUrl: Optional[str] = Field(default=None)
     gpkgUrl: Optional[str] = Field(default=None)
-    # GeoParquet of a dtf-aoi run's results (geometry, class, confidence,
-    # per-class probabilities), written by DTFAoiInferencePostprocessor.
+    # GeoParquet results of a model run.
     parquetUrl: Optional[str] = Field(default=None)
     labelsUrl: Optional[str] = Field(default=None)
     # ── Building labeling workflow (embedding sub-row) ──────────────────
@@ -462,31 +461,6 @@ class Model(BaseModel):
     # once at session start and looks vectors up by id; the PMTiles
     # archive itself only carries id + overture_id (no f_* columns).
     featuresSidecarUrl: Optional[str] = Field(default=None)
-    # ── Option B: DamageTriageFormer inference (dtf sub-row) ────────────
-    # A Model with modelType="dtf" represents a DamageTriageFormer
-    # inference run over an image layer's full-resolution mosaic + cached
-    # footprints (server-side 5-class typology, no analyst labels needed).
-    # It reuses gpkgUrl for the resulting per-building predictions, and
-    # damaged/damage_pct_0m/unknown_pct so existing Validation/Assessment
-    # reports work unchanged; the 5-class breakdown lives in extra columns
-    # (dtf_class, dtf_class_name, dtf_confidence, dtf_prob_0..4) on the same
-    # GeoPackage — see hastegeo/workflows/damage_triage_infer.py.
-    dtfJob: Optional[TrainingJob] = Field(default=None)
-    # ── Option B (AOI-scoped): DamageTriageFormer inference restricted to
-    # an analyst-drawn area of interest (dtf-aoi sub-row) ───────────────
-    # A Model with modelType="dtf-aoi" represents a DamageTriageFormer run
-    # scoped to either a drawn AOI polygon or an explicit building-id
-    # selection, resolved against the hg_buildings PostGIS table (see
-    # hastegeo/core/utils/postgis_query.py) rather than the whole layer.
-    # Unlike modelType="dtf", it does not repaint a full-layer raster —
-    # it PATCHes per-building rows in hg_buildings (damage_class,
-    # confidence, mask_url, crop_url, review_status), leaving every other
-    # building's row and the layer's existing dtf raster/gpkg untouched.
-    # gpkgUrl for a dtf-aoi row is an AOI-scoped export (only the buildings
-    # touched by this run), not a full-layer export.
-    dtfAoi: Optional[dict] = Field(default=None)
-    dtfBuildingIds: Optional[List[str]] = Field(default=None)
-    dtfAoiJob: Optional[TrainingJob] = Field(default=None)
     dependsOn: Optional[tuple[str, str]] = Field(
         default=("ImageLayer", "imageLayerId")
     )
@@ -786,6 +760,16 @@ class ImageLayer(BaseModel):
     buildingFootprintsUrl: Optional[str] = Field(default=None)
     userBuildingFootprintsUrl: Optional[str] = Field(default=None)
     validAreaMaskUrl: Optional[str] = Field(default=None)
+    # Why buildings are unavailable for assessments (footprint download or
+    # database load failed) while the imagery itself is usable; None when
+    # buildings are ready.
+    buildingFootprintsError: Optional[str] = Field(default=None)
+    # Buildings loaded into hg_buildings for this layer by the last prep.
+    buildingCount: Optional[int] = Field(default=None)
+    # Footprint dataset of the layer's buildings, e.g. "overture" +
+    # "2026-02-18.0", or "user:<file>" + "sha256:<digest>".
+    footprintSource: Optional[str] = Field(default=None)
+    footprintVersion: Optional[str] = Field(default=None)
     # Imagery updates (newer TIFs for part of the layer's area). The URLs
     # in ``pendingImageryUpdateUrls`` are processed by the next imageryprep
     # run; it moves the TIFs they replace from ``postEventImageryUrls`` to

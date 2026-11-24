@@ -1,6 +1,6 @@
 # Base image. The default bundles the CUDA 12.4 toolkit (~5.3 GB compressed),
-# which Azure Batch GPU nodes need. The host-CUDA build
-# (docker-compose.hostcuda.yml) passes the CPU-only sibling instead
+# which Azure Batch GPU nodes need. docker-compose.yml (host-CUDA build)
+# passes the CPU-only sibling instead
 # (~0.5 GB, same dockeruser + /opt/miniconda layout) and borrows CUDA from
 # the host at runtime -- see TORCH_VARIANT=host below.
 ARG BASE_IMAGE=mcr.microsoft.com/azureml/curated/minimal-py312-cuda12.4-inference
@@ -125,15 +125,6 @@ RUN for i in 1 2 3 4 5; do \
 RUN printf '#!/bin/bash\nexec python -m hastegeo.workflows.embed_buildings "$@"\n' > /usr/local/bin/embed-buildings \
 	&& chmod +x /usr/local/bin/embed-buildings
 
-# CLI shim for the DamageTriageFormer inference workflow (Option B).
-RUN printf '#!/bin/bash\nexec python -m hastegeo.workflows.damage_triage_infer "$@"\n' > /usr/local/bin/damage-triage-infer \
-	&& chmod +x /usr/local/bin/damage-triage-infer
-
-# CLI shim for the AOI-scoped DamageTriageFormer inference workflow
-# (Option B, per-building-crop path — docs/OptionB_AOI_Integration_Plan.md).
-RUN printf '#!/bin/bash\nexec python -m hastegeo.workflows.damage_triage_aoi_infer "$@"\n' > /usr/local/bin/damage-triage-aoi-infer \
-	&& chmod +x /usr/local/bin/damage-triage-aoi-infer
-
 # CLI shim for the batched Large-AOI DamageTriageFormer region inference workflow.
 RUN printf '#!/bin/bash\nexec python -m hastegeo.workflows.damage_triage_region_infer "$@"\n' > /usr/local/bin/damage-triage-region-infer \
 	&& chmod +x /usr/local/bin/damage-triage-region-infer
@@ -170,8 +161,9 @@ COPY --chown=dockeruser:dockeruser hastelib/src/hastegeo /app/hastegeo
 # Vendor DamageTriageFormer's model code (Option B). Code only (MIT licensed,
 # see external/damage-triage-former/LICENSE) — the ~500MB checkpoint is NOT
 # baked into the image; it's downloaded per-task by the Azure Batch runner
-# like imagery/footprints (see DTFInferencePostprocessor._create_dtf_config),
-# so pushing/pulling this image doesn't carry model weights.
+# like imagery/footprints (the Large-AOI config carries the checkpoint paths,
+# see core/processors/aoi_assessment.py), so pushing/pulling this image
+# does not carry model weights.
 COPY --chown=dockeruser:dockeruser external/damage-triage-former /opt/damage-triage-former
 
 # Convert line endings and ensure scripts are executable inside the container

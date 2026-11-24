@@ -417,24 +417,8 @@ const Visualizer = ({ setModalComponent }) => {
   // per classified building — because the AOI-scoped path never rasterizes
   // a whole-mosaic tile; it writes per-building crops/masks instead.
   async function loadDtfAoiPredictionsLayer(map) {
-    let featureCollection;
-    try {
-      featureCollection = await apiGet(
-        "GetHgBuildingsGeoJSON?imageLayerId=" + imageLayerId
-      );
-    } catch (error) {
-      // Not every image layer has run an AOI-scoped DTF job — an empty/
-      // missing result is expected, not an error worth surfacing.
-      console.warn("No AOI-scoped DamageTriageFormer predictions to load:", error);
-      return;
-    }
-    if (!featureCollection || !featureCollection.features?.length) {
-      return;
-    }
-
     const dataSource = new window.atlas.source.DataSource();
     map.sources.add(dataSource);
-    dataSource.add(featureCollection);
     dtfAoiDataSourcesRef.current.push(dataSource);
 
     const fillLayer = new window.atlas.layer.PolygonLayer(dataSource, null, {
@@ -449,9 +433,7 @@ const Visualizer = ({ setModalComponent }) => {
         /* default (unclassified/-1) */ "#888888",
       ],
       // Rejected predictions render at reduced opacity so an analyst can
-      // see at a glance which ones still need a second look; accepted and
-      // pending_review both render at full opacity (pending review is
-      // shown, not hidden, so the AI result is visible immediately).
+      // see at a glance which ones still need a second look.
       fillOpacity: [
         "case",
         ["==", ["get", "review_status"], "rejected"],
@@ -463,8 +445,20 @@ const Visualizer = ({ setModalComponent }) => {
     map.layers.add(fillLayer);
 
     const outlineLayer = new window.atlas.layer.LineLayer(dataSource, null, {
-      strokeColor: "#000000",
-      strokeWidth: 1,
+      // Orange, thicker outline: the result was made on imagery the layer
+      // no longer shows (re-run the assessment there).
+      strokeColor: [
+        "case",
+        ["boolean", ["get", "result_out_of_date"], false],
+        "#ff8c00",
+        "#000000",
+      ],
+      strokeWidth: [
+        "case",
+        ["boolean", ["get", "result_out_of_date"], false],
+        2.5,
+        1,
+      ],
     });
     outlineLayer.customId = "dtfAoiPredictionsOutline";
     map.layers.add(outlineLayer);
@@ -473,6 +467,26 @@ const Visualizer = ({ setModalComponent }) => {
       if (!e.shapes || !e.shapes.length) return;
       setSelectedDtfAoiBuilding(e.shapes[0].getProperties());
     });
+
+    // Only the current viewport is fetched (the server caps the count,
+    // most damaged first), and it is refreshed whenever the view settles.
+    let requestId = 0;
+    async function refresh() {
+      const bounds = map.getCamera().bounds;
+      if (!bounds) return;
+      const id = ++requestId;
+      try {
+        const featureCollection = await apiGet(
+          `GetHgBuildingsGeoJSON?imageLayerId=${imageLayerId}&bbox=${bounds.join(",")}`
+        );
+        if (id !== requestId) return; // a newer view superseded this one
+        dataSource.setShapes(featureCollection?.features || []);
+      } catch (error) {
+        console.warn("Could not load building damage results:", error);
+      }
+    }
+    map.events.add("moveend", refresh);
+    await refresh();
   }
 
   // Reflects an Accept/Reject decision in every map's data source so the

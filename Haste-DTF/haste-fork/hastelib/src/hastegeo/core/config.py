@@ -100,13 +100,6 @@ class ArtifactTypes(Enum):
     BUILDING_PMTILES = Template("building_pmtiles_${modelName}")
     BUILDING_FEATURES_SIDECAR = Template("building_features_${modelName}")
     BUILDING_PREDICTIONS_GPKG = Template("building_predictions_${modelName}")
-    # Option B: DamageTriageFormer per-building 5-class typology predictions.
-    BUILDING_DTF_PREDICTIONS_GPKG = Template("dtf_predictions_${modelName}")
-    # Option B (AOI-scoped): same, but only the buildings touched by a
-    # single dtf-aoi run (not the whole layer) — see damage_triage_aoi.py.
-    BUILDING_DTF_AOI_PREDICTIONS_GPKG = Template(
-        "dtf_aoi_predictions_${modelName}"
-    )
 
 
 class InviteConfig(NamedTuple):
@@ -241,7 +234,16 @@ class Config:
 
     @property
     def dtf_normalization(self) -> str:
-        return os.getenv("HASTE_DTF_NORMALIZATION", "imagenet")
+        from .utils.dtf_preprocess import resolve_normalization
+
+        return resolve_normalization(os.getenv("HASTE_DTF_NORMALIZATION"))
+
+    @property
+    def require_review(self) -> bool:
+        """New large-AOI results start ``pending_review`` unless this is false."""
+        return os.getenv("HASTE_REQUIRE_REVIEW", "true").strip().lower() not in (
+            "0", "false", "no", "off",
+        )
 
     @property
     def region_windows_per_batch(self) -> int | None:
@@ -329,12 +331,6 @@ class Config:
             "embedding_queue_name": os.getenv(
                 "EMBEDDING_QUEUE_NAME", "embedding-queue"
             ),
-            "dtf_queue_name": os.getenv(
-                "DTF_QUEUE_NAME", "dtf-queue"
-            ),
-            "dtf_aoi_queue_name": os.getenv(
-                "DTF_AOI_QUEUE_NAME", "dtf-aoi-inference"
-            ),
             "assessment_queue_name": os.getenv(
                 "ASSESSMENT_QUEUE_NAME", "local-assessment-queue"
             ),
@@ -369,8 +365,6 @@ class Config:
             EXPERIMENT_CONFIG = "experiment_config"
             IMAGERY_CONFIG = "imageryprep_config"
             EMBEDDING_CONFIG = "embedding_config"
-            DTF_CONFIG = "dtf_config"
-            DTF_AOI_CONFIG = "dtf_aoi_config"
             AOI_ASSESSMENT = "aoi_assessment"
             AOI_ASSESSMENT_CONFIG = "aoi_assessment_config"
             PROCESSED_IMAGERY = "processed_imagery_post_event_cog"
@@ -592,27 +586,6 @@ class Config:
             "artifact_batch_job_id": os.getenv(
                 "ARTIFACT_BATCH_JOB_ID", imageryprep_pool_id
             ),
-        }
-
-    @staticmethod
-    def get_dtf_config():
-        """Get DamageTriageFormer (Option B) configuration.
-
-        Returns:
-            dict: ``checkpoint_url`` — blob URL of the ``best_model.pth``
-                checkpoint (downloaded once from Hugging Face
-                ``Ymx1025/DamageTriageFormer-model`` and re-uploaded to our
-                own storage per docs/Haste-DTF/IMPLEMENTATION_PLAN.md Phase
-                1, then referenced here so every DTF job downloads it as a
-                per-task input like imagery/footprints — see
-                ``DTFInferencePostprocessor._create_dtf_config``).
-        """
-        return {
-            "checkpoint_url": os.getenv("DTF_CHECKPOINT_URL"),
-            # The training-run config.json Hugging Face ships alongside
-            # best_model.pth — needed to reconstruct the checkpoint's head
-            # architecture (gated vs plain severity) before loading weights.
-            "checkpoint_config_url": os.getenv("DTF_CHECKPOINT_CONFIG_URL"),
         }
 
     @staticmethod

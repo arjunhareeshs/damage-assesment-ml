@@ -295,20 +295,73 @@ containers** that the LocalRunner spawns dynamically:
 > **All commands should be run from the `docker/` directory** (the Docker Compose
 > context is set to the repository root via `context: ..` in the compose file).
 
+### One compose file, GPU for inference only
+
+There is a single `docker/docker-compose.yml`. It is set up for this split:
+
+| Runs on | What |
+|---------|------|
+| **GPU** | Model inference tasks: the `haste-training` container LocalRunner starts per Large-AOI unit (`damage-triage-region-infer`) and for embeddings. |
+| **CPU** | Everything else: hastefuncapi, hastefuncqueues, imagery prep (`haste-imageryprep`), zipping, azurite, postgis, titiler, nginx, ui. |
+
+No CUDA is downloaded. `haste-training` is built on a CPU-only base with
+the CUDA build of torch/torchvision but without the `nvidia/*` libraries
+(`TORCH_VARIANT=host`). At run time LocalRunner mounts the host's pip
+`site-packages/nvidia` folder (`HASTE_HOST_CUDA_DIR`) read-only into GPU tasks
+and asks Docker for the GPU (`HASTE_ENABLE_GPU=1`). If the GPU can't be
+attached, the task is rerun on CPU.
+
+Settings (in `docker/.env`, written by `build.sh`):
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `HASTE_HOST_CUDA_DIR` | none (required for GPU) | Host folder with the CUDA 12 runtime libraries |
+| `HASTE_ENABLE_GPU` | `1` | Request a GPU for GPU task images |
+| `HASTE_TORCH_VARIANT` | `host` | How `haste-training`'s torch is built (`host` or `cpu`) |
+| `HASTE_GPU_IMAGES` | `haste-training` | Task images that get the GPU |
+| `HASTE_GPU_DEVICES` | `all` | Which GPUs, e.g. `0` |
+
+On a machine without a GPU, `./build.sh --cpu` (or the auto mode) writes
+`HASTE_TORCH_VARIANT=cpu` and `HASTE_ENABLE_GPU=0`, and the same compose file
+gives a CPU-only stack. Those two must always change together. A
+`haste-training` built for `host` cannot import torch without the CUDA mount.
+
+| Command | Mode |
+|---------|------|
+| `./build.sh` | auto: GPU if this machine has a GPU, Docker's `nvidia` runtime and CUDA 12 libraries; else CPU |
+| `./build.sh --gpu` | force GPU |
+| `./build.sh --cpu` | force CPU |
+
+`build.sh` also saves `DOCKER_GID`, retries failed downloads, and smoke-tests
+every image (in GPU mode it runs a matmul and a conv on the GPU).
+
+Azure Batch / ACR images are built straight from the Dockerfiles (not
+compose). The training Dockerfile's own defaults (CUDA 12.4 base, `cu124`
+torch) still produce a self-contained GPU image for that.
+
+### Dockerfiles
+
+| Dockerfile | Image | Used by |
+|------------|-------|---------|
+| `api/hastefuncapi/Dockerfile` | `haste-api` | compose and ACR |
+| `api/hastefuncqueues/Dockerfile` | `haste-queues` | compose and ACR |
+| `docker/training/Dockerfile` | `haste-training` (model inference) | task image, started per job |
+| `docker/imageryprep/Dockerfile` | `haste-imageryprep` | task image, started per job |
+| `docker/emulators/Dockerfile`, `docker/data-init/Dockerfile`, `docker/titiler/Dockerfile` | `haste-azurite`, `haste-data-init`, `haste-titiler` | compose |
+| `ui/Dockerfile` | `haste-ui` (Vite dev server, port 4280) | compose |
+| `docker/ui/Dockerfile` | production UI (built assets served by nginx, port 5000) | ACR / Azure only |
+
 ### First-Time Build
 
 ```bash
-cd docker
-
-# Build every image (may take 15–30 min depending on network speed)
-docker compose build
-
-# Start all services in detached mode
+./build.sh                    # from the checkout root; builds and smoke-tests all images
+cd Haste-DTF/haste-fork/docker
 docker compose up -d
-
-# Watch the real-time log stream
 docker compose logs -f
 ```
+
+Plain `docker compose build` does not build the task images (they sit in the
+`tasks` profile); use `build.sh`, or add `--profile tasks`.
 
 The **first boot** will:
 
@@ -643,19 +696,15 @@ However, if deploying to Azure (non-Docker), you'll need a wheel:
 ```bash
 cd hastelib
 
-# Build the wheel (auto-bumps version, uploads to blob, updates requirements.txt)
-python haste_build.py
-
-# Or build manually without the custom script:
+# Build the wheel (version comes from src/hastegeo/__about__.py)
 pip install build hatchling
 python -m build --wheel
 ```
 
-The custom `haste_build.py` script:
-1. Increments the version in `src/hastegeo/__about__.py`
-2. Builds a `.whl` file under `hastelib/dist/`
-3. Uploads it to `researchlabwuopendata.blob.core.windows.net/haste-binaries/` (requires `az login`) and removes the local copy from `hastelib/dist/`
-4. Rewrites the `hastegeo @ <url>` line in `api/hastefuncapi/requirements.txt`, `api/hastefuncqueues/requirements.txt`, and `docker/imageryprep/requirements.txt` so they pin the new wheel URL
+Then point the `hastegeo @ <url>` line in `api/hastefuncapi/requirements.txt`,
+`api/hastefuncqueues/requirements.txt` and `docker/imageryprep/requirements.txt`
+at wherever you publish the wheel. The build no longer bumps the version or
+uploads anything.
 
 > **For local Docker**, you do NOT need to rebuild the wheel — the Dockerfiles
 > copy the source directly with `COPY hastelib/src/hastegeo /home/site/wwwroot/hastegeo`.
@@ -895,7 +944,7 @@ When transitioning from local Docker to a production deployment:
 | `docker/training/env/env.yml` | Conda environment definition for training |
 | `docker/imageryprep/Dockerfile` | Imagery preparation image |
 | `docker/titiler/Dockerfile` | TiTiler COG tile server image |
-| `docker/ui/Dockerfile` | UI image (same as `ui/Dockerfile`) |
+| `docker/ui/Dockerfile` | Production UI image (nginx), for ACR; compose uses `ui/Dockerfile` |
 | `api/hastefuncapi/Dockerfile` | HTTP API Azure Functions image |
 | `api/hastefuncapi/startup.py` | Startup script (waits for Azurite, regenerates stats) |
 | `api/hastefuncapi/entrypoint.sh` | Container entrypoint (runs startup.py then Functions host) |

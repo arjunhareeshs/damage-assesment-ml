@@ -1,7 +1,9 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 
+import fcntl
 import glob
+import hashlib
 import json
 import os
 import shutil
@@ -39,6 +41,34 @@ def _normalize_azurite_url(url: Optional[str]) -> Optional[str]:
 # libraries for host-CUDA images, and where those images expect it.
 _HOST_CUDA_ENV = "HASTE_HOST_CUDA_DIR"
 _HOST_CUDA_TARGET = "/opt/host-cuda/nvidia"
+
+
+# Images whose tasks run torch models and so get the GPU (and the host CUDA
+# mount). Everything else (imagery prep, zipping) runs on CPU only.
+_GPU_IMAGES_ENV = "HASTE_GPU_IMAGES"
+_DEFAULT_GPU_IMAGES = "haste-training"
+
+
+def _image_wants_gpu(image: str) -> bool:
+    """True when ``image`` is one of the GPU task images.
+
+    Compares the repository name only, so ``haste-training``,
+    ``haste-training:latest`` and ``myacr.azurecr.io/haste-training:v2`` all
+    match ``haste-training``.
+    """
+    if not image:
+        return False
+    repo = image.rsplit("/", 1)[-1].split("@", 1)[0].split(":", 1)[0]
+    wanted = {
+        name.strip()
+        for name in os.getenv(_GPU_IMAGES_ENV, _DEFAULT_GPU_IMAGES).split(",")
+        if name.strip()
+    }
+    return repo in wanted
+
+
+def _gpu_enabled() -> bool:
+    return os.getenv("HASTE_ENABLE_GPU", "0").strip().lower() in {"1", "true", "yes"}
 
 
 def _host_cuda_volume(logger) -> Dict[str, Dict[str, str]]:
@@ -122,6 +152,15 @@ class LocalRunner(BaseRunner):
         # This way spawned containers can access it, and it's separate from blob storage
         self.work_dir = Path("/shared/azurite/task_work")
         self.work_dir.mkdir(parents=True, exist_ok=True)
+        # Download cache for resources marked {"cache": True} (immutable
+        # inputs such as a layer's imagery TIF). Lives on the same volume as
+        # task_work so cached files are hard-linked into task dirs, not
+        # copied: a large-AOI assessment downloads its TIF once instead of
+        # once per batch.
+        self.cache_dir = self.work_dir.parent / "task_cache"
+        self.cache_max_age_s = float(
+            os.getenv("HASTE_TASK_CACHE_MAX_AGE_HOURS", "24")
+        ) * 3600.0
 
         # Container images mapping - map ACR images to local ones
         self.container_images = {
@@ -334,15 +373,6 @@ class LocalRunner(BaseRunner):
                 f"[PIPELINE-TRACE] Using azurite volume: {azurite_volume_name}"
             )
 
-            # Host-CUDA mode (docker-compose.hostcuda.yml): the training image
-            # ships torch without CUDA libraries and expects the host's pip
-            # ``site-packages/nvidia`` folder at /opt/host-cuda/nvidia (its
-            # LD_LIBRARY_PATH points there). The path is a HOST path: task
-            # containers are siblings started through the host's Docker daemon.
-            host_cuda_mount = _host_cuda_volume(self.logger)
-            if host_cuda_mount:
-                volumes.update(host_cuda_mount)
-
             # Container working dir points directly to the task directory in the volume
             container_working_dir = f"/shared/azurite/{relative_task_path}"
 
@@ -378,6 +408,9 @@ class LocalRunner(BaseRunner):
             for passthrough_key in (
                 "HASTE_USER_FOOTPRINTS_MAX_BYTES",
                 "HASTE_MAX_IMAGERY_DOWNLOAD_BYTES",
+                "HASTE_ALIGN_USER_FOOTPRINTS",
+                "HASTE_FOOTPRINT_ALIGN_MODE",
+                "HASTE_AOI_MASK_MAX_DIM",
                 "HASTE_AOI_MAX_AREA_KM2",
                 "HASTE_AOI_MAX_UNITS",
                 "HASTE_DTF_NORMALIZATION",
@@ -468,7 +501,7 @@ class LocalRunner(BaseRunner):
             # mounts directly; the shared named volume is the one thing
             # already wired to reach them. Pointing these env vars at that
             # copy makes _find_local_checkpoint()/_find_local_backbone()
-            # (damage_triage.py, damage_triage_infer.py, external/
+            # (damage_triage_infer.py, external/
             # damage-triage-former/src/config.py) resolve everything
             # locally, so the task container never needs to talk to
             # Hugging Face at all.
@@ -547,6 +580,20 @@ class LocalRunner(BaseRunner):
                 self.logger.info(
                     f"[PIPELINE-TRACE] Using direct/fallback image: '{container_image}'"
                 )
+
+            # Only the model image gets the GPU. Its torch is built without
+            # CUDA libraries (TORCH_VARIANT=host) and loads the host's pip
+            # ``site-packages/nvidia`` folder from /opt/host-cuda/nvidia (its
+            # LD_LIBRARY_PATH points there). The path is a HOST path: task
+            # containers are siblings started through the host's Docker daemon.
+            use_gpu = _gpu_enabled() and _image_wants_gpu(container_image)
+            if _image_wants_gpu(container_image):
+                volumes.update(_host_cuda_volume(self.logger))
+            self.logger.info(
+                "[PIPELINE-TRACE] GPU for %s: %s",
+                container_image,
+                "requested" if use_gpu else "no (CPU task)",
+            )
 
             self.logger.info(
                 "[PIPELINE-TRACE] ========== COMMAND PREPARATION =========="
@@ -714,11 +761,7 @@ class LocalRunner(BaseRunner):
                 # Use detach=True to get the container object so we can check exit code
                 # Configure GPU access if requested via environment variables
                 device_requests = None
-                if os.getenv("HASTE_ENABLE_GPU", "0").lower() in {
-                    "1",
-                    "true",
-                    "yes",
-                }:
+                if use_gpu:
                     try:
                         gpu_devices = (
                             os.getenv("HASTE_GPU_DEVICES", "all")
@@ -1176,6 +1219,65 @@ class LocalRunner(BaseRunner):
 
         return candidates
 
+    def _download_blob_to(self, blob_url: str, target: Path) -> None:
+        """Download one blob to ``target``, trying each client candidate."""
+        last_error = None
+        for candidate in self._build_blob_client_candidates(blob_url):
+            try:
+                with open(target, "wb") as f:
+                    candidate.download_blob().readinto(f)
+                return
+            except Exception as err:
+                last_error = err
+                if target.exists():
+                    target.unlink()
+        raise RuntimeError(f"download of {blob_url} failed: {last_error}")
+
+    def _evict_cache(self) -> None:
+        """Remove cache entries unused for longer than the max age."""
+        if not self.cache_dir.exists():
+            return
+        cutoff = time.time() - self.cache_max_age_s
+        for entry in self.cache_dir.iterdir():
+            try:
+                if entry.is_dir() and entry.stat().st_mtime < cutoff:
+                    shutil.rmtree(entry, ignore_errors=True)
+            except OSError:
+                continue
+
+    def _fetch_cached(self, blob_url: str, target: Path) -> None:
+        """Place ``blob_url`` at ``target`` through the shared cache.
+
+        One download per URL: concurrent tasks wait on a per-entry file lock,
+        the first downloads to a temporary name and renames it into place,
+        the rest hard-link the finished file (copy if linking is impossible).
+        Only for immutable blobs (the URL must identify the content).
+        """
+        if not self.blob_client:
+            raise RuntimeError("no blob client")
+        key = hashlib.sha1(blob_url.encode("utf-8")).hexdigest()
+        entry = self.cache_dir / key
+        entry.mkdir(parents=True, exist_ok=True)
+        cached = entry / (os.path.basename(urlparse(blob_url).path) or "blob")
+        with open(entry / ".lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                if not cached.exists():
+                    self._evict_cache()
+                    entry.mkdir(parents=True, exist_ok=True)
+                    tmp = cached.with_name(cached.name + ".part")
+                    self._download_blob_to(blob_url, tmp)
+                    os.replace(tmp, cached)
+                os.utime(entry)  # mark as recently used
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+        if target.exists():
+            target.unlink()
+        try:
+            os.link(cached, target)
+        except OSError:
+            shutil.copy2(cached, target)
+
     def _download_resource_files(self, task_dir: Path, resource_files: dict):
         """Download resource files from blob storage to local task directory."""
         try:
@@ -1201,6 +1303,19 @@ class LocalRunner(BaseRunner):
 
                     local_file_path = task_dir / target_rel_path
                     local_file_path.parent.mkdir(parents=True, exist_ok=True)
+
+                    if file_info.get("cache"):
+                        try:
+                            self._fetch_cached(blob_url, local_file_path)
+                            self.logger.info(
+                                f"Resource '{file_key}' served from the task cache"
+                            )
+                            continue
+                        except Exception as cache_err:
+                            self.logger.warning(
+                                f"Task cache unavailable for '{file_key}' "
+                                f"({cache_err}); downloading directly"
+                            )
 
                     download_succeeded = False
                     last_error = None

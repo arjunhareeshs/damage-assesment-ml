@@ -510,54 +510,70 @@ class ImageryUtils:
             vrt_input_files = []
             temp_files = []
 
-            # Process each file with gdalwarp using nearest neighbor resampling
-            # This handles rotated geotransforms without changing projection
+            # GDAL's VRT builder stacks sources as they are: it does not
+            # reproject. A tile in another CRS would be placed using its own
+            # coordinates as if they were the first tile's, so every tile is
+            # first brought onto the first tile's CRS. Rotated geotransforms
+            # are warped north-up in their own CRS (nearest neighbour, no
+            # value change). A file without a CRS cannot be placed at all.
+            ref_crs = None
             for i, tif_file in enumerate(tif_files):
                 with rasterio.open(tif_file) as src:
-                    # Check if the file has a rotated geotransform
+                    if src.crs is None:
+                        raise ValueError(
+                            f"{os.path.basename(tif_file)} has no coordinate "
+                            "reference system; it cannot be placed in a mosaic."
+                        )
+                    if ref_crs is None:
+                        ref_crs = src.crs
                     geotransform = src.transform
                     has_rotation = geotransform.b != 0 or geotransform.d != 0
+                    src_crs = src.crs
+                    other_crs = src_crs != ref_crs
 
-                    if has_rotation:
-                        logger.info(
-                            f"Processing rotated geotransform for {tif_file}"
-                        )
-                        temp_file = (
-                            os.path.splitext(tif_file)[0]
-                            + f"_temp_warped_{i}.tif"
-                        )
+                if not has_rotation and not other_crs:
+                    vrt_input_files.append(tif_file)
+                    continue
 
-                        # Use gdalwarp with nearest neighbor to handle rotation
-                        # while preserving original projection
-                        warp_options = gdal.WarpOptions(
-                            resampleAlg="near",  # Nearest neighbor resampling
-                            creationOptions=["COMPRESS=DEFLATE", "TILED=YES"],
-                        )
-
-                        result = gdal.Warp(
-                            temp_file, tif_file, options=warp_options
-                        )
-                        if result is None:
-                            error_msg = gdal.GetLastErrorMsg()
-                            raise RuntimeError(
-                                f"Failed to warp {tif_file}: {error_msg}"
-                            )
-
-                        result.FlushCache()
-                        result = None
-                        temp_files.append(temp_file)
-                        vrt_input_files.append(temp_file)
-                        logger.info(f"Warped file created: {temp_file}")
-                    else:
-                        # File doesn't have rotation, use as-is
-                        vrt_input_files.append(tif_file)
+                temp_file = (
+                    os.path.splitext(tif_file)[0] + f"_temp_warped_{i}.tif"
+                )
+                if other_crs:
+                    logger.info(
+                        "Reprojecting %s from %s to the mosaic CRS %s",
+                        tif_file, src_crs, ref_crs,
+                    )
+                    warp_options = gdal.WarpOptions(
+                        dstSRS=ref_crs.to_wkt(),
+                        resampleAlg="bilinear",
+                        creationOptions=["COMPRESS=DEFLATE", "TILED=YES", "BIGTIFF=IF_SAFER"],
+                    )
+                else:
+                    logger.info(f"Processing rotated geotransform for {tif_file}")
+                    warp_options = gdal.WarpOptions(
+                        resampleAlg="near",
+                        creationOptions=["COMPRESS=DEFLATE", "TILED=YES", "BIGTIFF=IF_SAFER"],
+                    )
+                result = gdal.Warp(temp_file, tif_file, options=warp_options)
+                if result is None:
+                    error_msg = gdal.GetLastErrorMsg()
+                    raise RuntimeError(f"Failed to warp {tif_file}: {error_msg}")
+                result.FlushCache()
+                result = None
+                temp_files.append(temp_file)
+                vrt_input_files.append(temp_file)
+                logger.info(f"Warped file created: {temp_file}")
 
             try:
                 vrt_path = Path(output_file_path).with_suffix(".vrt")
 
                 # Create a VRT (Virtual Raster) file to combine multiple TIFF files into a single virtual dataset
+                # Mixed resolutions: keep the finest, so no tile is
+                # downsampled by the coarsest one (GDAL's default is the
+                # average, which blurs the sharpest imagery).
                 vrt_options = gdal.BuildVRTOptions(
-                    **ImageryUtils._mosaic_nodata_options(vrt_input_files)
+                    resolution="highest",
+                    **ImageryUtils._mosaic_nodata_options(vrt_input_files),
                 )
                 vrt = gdal.BuildVRT(
                     str(vrt_path), vrt_input_files, options=vrt_options

@@ -7,7 +7,6 @@ import {
 } from "@fluentui/react";
 import DrawingToolbar from "./DrawingToolbar";
 import AoiDrawTool from "./AoiDrawTool";
-import RunDtfAoiButton from "./RunDtfAoiButton";
 import AoiAssessmentModal from "./AoiAssessmentModal";
 import PropType from "prop-types";
 import { useEffect, useState } from "react";
@@ -75,19 +74,6 @@ const LabelingToolRightPanel = ({
     };
   }, [aoiGeoJson, imageLayerId]);
 
-  function handleRunDtfAoi() {
-    setModalComponent(
-      <RunDtfAoiButton
-        onClose={() => setModalComponent(null)}
-        projectId={projectId}
-        imageLayerId={imageLayerId}
-        aoiGeoJson={aoiGeoJson}
-        selectedBuildingIds={selectedBuildingIds}
-        fetchProjectDetails={() => {}}
-      />
-    );
-  }
-
   function handleRunLargeAoiAssessment() {
     setModalComponent(
       <AoiAssessmentModal
@@ -95,6 +81,7 @@ const LabelingToolRightPanel = ({
         projectId={projectId}
         imageLayerId={imageLayerId}
         aoiGeoJson={aoiGeoJson}
+        selectedBuildingIds={selectedBuildingIds}
         onAssessmentCreated={(newAssessmentId) => {
           if (onAssessmentCreated) {
             onAssessmentCreated(newAssessmentId);
@@ -134,18 +121,18 @@ const LabelingToolRightPanel = ({
             ) : layerBuildings.error ? (
               <span style={{ color: "#a4262c" }}>Could not load the building footprints.</span>
             ) : layerBuildings.total === 0 ? (
-              <span style={{ color: "#a4262c" }}>
-                This layer has no building footprints, so there is nothing to
-                assess. Re-create it with a footprints file.
+              <span style={{ color: "#666" }}>
+                No building footprints in this view. Pan to the imagery, or
+                re-create the layer with a footprints file if it has none.
               </span>
             ) : (
               <>
                 <span className="fw-semibold">
                   {layerBuildings.total.toLocaleString()} buildings
                 </span>{" "}
-                in this image
+                in this view
                 {layerBuildings.truncated
-                  ? ` (showing the first ${layerBuildings.shown.toLocaleString()})`
+                  ? ` (showing ${layerBuildings.shown.toLocaleString()}; zoom in to see all)`
                   : ""}
                 <div className="d-flex gap-3 mt-1" style={{ color: "#555" }}>
                   <span><span style={{ border: "2px solid #888", display: "inline-block", width: 10, height: 10, marginRight: 4 }} />building</span>
@@ -225,27 +212,14 @@ const LabelingToolRightPanel = ({
 
         <div className="col-12 d-flex flex-column pt-2 mt-2 border-top">
           <PrimaryButton
-            id="runDtfAoiButton"
-            className="w-100"
-            text="Run DamageTriageFormer"
+            id="runLargeAoiAssessmentButton"
+            className="w-100 mt-2"
+            text="Run Large-AOI Assessment"
             disabled={nothingToRun}
             title={
               nothingToRun
                 ? "Draw an area or select buildings first"
-                : "Classify the selected buildings"
-            }
-            onClick={handleRunDtfAoi}
-          />
-
-          <PrimaryButton
-            id="runLargeAoiAssessmentButton"
-            className="w-100 mt-2"
-            text="Run Large-AOI Assessment"
-            disabled={!aoiGeoJson}
-            title={
-              !aoiGeoJson
-                ? "Draw a polygon or rectangle first"
-                : "Launch batched large-AOI assessment"
+                : "Run DamageTriageFormer on the drawn area or the selected buildings"
             }
             onClick={handleRunLargeAoiAssessment}
           />

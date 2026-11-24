@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
 # Build the HASTE Docker images. Builds only: it does not start any container
 # or download model files. Outside Docker's image cache it only writes
-# HASTE_HOST_CUDA_DIR into Haste-DTF/haste-fork/docker/.env (host-CUDA mode).
+# the build mode, HASTE_HOST_CUDA_DIR and DOCKER_GID into Haste-DTF/haste-fork/docker/.env.
 #
 #   ./build.sh                 auto (default): GPU build when this machine has
 #                              an NVIDIA GPU, Docker's nvidia runtime and CUDA 12
 #                              libraries; otherwise the CPU build
-#   ./build.sh --host-cuda     force the GPU build: only torch + torchvision
-#                              are downloaded, CUDA is used from this machine
+#   ./build.sh --gpu           force the GPU build (alias: --host-cuda)
 #   ./build.sh --cpu           force the CPU build (CPU torch, no CUDA at all)
-#   ./build.sh --bundled-cuda  self-contained GPU images (CUDA 12.4 baked in,
-#                              ~8 GB more to download; what Azure Batch needs)
 #   ./build.sh --no-cache      rebuild every layer
 #
-# Only haste-training contains torch; no other image needs a GPU. In the GPU
-# build the models still fall back to the CPU when no GPU can be attached.
+# There is one compose file (docker-compose.yml); the mode is stored in
+# docker/.env, so a plain `docker compose up -d` afterwards uses it.
+# GPU build: only torch + torchvision are downloaded (the CUDA build, without
+# CUDA libraries); CUDA itself is used from this machine. Only model inference
+# (haste-training) gets the GPU, and falls back to CPU when none can be
+# attached; all other services and tasks run on CPU.
 #
 # The GPU build needs a pip `site-packages/nvidia` folder with CUDA 12
 # libraries (what `pip install torch` installs on the host). It is found from
@@ -29,7 +30,7 @@
 #
 # Also writes DOCKER_GID (the Docker socket's group, as the current docker
 # context's engine sees it) to docker/.env: the queue worker needs it to start
-# task containers. CPU/bundled builds remove a stale HASTE_HOST_CUDA_DIR.
+# task containers. The build mode is recorded there too (see "case" below).
 #
 # Safe to re-run: unchanged layers come from the cache. A failed attempt (for
 # example a dropped download) is retried, and finished layers are kept.
@@ -49,8 +50,7 @@ mode_name=auto
 extra=()
 for arg in "$@"; do
     case "$arg" in
-        --host-cuda) mode_name=host ;;
-        --bundled-cuda|--gpu) mode_name=bundled ;;
+        --gpu|--host-cuda) mode_name=host ;;
         --cpu) mode_name=cpu ;;
         --no-cache) extra+=(--no-cache) ;;
         -h|--help) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -139,7 +139,7 @@ if [ "$mode_name" = auto ] || [ "$mode_name" = host ]; then
         [ -z "$libs_problem" ] || die "$libs_problem
   Install CUDA 12 runtime wheels on the host (e.g. pip install --user torch), or
   point HASTE_HOST_CUDA_DIR at a site-packages/nvidia folder that has them,
-  or build with --cpu / --bundled-cuda instead."
+  or build with --cpu instead."
         [ -z "$gpu_problem_msg" ] \
             || echo "[build.sh] WARNING: $gpu_problem_msg; models will run on CPU until a GPU is available."
     fi
@@ -147,23 +147,20 @@ fi
 
 case "$mode_name" in
     host)
+        # Compose defaults are the GPU mode; only the CUDA path is needed.
         export HASTE_HOST_CUDA_DIR="$cuda_dir"
         set_env_var HASTE_HOST_CUDA_DIR "$cuda_dir"
-        files+=(-f "$COMPOSE_DIR/docker-compose.hostcuda.yml")
-        overlay=docker-compose.hostcuda.yml
-        mode="GPU: torch + torchvision only, CUDA from this machine ($cuda_dir, saved to docker/.env)"
-        ;;
-    bundled)
-        # CUDA ships inside the image: a host CUDA path left over from an
-        # earlier --host-cuda build must not be mounted into tasks.
-        unset_env_var HASTE_HOST_CUDA_DIR
-        files+=(-f "$COMPOSE_DIR/docker-compose.gpu.yml")
-        overlay=docker-compose.gpu.yml
-        mode="GPU with CUDA 12.4 bundled in the training image"
+        unset_env_var HASTE_TORCH_VARIANT
+        unset_env_var HASTE_ENABLE_GPU
+        unset HASTE_TORCH_VARIANT HASTE_ENABLE_GPU
+        mode="GPU for model inference: torch + torchvision only, CUDA from this machine ($cuda_dir)"
         ;;
     cpu)
-        unset_env_var HASTE_HOST_CUDA_DIR  # no host CUDA in a CPU build
-        overlay=""
+        unset_env_var HASTE_HOST_CUDA_DIR
+        set_env_var HASTE_TORCH_VARIANT cpu
+        set_env_var HASTE_ENABLE_GPU 0
+        export HASTE_TORCH_VARIANT=cpu HASTE_ENABLE_GPU=0
+        unset HASTE_HOST_CUDA_DIR
         mode="CPU only (CPU torch in haste-training)"
         ;;
 esac
@@ -244,11 +241,11 @@ echo "[build.sh] Smoke-testing the images..."
 smoke haste-imageryprep docker run --rm --network none -w /tmp -e WORKDIR=/tmp --entrypoint python haste-imageryprep -c \
     "import hastegeo.workflows.prepare_imagery, hastegeo.core.utils.footprint_sources; print('imports ok')"
 smoke haste-api docker run --rm --network none -w /tmp -e WORKDIR=/tmp --entrypoint python haste-api -c \
-    "import hastegeo.core.processors.uploader, hastegeo.core.processors.damage_triage; print('imports ok')"
+    "import hastegeo.core.processors.uploader, hastegeo.core.processors.aoi_assessment; print('imports ok')"
 smoke haste-queues docker run --rm --network none -w /tmp -e WORKDIR=/tmp --entrypoint python haste-queues -c \
     "import docker, hastegeo.core.runners.local; print('imports ok')"
 train_py="import torch, torchvision, transformers, torchgeo, lightning, cv2, rasterio, geopandas
-import hastegeo.workflows.damage_triage_infer, hastegeo.workflows.embed_buildings
+import hastegeo.workflows.damage_triage_infer, hastegeo.workflows.damage_triage_region_infer, hastegeo.workflows.embed_buildings
 print('torch', torch.__version__, '| cuda available:', torch.cuda.is_available())"
 if [ "$mode_name" = host ]; then
     smoke "haste-training (GPU via $cuda_dir)" docker run --rm --network none -w /tmp -e WORKDIR=/tmp --gpus all \
@@ -258,8 +255,6 @@ assert torch.cuda.is_available(), 'torch cannot use the GPU with the mounted CUD
 x = torch.randn(256, 256, device='cuda'); (x @ x).sum().item()
 torch.nn.Conv2d(3, 8, 3).cuda()(torch.randn(1, 3, 32, 32, device='cuda'))
 print('GPU', torch.cuda.get_device_name(0), '| cuDNN', torch.backends.cudnn.version(), '| matmul + conv ok')"
-elif [ "$mode_name" = bundled ]; then
-    smoke haste-training docker run --rm --network none -w /tmp -e WORKDIR=/tmp --gpus all --entrypoint python haste-training -c "$train_py"
 else
     smoke haste-training docker run --rm --network none -w /tmp -e WORKDIR=/tmp --entrypoint python haste-training -c "$train_py"
 fi
@@ -273,4 +268,4 @@ echo "[build.sh] Images:"
 docker images --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}' \
     | grep -E '^REPOSITORY|^haste-' || true
 echo "[build.sh] Start the stack with:"
-echo "  cd $COMPOSE_DIR && docker compose -f docker-compose.yml${overlay:+ -f $overlay} up -d"
+echo "  cd $COMPOSE_DIR && docker compose up -d"

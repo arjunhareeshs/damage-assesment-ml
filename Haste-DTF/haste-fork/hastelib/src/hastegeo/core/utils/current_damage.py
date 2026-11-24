@@ -73,6 +73,9 @@ def publish_current_results(assessment_id: str, conn=None) -> int:
     connection = conn or get_connection()
     try:
         ensure_schema(connection)
+        from .assessment_store import ensure_review_schema
+
+        ensure_review_schema(connection)
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -81,12 +84,14 @@ def publish_current_results(assessment_id: str, conn=None) -> int:
                     damage_class_name  = d.damage_class_name,
                     confidence         = d.confidence,
                     result_status      = d.result_status,
+                    review_status      = d.review_status,
                     last_assessment_id = d.assessment_id,
                     updated_at         = NOW()
                 FROM hg_damage_assessments d
                 WHERE d.assessment_id = %s
                   AND d.result_status = %s
                   AND d.damage_class IS NOT NULL
+                  AND d.review_status <> 'rejected'
                   AND b.image_layer_id = d.image_layer_id
                   AND b.building_id = d.building_id
                   AND (b.updated_at IS NULL OR b.updated_at <= d.updated_at)
@@ -132,7 +137,7 @@ def _query_rows(image_layer_id, bbox, limit, after_building_id, conn, geom_digit
     if image_layer_id is None and not bbox:
         raise ValueError("bbox is required when imageLayerId is not given.")
 
-    where = ["damage_class IS NOT NULL"]
+    where = ["damage_class IS NOT NULL", "review_status <> 'rejected'"]
     params: List[Any] = []
     if image_layer_id is not None:
         where.append("image_layer_id = %s")
@@ -252,6 +257,7 @@ def export_geoparquet(image_layer_id: str, path: str, conn=None) -> int:
                        last_assessment_id, updated_at
                 FROM hg_buildings
                 WHERE image_layer_id = %s AND damage_class IS NOT NULL
+                  AND review_status <> 'rejected'
                 ORDER BY building_id
                 """,
                 (image_layer_id,),

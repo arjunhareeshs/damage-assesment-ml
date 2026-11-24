@@ -17,11 +17,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY --chown=appuser:appgroup hastelib/src/hastegeo /home/site/wwwroot/hastegeo
 COPY --chown=appuser:appgroup hastelib/ /tmp/hastelib/
 # Install hastegeo from this repo's hastelib/ (its dependencies are in
-# requirements.txt). HASTE_SKIP_VERSION_BUMP avoids the haste_build.py hook
-# bumping __about__.py and attempting an Azure blob upload during the build.
-# Dependencies are already installed above, so this only builds and installs
-# hastegeo itself (--no-deps: nothing new to download).
-RUN HASTE_SKIP_VERSION_BUMP=1 pip install --no-cache-dir --no-deps /tmp/hastelib/ \
+# requirements.txt). Dependencies are already installed above, so this only
+# builds and installs hastegeo itself (--no-deps: nothing new to download).
+RUN pip install --no-cache-dir --no-deps /tmp/hastelib/ \
     && rm -rf /tmp/hastelib
 COPY --chown=appuser:appgroup api/hastefuncapi/ .
 

@@ -307,9 +307,12 @@ class ImageryPostProcessor:
                 self.image_data.userBuildingFootprintsUrl
             ),
             # One COG per source TIF in the imagery catalogue (large-AOI
-            # assessments) instead of only the mosaic. Off by default.
-            "catalog_mode": os.getenv("HASTE_IMAGERY_CATALOG_MODE", "").lower()
-            in ("1", "true", "yes"),
+            # assessments) instead of only the mosaic, so each assessment
+            # batch fetches just the TIF its windows lie in rather than the
+            # whole layer mosaic. On by default; "false" catalogues the
+            # mosaic only.
+            "catalog_mode": os.getenv("HASTE_IMAGERY_CATALOG_MODE", "true").lower()
+            not in ("0", "false", "no", "off"),
         }
         pending_update = getattr(self.image_data, "pendingImageryUpdateUrls", None)
         if pending_update:
@@ -523,8 +526,12 @@ class ImageryPostProcessor:
         building_footprints_error = processed_manifest.get(
             "building_footprints_error", ""
         )
+        self.image_data.footprintSource = processed_manifest.get("footprint_source") or None
+        self.image_data.footprintVersion = processed_manifest.get("footprint_version") or None
         if building_footprints_filename and not building_footprints_error:
-            self._load_footprints_into_postgis(
+            # Loading into hg_buildings is what makes buildings assessable,
+            # so a failure here is reported on the layer, never only logged.
+            building_footprints_error = self._load_footprints_into_postgis(
                 building_footprints_filename, preserve_results=bool(update_report)
             )
         if update_report:
@@ -532,16 +539,17 @@ class ImageryPostProcessor:
         self._register_imagery_catalog(processed_manifest.get("catalog_records", []))
         if update_report:
             self._apply_imagery_update(update_report)
+        self.image_data.buildingFootprintsError = building_footprints_error or None
         if building_footprints_error:
-            self.image_data.status = (
-                self.config.get_status_types().FAILED.value
-            )
-            self.image_data.preprocessJob.status = self.image_data.status
+            # The imagery is ready and stays viewable; only damage
+            # assessment is blocked until buildings are available (the UI
+            # disables "Run" while buildingFootprintsError is set).
+            self.image_data.buildingCount = 0
             self._update_imagery_progress(
-                f"Building footprints unavailable — {building_footprints_error}",
+                "Imagery ready, but buildings are unavailable so damage "
+                f"assessment is disabled: {building_footprints_error}",
                 step=self.image_data.currentStep,
             )
-            self.image_data.preprocessJob.logs = self.image_data.statusMessage
 
         # Valid-area mask GeoJSON. Surfaced as a downloadable artifact;
         # a missing mask is not by itself a layer failure (the matching
@@ -649,22 +657,15 @@ class ImageryPostProcessor:
 
     def _load_footprints_into_postgis(
         self, building_footprints_filename, preserve_results=False
-    ):
-        """Load the freshly-produced footprints GPKG into ``hg_buildings``.
+    ) -> str:
+        """Load the footprints GPKG produced by the task into ``hg_buildings``.
 
-        Runs here (in the API/worker process, which has PostGIS
-        connectivity/credentials) rather than inside the imageryprep
-        Docker subprocess. This backs the AOI-scoped DamageTriageFormer
-        path (``modelType="dtf-aoi"``, see
-        ``hastegeo.core.utils.postgis_query.buildings_in_aoi``) with a
-        live spatial index of every building in this layer. A failure here
-        is logged but does not fail the image layer — the whole-layer
-        ``modelType="dtf"`` path and the map/labeling tool don't depend on
-        ``hg_buildings`` at all, only the AOI path does.
+        Runs here (the worker has database access; the task container does
+        not). Returns ``""`` on success, otherwise a user-readable reason that
+        the caller records on the layer (``buildingFootprintsError``), so a
+        failed load is visible instead of surfacing later as "no buildings".
 
-        The GPKG is a binary SQLite file, so it must be fetched as raw
-        bytes (``as_chunk=True``) rather than the UTF-8-decoded text path
-        ``get_filecontent_from_task`` takes by default.
+        The GPKG is binary, so it is fetched as raw bytes (``as_chunk=True``).
         """
         try:
             chunks = self.runner.get_filecontent_from_task(
@@ -674,34 +675,39 @@ class ImageryPostProcessor:
                 as_chunk=True,
             )
             if not chunks:
-                self.logger.warning(
-                    "Building-footprints GPKG %s not found on task output; "
-                    "skipping hg_buildings load for image layer %s",
-                    building_footprints_filename,
-                    self.image_data.imageLayerId,
+                return (
+                    f"building footprints file {building_footprints_filename} "
+                    "was not found in the preparation outputs"
                 )
-                return
             with tempfile.NamedTemporaryFile(suffix=".gpkg") as tmp:
                 for chunk in chunks:
                     tmp.write(chunk)
                 tmp.flush()
                 count = postgis_load.load_footprints_into_postgis(
-                    self.image_data, tmp.name, preserve_results=preserve_results
+                    self.image_data,
+                    tmp.name,
+                    preserve_results=preserve_results,
+                    footprint_source=self.image_data.footprintSource,
+                    footprint_version=self.image_data.footprintVersion,
                 )
+            self.image_data.buildingCount = count
             self.logger.info(
                 "Loaded %d buildings into hg_buildings for image layer %s",
                 count,
                 self.image_data.imageLayerId,
             )
+            if count == 0:
+                return "no building footprints lie inside the imagery"
+            return ""
         except Exception as exc:
             self.logger.error(
                 "Failed loading building footprints into PostGIS for "
-                "image layer %s (AOI-scoped DamageTriageFormer runs will "
-                "see no buildings until this is retried): %s",
+                "image layer %s: %s",
                 self.image_data.imageLayerId,
                 exc,
                 exc_info=True,
             )
+            return f"buildings could not be loaded into the database ({exc}); re-run imagery preparation"
 
     def _register_imagery_catalog(self, catalog_records):
         """Register this layer's catalogued rasters in ``hg_imagery``.

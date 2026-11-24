@@ -22,12 +22,11 @@ const ImageLayerInfoMobile = ({ item }) => {
   const navigate = useNavigate();
 
   const dtfModels =
-    (item.models || []).filter((m) => m.modelType === "dtf") || [];
+    (item.models || []).filter((m) => m.modelType === "dtf-aoi") || [];
 
-  // DamageTriageFormer runs from the Labeling Tool: draw an area (or use the
-  // whole image) and run it per building or as a Large-AOI assessment. The
-  // old whole-layer tile workflow (CreateEditDTFModal) can't load the
-  // crop-mode checkpoint this deployment ships, so it isn't offered here.
+  // DamageTriageFormer runs from the Labeling Tool as a Large-AOI assessment
+  // (draw an area or use the whole image). The whole-layer and per-AOI DTF
+  // workflows were removed.
   return (
     <React.Fragment key={"imageLayerInfoMobile_" + item.projectId + "_" + item.imageLayerId}>
       <tr>
@@ -89,7 +88,11 @@ const ImageLayerInfoMobile = ({ item }) => {
               onClick={() =>
                 navigate(`/labeling-tool/${item.projectId}/${item.imageLayerId}`)
               }
-              disabled={item.status !== "Processed" || !item.buildingFootprintsUrl}
+              disabled={
+                item.status !== "Processed" ||
+                !item.buildingFootprintsUrl ||
+                Boolean(item.buildingFootprintsError)
+              }
             >
               Run DamageTriageFormer
             </DefaultButton>

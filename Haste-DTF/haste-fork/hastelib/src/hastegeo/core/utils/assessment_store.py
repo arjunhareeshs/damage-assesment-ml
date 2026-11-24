@@ -962,7 +962,10 @@ def buildings_without_completed_units(assessment_id: str, conn=None) -> List[str
 
 
 def eligible_buildings_with_overlap(
-    image_layer_id: str, aoi_geojson: Dict[str, Any], conn=None
+    image_layer_id: str,
+    aoi_geojson: Dict[str, Any],
+    conn=None,
+    building_ids: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Buildings intersecting the AOI, with boundary flags.
 
@@ -992,9 +995,10 @@ def eligible_buildings_with_overlap(
                 FROM hg_buildings b, aoi
                 WHERE b.image_layer_id = %s
                   AND ST_Intersects(b.geometry, aoi.g)
+                  AND (%s::text[] IS NULL OR b.building_id = ANY(%s::text[]))
                 ORDER BY b.building_id
                 """,
-                (json.dumps(aoi_geojson), image_layer_id),
+                (json.dumps(aoi_geojson), image_layer_id, building_ids, building_ids),
             )
             rows = cursor.fetchall()
     finally:
@@ -1010,6 +1014,37 @@ def eligible_buildings_with_overlap(
         }
         for r in rows
     ]
+
+
+def selection_envelope(
+    image_layer_id: str, building_ids: Iterable[str], conn=None
+) -> Optional[Dict[str, Any]]:
+    """GeoJSON bounding box of an explicit building selection (EPSG:4326).
+
+    A selection-only assessment still needs an AOI polygon (area limits,
+    imagery lookup, duplicate detection); this is it. ``None`` if none of the
+    ids exist in the layer.
+    """
+    ids = list(building_ids)
+    if not ids:
+        return None
+    owns_conn = conn is None
+    connection = conn or get_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT ST_AsGeoJSON(ST_Envelope(ST_Collect(geometry)))
+                FROM hg_buildings
+                WHERE image_layer_id = %s AND building_id = ANY(%s)
+                """,
+                (image_layer_id, ids),
+            )
+            row = cursor.fetchone()
+    finally:
+        if owns_conn:
+            connection.close()
+    return json.loads(row[0]) if row and row[0] else None
 
 
 def get_building_geometries(
@@ -1139,6 +1174,126 @@ def get_evidence(assessment_id: str, conn=None) -> List[Dict[str, Any]]:
 get_prediction_evidence = get_evidence
 
 
+REVIEW_STATUSES = ("unclassified", "pending_review", "accepted", "rejected")
+_REVIEW_SCHEMA_READY = False
+
+
+def ensure_review_schema(connection) -> None:
+    """Apply migration 0007 if it has not run (existing volumes skip init)."""
+    global _REVIEW_SCHEMA_READY
+    if _REVIEW_SCHEMA_READY:
+        return
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "ALTER TABLE hg_damage_assessments ADD COLUMN IF NOT EXISTS "
+            "review_status TEXT NOT NULL DEFAULT 'pending_review'"
+        )
+        cursor.execute(
+            "ALTER TABLE hg_damage_assessments ADD COLUMN IF NOT EXISTS reviewed_by TEXT"
+        )
+        cursor.execute(
+            "ALTER TABLE hg_damage_assessments ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ"
+        )
+    connection.commit()
+    _REVIEW_SCHEMA_READY = True
+
+
+def initial_review_status(result_status: str, require_review: bool) -> str:
+    """Review state a fresh result starts in.
+
+    Only ``completed`` results are reviewable. Uncertain, insufficient-data and
+    failed results are never published, so they stay ``unclassified``.
+    """
+    if result_status != "completed":
+        return "unclassified"
+    return "pending_review" if require_review else "accepted"
+
+
+def review_buildings(
+    image_layer_id: str,
+    building_ids: Optional[List[str]],
+    review_status: str,
+    assessment_id: Optional[str] = None,
+    reviewed_by: Optional[str] = None,
+    only_status: Optional[str] = None,
+    conn=None,
+) -> int:
+    """Accept / reject / reset results. Returns buildings updated.
+
+    ``building_ids=None`` means every building of ``assessment_id`` (bulk
+    "accept all"); ``only_status`` narrows a bulk action, e.g. accept only
+    what is still ``pending_review``. Without ``assessment_id`` each building
+    is resolved to the assessment that last published it. Only ``completed``
+    results can be reviewed. ``hg_buildings.review_status`` is kept in step so
+    the map and the current-damage exports reflect the decision at once.
+    """
+    if review_status not in REVIEW_STATUSES or review_status == "unclassified":
+        raise ValueError(f"Invalid review_status: {review_status}")
+    if building_ids is None and not assessment_id:
+        raise ValueError("A bulk review needs an assessmentId.")
+    if only_status is not None and only_status not in REVIEW_STATUSES:
+        raise ValueError(f"Invalid only_status: {only_status}")
+
+    owns_conn = conn is None
+    connection = conn or get_connection()
+    try:
+        ensure_review_schema(connection)
+        with connection.cursor() as cursor:
+            where = ["d.image_layer_id = %s", "d.result_status = 'completed'"]
+            params: List[Any] = [image_layer_id]
+            if assessment_id:
+                where.append("d.assessment_id = %s")
+                params.append(assessment_id)
+            else:
+                where.append(
+                    "d.assessment_id = (SELECT last_assessment_id FROM hg_buildings "
+                    "b WHERE b.image_layer_id = d.image_layer_id "
+                    "AND b.building_id = d.building_id)"
+                )
+            if building_ids is not None:
+                where.append("d.building_id = ANY(%s)")
+                params.append(list(building_ids))
+            if only_status is not None:
+                where.append("d.review_status = %s")
+                params.append(only_status)
+            cursor.execute(
+                f"""
+                UPDATE hg_damage_assessments d
+                SET review_status = %s, reviewed_by = %s,
+                    reviewed_at = NOW(), updated_at = NOW()
+                WHERE {" AND ".join(where)}
+                RETURNING d.assessment_id, d.building_id
+                """,
+                [review_status, reviewed_by] + params,
+            )
+            changed = cursor.fetchall()
+            if changed:
+                cursor.execute(
+                    """
+                    UPDATE hg_buildings b
+                    SET review_status = %s
+                    FROM unnest(%s::text[], %s::text[]) AS c(aid, bid)
+                    WHERE b.image_layer_id = %s
+                      AND b.building_id = c.bid
+                      AND b.last_assessment_id = c.aid
+                    """,
+                    (
+                        review_status,
+                        [r[0] for r in changed],
+                        [r[1] for r in changed],
+                        image_layer_id,
+                    ),
+                )
+        connection.commit()
+        return len(changed)
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        if owns_conn:
+            connection.close()
+
+
 def upsert_damage_assessments(assessment_id_or_results, results_or_conn=None, conn=None) -> int:
     """Upsert final aggregated damage results per building.
     Supports both signatures:
@@ -1160,6 +1315,7 @@ def upsert_damage_assessments(assessment_id_or_results, results_or_conn=None, co
     owns_conn = conn is None
     connection = conn or get_connection()
     try:
+        ensure_review_schema(connection)
         with connection.cursor() as cursor:
             cursor.executemany(
                 """
@@ -1169,14 +1325,14 @@ def upsert_damage_assessments(assessment_id_or_results, results_or_conn=None, co
                     damage_percentage, result_status,
                     boundary_intersecting, aoi_overlap_fraction,
                     winning_unit_id, model_digest, preprocessing_version, footprint_version,
-                    created_at, updated_at
+                    review_status, created_at, updated_at
                 ) VALUES (
                     %s, %s, %s,
                     %s, %s, %s,
                     NULL, %s,
                     %s, %s,
                     %s, %s, %s, %s,
-                    NOW(), NOW()
+                    %s, NOW(), NOW()
                 )
                 ON CONFLICT (assessment_id, building_id) DO UPDATE
                 SET damage_class = EXCLUDED.damage_class,
@@ -1207,6 +1363,10 @@ def upsert_damage_assessments(assessment_id_or_results, results_or_conn=None, co
                         r.get("model_digest"),
                         r.get("preprocessing_version"),
                         r.get("footprint_version"),
+                        r.get("review_status")
+                        or initial_review_status(
+                            r.get("result_status", "completed"), True
+                        ),
                     )
                     for r in results
                 ],
@@ -1347,6 +1507,7 @@ def get_assessment_map_data(
     owns_conn = conn is None
     connection = conn or get_connection()
     try:
+        ensure_review_schema(connection)
         with connection.cursor() as cursor:
             where_clauses = ["d.assessment_id = %s"]
             params: List[Any] = [assessment_id]
@@ -1361,20 +1522,26 @@ def get_assessment_map_data(
             where_sql = " AND ".join(where_clauses)
 
             if zoom < min_zoom:
-                # Low zoom: spatial grid clustering
+                # Low zoom: grid clustering. Each building's CENTROID is
+                # snapped to the grid: snapping the footprint polygon itself
+                # collapses buildings smaller than a cell to POLYGON EMPTY,
+                # which put every building into one cluster. The cell is a
+                # quarter of a map tile at this zoom (about 0.01 deg at z13).
+                cell = 360.0 / (2 ** (max(0, int(zoom)) + 2))
                 cursor.execute(
                     f"""
                     SELECT
-                        ST_AsGeoJSON(ST_Centroid(ST_Collect(b.geometry))),
+                        ST_AsGeoJSON(ST_Centroid(ST_Collect(ST_Centroid(b.geometry)))),
                         COUNT(*),
                         AVG(d.damage_class)
                     FROM hg_damage_assessments d
                     JOIN hg_buildings b ON d.building_id = b.building_id AND d.image_layer_id = b.image_layer_id
                     WHERE {where_sql}
-                    GROUP BY ST_SnapToGrid(b.geometry, 0.01)
+                    GROUP BY ST_SnapToGrid(ST_Centroid(b.geometry), %s)
+                    ORDER BY COUNT(*) DESC
                     LIMIT %s
                     """,
-                    params + [max_features],
+                    params + [cell, max_features],
                 )
                 clusters = cursor.fetchall()
                 features = [
@@ -1402,10 +1569,15 @@ def get_assessment_map_data(
                     f"""
                     SELECT
                         d.building_id, d.damage_class, d.damage_class_name, d.confidence,
-                        d.result_status, d.boundary_intersecting, ST_AsGeoJSON(b.geometry)
+                        d.result_status, d.boundary_intersecting, ST_AsGeoJSON(b.geometry),
+                        d.review_status, d.reviewed_by, d.reviewed_at,
+                        d.assessment_id, d.image_layer_id
                     FROM hg_damage_assessments d
                     JOIN hg_buildings b ON d.building_id = b.building_id AND d.image_layer_id = b.image_layer_id
                     WHERE {where_sql}
+                    -- deterministic: when truncated, the most damaged
+                    -- buildings in view are the ones shown
+                    ORDER BY d.damage_class DESC NULLS LAST, d.building_id
                     LIMIT %s
                     """,
                     params + [max_features + 1],
@@ -1427,6 +1599,11 @@ def get_assessment_map_data(
                             "confidence": r[3],
                             "result_status": r[4],
                             "boundary_intersecting": r[5],
+                            "review_status": r[7],
+                            "reviewed_by": r[8],
+                            "reviewed_at": r[9].isoformat() if r[9] else None,
+                            "assessment_id": r[10],
+                            "image_layer_id": r[11],
                         },
                     }
                     for r in rows
@@ -1448,13 +1625,15 @@ def get_building_history(image_layer_id: str, building_id: str, conn=None) -> Li
     owns_conn = conn is None
     connection = conn or get_connection()
     try:
+        ensure_review_schema(connection)
         with connection.cursor() as cursor:
             cursor.execute(
                 """
                 SELECT
                     d.assessment_id, a.name, a.created_at,
                     d.damage_class, d.damage_class_name, d.confidence,
-                    d.result_status, d.winning_unit_id
+                    d.result_status, d.winning_unit_id,
+                    d.review_status, d.reviewed_by, d.reviewed_at
                 FROM hg_damage_assessments d
                 JOIN hg_assessments a ON d.assessment_id = a.assessment_id
                 WHERE d.image_layer_id = %s AND d.building_id = %s
@@ -1473,6 +1652,9 @@ def get_building_history(image_layer_id: str, building_id: str, conn=None) -> Li
                     "confidence": r[5],
                     "result_status": r[6],
                     "winning_unit_id": r[7],
+                    "review_status": r[8],
+                    "reviewed_by": r[9],
+                    "reviewed_at": r[10].isoformat() if r[10] else None,
                 }
                 for r in rows
             ]

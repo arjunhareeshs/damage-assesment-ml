@@ -9,7 +9,7 @@ extract pixels."* ``crop_building`` is exactly that boundary — a
 building's geometry is consumed here only to pick a pixel window (via
 ``rasterio.windows``, which only pulls the needed blocks of a
 Cloud-Optimized GeoTIFF, never the whole raster); everything downstream
-(``hastegeo.workflows.damage_triage_aoi_infer``) works with pixel arrays
+(``hastegeo.workflows.damage_triage_region_infer``) works with pixel arrays
 plus one binary instance mask, never the vector geometry itself.
 
 Runs only inside the training Docker image (see
@@ -95,7 +95,9 @@ def crop_building(
         width = min(width, crop_size)
 
     window = rasterio.windows.Window(col_start, row_start, width, height)
-    data = raster.read([1, 2, 3], window=window)
+    from hastegeo.core.utils.raster_bands import rgb_band_indexes
+
+    data = raster.read(rgb_band_indexes(raster), window=window)
     crop_transform = rasterio.windows.transform(window, raster.transform)
 
     if crop_size is not None:

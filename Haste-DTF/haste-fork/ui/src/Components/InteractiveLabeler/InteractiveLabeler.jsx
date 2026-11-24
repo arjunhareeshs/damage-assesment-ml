@@ -335,7 +335,7 @@ const InteractiveLabeler = () => {
   const labeledMapRef = useRef({});
   const predictionsMapRef = useRef({});
   // DTF results: building id -> DamageTriageFormer class index (0-4), loaded
-  // from a run_local_aoi_assessment.py / damage_triage_aoi_infer manifest.
+  // from a run_local_aoi_assessment.py manifest.
   // Building id here is assumed to match the map feature's row-index id
   // (both are ultimately derived from the same footprints file's row order).
   const dtfResultsMapRef = useRef({});
@@ -1030,7 +1030,7 @@ const InteractiveLabeler = () => {
     clearFeatureStateLabel(primarySourceId(), id);
     refreshCounts();
   }
-  // Apply a run_local_aoi_assessment.py / damage_triage_aoi_infer manifest
+  // Apply a run_local_aoi_assessment.py manifest
   // ({buildings: [{building_id, class, class_name, confidence}, ...]}) to
   // the map: one setFeatureState call per building, keyed by the same id
   // the manifest's building_id carries. Colors take effect immediately for

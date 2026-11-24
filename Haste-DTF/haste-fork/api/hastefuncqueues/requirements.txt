@@ -29,12 +29,6 @@ boto3==1.36.20
 tenacity==9.1.2
 typing-extensions==4.14.1
 docker==7.1.0
-# DTFInferencePostprocessor._create_dtf_config() calls
-# processors/damage_triage.py::_download_hf_checkpoint(), which stages the
-# DamageTriageFormer checkpoint into the task dir from THIS container --
-# so hf_hub_download must be importable here, not just in the training
-# image where inference itself runs. Hub client only (no torch needed).
-huggingface_hub==0.35.3
 # Use wheel for remote, comment out for local Docker (source is copied directly)
 # hastegeo comes from this repo's hastelib/ (the Dockerfile pip-installs it
 # after this file). The published 1.0.26 wheel that used to be listed here

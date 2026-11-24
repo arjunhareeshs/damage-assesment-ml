@@ -141,6 +141,9 @@ def _conn():
 
 class TestBuildingResultsKept(unittest.TestCase):
     def _load(self, preserve):
+        import os
+        import tempfile
+
         import geopandas as gpd
         from shapely.geometry import box
 
@@ -149,20 +152,25 @@ class TestBuildingResultsKept(unittest.TestCase):
         gdf = gpd.GeoDataFrame({"id": ["b1", "b2"], "subtype": [None, None], "class": [None, None]},
                                geometry=[box(0, 0, 1, 1), box(2, 2, 3, 3)], crs=4326)
         conn, cur = _conn()
-        with patch.object(postgis_load.gpd, "read_file", return_value=gdf):
-            postgis_load.load_footprints_into_postgis(_layer(), "x.gpkg", conn=conn,
+        with tempfile.TemporaryDirectory() as tmp, patch("psycopg2.extras.execute_values"):
+            path = os.path.join(tmp, "x.gpkg")
+            gdf.to_file(path, driver="GPKG")
+            postgis_load.load_footprints_into_postgis(_layer(), path, conn=conn,
                                                       preserve_results=preserve)
-        return cur.execute.call_args_list[0].args
+        return [c.args for c in cur.execute.call_args_list]
 
-    def test_update_only_removes_buildings_that_are_gone(self):
-        sql, params = self._load(preserve=True)
-        self.assertIn("NOT (building_id = ANY", sql)
-        self.assertEqual(params, ("layer-1", ["b1", "b2"]))
+    def test_load_only_removes_buildings_that_are_gone(self):
+        for preserve in (True, False):
+            calls = self._load(preserve)
+            delete = next(a for a in calls if a[0].strip().startswith("DELETE"))
+            self.assertIn("NOT EXISTS", delete[0])
+            self.assertEqual(delete[1], ("layer-1",))
 
-    def test_first_load_replaces_everything(self):
-        sql, params = self._load(preserve=False)
-        self.assertNotIn("ANY", sql)
-        self.assertEqual(params, ("layer-1",))
+    def test_results_are_flagged_not_wiped(self):
+        calls = self._load(preserve=False)
+        upsert = next(a for a in calls if "INSERT INTO hg_buildings" in a[0])
+        self.assertIn("imagery_updated_at", upsert[0])
+        self.assertNotIn("damage_class", upsert[0])
 
     def test_mark_imagery_updated_counts_out_of_date_results(self):
         from hastegeo.core.utils.postgis_load import mark_imagery_updated

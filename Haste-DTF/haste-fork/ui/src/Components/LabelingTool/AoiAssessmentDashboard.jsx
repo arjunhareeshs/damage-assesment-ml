@@ -1,6 +1,6 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
-import { useEffect, useRef, useState } from "react";
+import { useContext, useEffect, useRef, useState } from "react";
 import PropTypes from "prop-types";
 import {
   ActionButton,
@@ -11,6 +11,8 @@ import {
   Text,
 } from "@fluentui/react";
 import { apiGet, apiPut } from "../../util/api";
+import { AppContext } from "../../AppContext";
+import { fileDownload } from "../../util/file";
 import { DTF_CATEGORIES, DTF_CLASS_COLORS } from "./LabelingToolHelper";
 
 // Poll intervals (ms) while an assessment is running / after a failed poll.
@@ -29,6 +31,8 @@ const AoiAssessmentDashboard = ({ assessmentId, onClose, onRefreshMap }) => {
   const [assessment, setAssessment] = useState(null);
   const [stats, setStats] = useState(null);
   const [isCancelling, setIsCancelling] = useState(false);
+  const [busy, setBusy] = useState("");
+  const { setDialog } = useContext(AppContext);
   const [error, setError] = useState("");
   // The parent passes a new callback each render; keep it out of the
   // polling effect's dependencies, or every refresh restarts the poll
@@ -87,6 +91,50 @@ const AoiAssessmentDashboard = ({ assessmentId, onClose, onRefreshMap }) => {
       if (timer) clearTimeout(timer);
     };
   }, [assessmentId]);
+
+  async function handleExport(format) {
+    setBusy(format);
+    try {
+      const result = await apiGet(
+        `GetAoiAssessmentExport?assessmentId=${assessmentId}&format=${format}`
+      );
+      if (format === "aoi") {
+        const blob = new Blob([JSON.stringify(result)], { type: "application/geo+json" });
+        const link = document.createElement("a");
+        link.href = URL.createObjectURL(blob);
+        link.download = `${assessmentId}_aoi.geojson`;
+        link.click();
+        URL.revokeObjectURL(link.href);
+      } else {
+        fileDownload(result.url, setDialog);
+      }
+    } catch (err) {
+      console.error("Error exporting assessment:", err);
+      setDialog("Export failed", "Could not export this assessment (no results to export yet?).");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function handleAcceptPending() {
+    setBusy("accept");
+    try {
+      const result = await apiPut("PutAoiAssessmentReview", {
+        imageLayerId: assessment.imageLayerId,
+        assessmentId,
+        all: true,
+        onlyStatus: "pending_review",
+        reviewStatus: "accepted",
+      });
+      setDialog("Reviewed", `${result.updated} result(s) accepted.`);
+      if (onRefreshMapRef.current) onRefreshMapRef.current();
+    } catch (err) {
+      console.error("Error accepting results:", err);
+      setDialog("Nothing to accept", "No pending results were found for this assessment.");
+    } finally {
+      setBusy("");
+    }
+  }
 
   async function handleCancel() {
     setIsCancelling(true);
@@ -319,6 +367,39 @@ const AoiAssessmentDashboard = ({ assessmentId, onClose, onRefreshMap }) => {
               ) : null}
             </div>
           ) : null}
+        </div>
+      )}
+
+      {/* Review + exports (once results exist) */}
+      {(assessment.status === "completed" || assessment.status === "completed_with_errors") && (
+        <div className="mb-3 pt-2 border-top">
+          <Text variant="small" className="fw-bold mb-2 d-block">
+            Review and export
+          </Text>
+          <div className="d-flex flex-wrap gap-2">
+            <DefaultButton
+              text="Accept all pending"
+              disabled={!!busy}
+              onClick={handleAcceptPending}
+              title="Accept every result still waiting for review (rejected ones stay rejected)"
+            />
+            {[
+              ["csv", "Table (CSV)"],
+              ["gpkg", "GeoPackage"],
+              ["geoparquet", "GeoParquet"],
+              ["aoi", "AOI (GeoJSON)"],
+            ].map(([fmt, label]) => (
+              <DefaultButton
+                key={fmt}
+                text={label}
+                disabled={!!busy}
+                onClick={() => handleExport(fmt)}
+              />
+            ))}
+          </div>
+          <div style={{ fontSize: 11, color: "#666", marginTop: 6 }}>
+            Exports leave out rejected results. The GeoPackage holds buildings, aoi and summary layers.
+          </div>
         </div>
       )}
 

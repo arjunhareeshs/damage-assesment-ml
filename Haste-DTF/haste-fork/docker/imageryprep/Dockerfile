@@ -1,4 +1,4 @@
-# Pinned to the same stable tag docker/api/Dockerfile uses. The previous
+# Pinned to the same stable tag api/hastefuncapi/Dockerfile uses. The previous
 # `4-nightly-...` tag silently changes the base under every rebuild, so two
 # developers could never produce the same image.
 FROM mcr.microsoft.com/azure-functions/python:4.30.0-python3.11-slim

@@ -1,8 +1,0 @@
-out/
-__pycache__/
-*.pyc
-.venv*/
-venv*/
-*.png
-*.json
-

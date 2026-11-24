@@ -16,7 +16,6 @@ Validates all 13 specific requirements:
 10. Result class names are exactly the five in DTF_CATEGORIES; damage_percentage is NULL in every row.
 11. A second assessment over the same AOI leaves the first assessment's rows untouched.
 12. Zero buildings in the AOI -> completed, zero rows.
-13. Existing tests / workflows for dtf-aoi remain intact.
 """
 
 import os
@@ -379,16 +378,6 @@ class TestSection8Specification(unittest.TestCase):
                 completed_units=0,
                 failed_units=0,
             )
-
-    def test_13_existing_dtf_aoi_workflow_unbroken(self):
-        """13. Existing tests / workflows for dtf-aoi remain intact."""
-        from hastegeo.core.processors.damage_triage_aoi import (
-            DTFAoiInferencePreprocessor,
-            DTFAoiInferencePostprocessor,
-        )
-        self.assertTrue(callable(DTFAoiInferencePreprocessor))
-        self.assertTrue(callable(DTFAoiInferencePostprocessor))
-
 
 if __name__ == "__main__":
     unittest.main()

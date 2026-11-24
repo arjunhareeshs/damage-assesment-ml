@@ -5,10 +5,17 @@
 # wildcard CORS, well-known Azurite credentials) that are NOT suitable for
 # production use. For production deployment see docs/deployment.md.
 #
-# Usage (from the repo root):
-#   ./build.sh                       build every image (picks GPU or CPU)
-#   then start with the command build.sh prints, e.g.
-#   docker compose -f docker-compose.yml -f docker-compose.hostcuda.yml up -d
+# Usage:
+#   ./build.sh               (checkout root) build + smoke-test every image
+#   docker compose up -d     (this directory) start the stack
+#
+# GPU: model inference (haste-training tasks) runs on the GPU using the CUDA
+# libraries already installed on the host -- the images download no CUDA.
+# Everything else (API, queue worker, imagery prep, zipping, postgis, ...)
+# runs on CPU. build.sh writes HASTE_HOST_CUDA_DIR (and DOCKER_GID) into
+# docker/.env. On a machine without a usable GPU it writes
+# HASTE_TORCH_VARIANT=cpu and HASTE_ENABLE_GPU=0 there instead, and this
+# same file gives a CPU-only stack.
 #
 # Everything runs as one Compose project named `haste`: containers show up as
 # haste-<service>-1, images are haste-*, plus the haste_default network and
@@ -25,6 +32,63 @@
 #   - DEVELOPMENT_MODE: "true" for local, "false" for production
 
 name: haste
+
+# Settings shared by hastefuncapi and hastefuncqueues (merged into each with <<:).
+x-haste-env: &haste-env
+  AzureWebJobsStorage: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;QueueEndpoint=http://azurite:10001/devstoreaccount1;"  # pragma: allowlist secret # gitleaks:allow
+  ASPNETCORE_URLS: "http://+:8080"
+  DATA_PATH: "/app/data"
+  DEVELOPMENT_MODE: "true"
+  FUNCTIONS_WORKER_RUNTIME: "python"
+  AzureWebJobsFeatureFlags: "EnableWorkerIndexing"
+  AzureWebJobsDisableHomepage: "true"
+  AZURE_FUNCTIONS_ENVIRONMENT: "Development"
+  languageWorkers__python__requests__postUri: "http://127.0.0.1:8080/admin/host/ping"
+  AzureFunctionsJobHost__logging__logLevel__Host: "Information"
+  AzureFunctionsJobHost__logging__logLevel__Function: "Information"
+  BLOB_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;QueueEndpoint=http://azurite:10001/devstoreaccount1;"  # pragma: allowlist secret # gitleaks:allow
+  QUEUE_ACCOUNT_URL: "http://azurite:10001/devstoreaccount1"
+  BLOB_ACCOUNT_URL: "http://azurite:10000/devstoreaccount1"
+  IMAGE_QUEUE_NAME: "local-image-queue"
+  TRAIN_QUEUE_NAME: "local-train-queue"
+  STATS_QUEUE_NAME: "local-stats-queue"
+  ZIP_QUEUE_NAME: "local-zip-queue"
+  INFERENCE_QUEUE_NAME: "local-inference-queue"
+  EMBEDDING_QUEUE_NAME: "local-embedding-queue"
+  ASSESSMENT_QUEUE_NAME: "local-assessment-queue"
+  HASTE_AOI_MAX_AREA_KM2: "${HASTE_AOI_MAX_AREA_KM2:-500}"
+  HASTE_AOI_MAX_UNITS: "${HASTE_AOI_MAX_UNITS:-500}"
+  HASTE_DTF_NORMALIZATION: "${HASTE_DTF_NORMALIZATION:-imagenet}"
+  # New large-AOI results start pending_review; false auto-accepts them.
+  HASTE_REQUIRE_REVIEW: "${HASTE_REQUIRE_REVIEW:-true}"
+  HASTE_REGION_WINDOWS_PER_BATCH: "${HASTE_REGION_WINDOWS_PER_BATCH:-20}"
+  HASTE_REGION_MASKS_PER_FORWARD: "${HASTE_REGION_MASKS_PER_FORWARD:-64}"
+  HASTE_REGION_PREFETCH_UNITS: "${HASTE_REGION_PREFETCH_UNITS:-2}"
+  HASTE_REGION_MAX_CONCURRENT_BATCHES: "${HASTE_REGION_MAX_CONCURRENT_BATCHES:-1}"
+  HASTE_REGION_MAX_ATTEMPTS: "${HASTE_REGION_MAX_ATTEMPTS:-3}"
+  HASTE_REGION_LEASE_SECONDS: "${HASTE_REGION_LEASE_SECONDS:-300}"
+  HASTE_REGION_MIN_VALID_FRACTION: "${HASTE_REGION_MIN_VALID_FRACTION:-0.5}"
+  HASTE_REGION_UNCERTAIN_CONFIDENCE: "${HASTE_REGION_UNCERTAIN_CONFIDENCE:-}"
+  HASTE_FOOTPRINT_LOAD_CHUNK: "${HASTE_FOOTPRINT_LOAD_CHUNK:-50000}"
+  HASTE_MAP_MAX_FEATURES: "${HASTE_MAP_MAX_FEATURES:-5000}"
+  HASTE_MAP_FEATURE_MIN_ZOOM: "${HASTE_MAP_FEATURE_MIN_ZOOM:-14}"
+  BLOB_CONTAINER: "data"
+  METADATA_STORAGE_TYPE: "blob"
+  IMAGERY_STORAGE_TYPE: "blob"
+  ARTIFACT_STORAGE_TYPE: "blob"
+  POSTGRES_HOST: "postgis"
+  POSTGRES_PORT: "5432"
+  POSTGRES_DATABASE: "haste"
+  POSTGRES_USER: "haste"
+  POSTGRES_PASSWORD: "haste-dev-only"  # pragma: allowlist secret # gitleaks:allow
+  # The local postgis image has no TLS; hastegeo defaults to
+  # sslmode=require for production safety, so dev opts out here.
+  POSTGRES_SSLMODE: "disable"
+  TITILER_ENDPOINT: "http://titiler:8000/"
+  TITILER_PUBLIC_ENDPOINT: "http://${HOST_IP:-localhost}:7071/api/titiler/"
+  # Pre-downloaded DamageTriageFormer checkpoint paths (skip HuggingFace download)
+  DTF_CHECKPOINT_PATH: "/app/models/damage_triage/best_model.pth"
+  DTF_CHECKPOINT_CONFIG_PATH: "/app/models/damage_triage/config.json"
 
 services:
   # ==============================================================================
@@ -113,8 +177,8 @@ services:
     depends_on:
       - azurite
 
-  # PostGIS-backed hg_buildings table for the AOI-scoped DamageTriageFormer
-  # path (modelType="dtf-aoi" — docs/OptionB_AOI_Integration_Plan.md).
+  # PostGIS-backed hg_buildings / hg_assessments tables for the large-AOI
+  # DamageTriageFormer assessment (hg_assessments state machine).
   # hastegeo.core.utils.postgis_connect reads POSTGRES_HOST/PORT/DATABASE/
   # USER/PASSWORD (below, wired into hastefuncapi/hastefuncqueues) to
   # connect here with plain password auth for local dev; production uses
@@ -152,62 +216,9 @@ services:
       dockerfile: ./api/hastefuncapi/Dockerfile
     image: haste-api
     environment:
-      AzureWebJobsStorage: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;QueueEndpoint=http://azurite:10001/devstoreaccount1;"  # pragma: allowlist secret # gitleaks:allow
-      ASPNETCORE_URLS: "http://+:8080"
-      DATA_PATH: "/app/data"
-      DEVELOPMENT_MODE: "true"
-      FUNCTIONS_WORKER_RUNTIME: "python"
-      AzureWebJobsFeatureFlags: "EnableWorkerIndexing"
-      AzureWebJobsDisableHomepage: "true"
-      AZURE_FUNCTIONS_ENVIRONMENT: "Development"
-      languageWorkers__python__requests__postUri: "http://127.0.0.1:8080/admin/host/ping"
+      <<: *haste-env
       AzureFunctionsJobHost__logging__logLevel__default: "Debug"
-      AzureFunctionsJobHost__logging__logLevel__Host: "Information"
-      AzureFunctionsJobHost__logging__logLevel__Function: "Information"
       AzureFunctionsJobHost__logging__logLevel__Worker: "Debug"
-      BLOB_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;QueueEndpoint=http://azurite:10001/devstoreaccount1;"  # pragma: allowlist secret # gitleaks:allow
-      QUEUE_ACCOUNT_URL: "http://azurite:10001/devstoreaccount1"
-      BLOB_ACCOUNT_URL: "http://azurite:10000/devstoreaccount1"
-      IMAGE_QUEUE_NAME: "local-image-queue"
-      TRAIN_QUEUE_NAME: "local-train-queue"
-      STATS_QUEUE_NAME: "local-stats-queue"
-      ZIP_QUEUE_NAME: "local-zip-queue"
-      INFERENCE_QUEUE_NAME: "local-inference-queue"
-      EMBEDDING_QUEUE_NAME: "local-embedding-queue"
-      DTF_QUEUE_NAME: "local-dtf-queue"
-      DTF_AOI_QUEUE_NAME: "local-dtf-aoi-queue"
-      ASSESSMENT_QUEUE_NAME: "local-assessment-queue"
-      HASTE_AOI_MAX_AREA_KM2: "${HASTE_AOI_MAX_AREA_KM2:-500}"
-      HASTE_AOI_MAX_UNITS: "${HASTE_AOI_MAX_UNITS:-500}"
-      HASTE_DTF_NORMALIZATION: "${HASTE_DTF_NORMALIZATION:-imagenet}"
-      HASTE_REGION_WINDOWS_PER_BATCH: "${HASTE_REGION_WINDOWS_PER_BATCH:-20}"
-      HASTE_REGION_MASKS_PER_FORWARD: "${HASTE_REGION_MASKS_PER_FORWARD:-64}"
-      HASTE_REGION_PREFETCH_UNITS: "${HASTE_REGION_PREFETCH_UNITS:-2}"
-      HASTE_REGION_MAX_CONCURRENT_BATCHES: "${HASTE_REGION_MAX_CONCURRENT_BATCHES:-1}"
-      HASTE_REGION_MAX_ATTEMPTS: "${HASTE_REGION_MAX_ATTEMPTS:-3}"
-      HASTE_REGION_LEASE_SECONDS: "${HASTE_REGION_LEASE_SECONDS:-300}"
-      HASTE_REGION_MIN_VALID_FRACTION: "${HASTE_REGION_MIN_VALID_FRACTION:-0.5}"
-      HASTE_REGION_UNCERTAIN_CONFIDENCE: "${HASTE_REGION_UNCERTAIN_CONFIDENCE:-}"
-      HASTE_FOOTPRINT_LOAD_CHUNK: "${HASTE_FOOTPRINT_LOAD_CHUNK:-50000}"
-      HASTE_MAP_MAX_FEATURES: "${HASTE_MAP_MAX_FEATURES:-5000}"
-      HASTE_MAP_FEATURE_MIN_ZOOM: "${HASTE_MAP_FEATURE_MIN_ZOOM:-14}"
-      BLOB_CONTAINER: "data"
-      METADATA_STORAGE_TYPE: "blob"
-      IMAGERY_STORAGE_TYPE: "blob"
-      ARTIFACT_STORAGE_TYPE: "blob"
-      TITILER_ENDPOINT: "http://titiler:8000/"
-      TITILER_PUBLIC_ENDPOINT: "http://${HOST_IP:-localhost}:7071/api/titiler/"
-      POSTGRES_HOST: "postgis"
-      POSTGRES_PORT: "5432"
-      POSTGRES_DATABASE: "haste"
-      POSTGRES_USER: "haste"
-      POSTGRES_PASSWORD: "haste-dev-only"  # pragma: allowlist secret # gitleaks:allow
-      # The local postgis image has no TLS; hastegeo defaults to
-      # sslmode=require for production safety, so dev opts out here.
-      POSTGRES_SSLMODE: "disable"
-      # Pre-downloaded DamageTriageFormer checkpoint paths (skip HuggingFace download)
-      DTF_CHECKPOINT_PATH: "/app/models/damage_triage/best_model.pth"
-      DTF_CHECKPOINT_CONFIG_PATH: "/app/models/damage_triage/config.json"
     volumes:
       - ../data:/app/data
       - /var/run/docker.sock:/var/run/docker.sock
@@ -230,18 +241,8 @@ services:
       dockerfile: ./api/hastefuncqueues/Dockerfile
     image: haste-queues
     environment:
-      AzureWebJobsStorage: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;QueueEndpoint=http://azurite:10001/devstoreaccount1;"  # pragma: allowlist secret # gitleaks:allow
-      ASPNETCORE_URLS: "http://+:8080"
-      DATA_PATH: "/app/data"
-      DEVELOPMENT_MODE: "true"
-      FUNCTIONS_WORKER_RUNTIME: "python"
-      AzureWebJobsFeatureFlags: "EnableWorkerIndexing"
-      AzureWebJobsDisableHomepage: "true"
-      AZURE_FUNCTIONS_ENVIRONMENT: "Development"
-      languageWorkers__python__requests__postUri: "http://127.0.0.1:8080/admin/host/ping"
+      <<: *haste-env
       AzureFunctionsJobHost__logging__logLevel__default: "Information"
-      AzureFunctionsJobHost__logging__logLevel__Host: "Information"
-      AzureFunctionsJobHost__logging__logLevel__Function: "Information"
       AzureFunctionsJobHost__logging__logLevel__Worker: "Information"
       AzureFunctionsJobHost__logging__logLevel__haste: "Information"
       # Hugging Face fallback only. local.py now points spawned task
@@ -252,46 +253,18 @@ services:
       # HF_TOKEN in your shell before `docker compose up` if you need the
       # fallback against facebook/dinov3-vitl16-pretrain-lvd1689m.
       HF_TOKEN: "${HF_TOKEN:-}"
-      BLOB_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;QueueEndpoint=http://azurite:10001/devstoreaccount1;"  # pragma: allowlist secret # gitleaks:allow
-      QUEUE_ACCOUNT_URL: "http://azurite:10001/devstoreaccount1"
-      BLOB_ACCOUNT_URL: "http://azurite:10000/devstoreaccount1"
-      IMAGE_QUEUE_NAME: "local-image-queue"
-      TRAIN_QUEUE_NAME: "local-train-queue"
-      STATS_QUEUE_NAME: "local-stats-queue"
-      ZIP_QUEUE_NAME: "local-zip-queue"
-      INFERENCE_QUEUE_NAME: "local-inference-queue"
-      EMBEDDING_QUEUE_NAME: "local-embedding-queue"
-      DTF_QUEUE_NAME: "local-dtf-queue"
-      DTF_AOI_QUEUE_NAME: "local-dtf-aoi-queue"
-      ASSESSMENT_QUEUE_NAME: "local-assessment-queue"
-      HASTE_AOI_MAX_AREA_KM2: "${HASTE_AOI_MAX_AREA_KM2:-500}"
-      HASTE_AOI_MAX_UNITS: "${HASTE_AOI_MAX_UNITS:-500}"
-      HASTE_DTF_NORMALIZATION: "${HASTE_DTF_NORMALIZATION:-imagenet}"
-      HASTE_REGION_WINDOWS_PER_BATCH: "${HASTE_REGION_WINDOWS_PER_BATCH:-20}"
-      HASTE_REGION_MASKS_PER_FORWARD: "${HASTE_REGION_MASKS_PER_FORWARD:-64}"
-      HASTE_REGION_PREFETCH_UNITS: "${HASTE_REGION_PREFETCH_UNITS:-2}"
-      HASTE_REGION_MAX_CONCURRENT_BATCHES: "${HASTE_REGION_MAX_CONCURRENT_BATCHES:-1}"
-      HASTE_REGION_MAX_ATTEMPTS: "${HASTE_REGION_MAX_ATTEMPTS:-3}"
-      HASTE_REGION_LEASE_SECONDS: "${HASTE_REGION_LEASE_SECONDS:-300}"
-      HASTE_REGION_MIN_VALID_FRACTION: "${HASTE_REGION_MIN_VALID_FRACTION:-0.5}"
-      HASTE_REGION_UNCERTAIN_CONFIDENCE: "${HASTE_REGION_UNCERTAIN_CONFIDENCE:-}"
-      HASTE_FOOTPRINT_LOAD_CHUNK: "${HASTE_FOOTPRINT_LOAD_CHUNK:-50000}"
-      HASTE_MAP_MAX_FEATURES: "${HASTE_MAP_MAX_FEATURES:-5000}"
-      HASTE_MAP_FEATURE_MIN_ZOOM: "${HASTE_MAP_FEATURE_MIN_ZOOM:-14}"
-      HASTE_IMAGERY_CATALOG_MODE: "${HASTE_IMAGERY_CATALOG_MODE:-false}"
-      BLOB_CONTAINER: "data"
-      METADATA_STORAGE_TYPE: "blob"
-      IMAGERY_STORAGE_TYPE: "blob"
-      ARTIFACT_STORAGE_TYPE: "blob"
+      HASTE_IMAGERY_CATALOG_MODE: "${HASTE_IMAGERY_CATALOG_MODE:-true}"
+      # User-supplied footprints are not shifted onto the roofs unless true
+      # (the measured shift is still reported in the imagery manifest).
+      HASTE_ALIGN_USER_FOOTPRINTS: "${HASTE_ALIGN_USER_FOOTPRINTS:-false}"
+      # local: per-building shift from nearby tie points (handles offsets that
+      # vary across the image and per footprint source); global: one shift.
+      HASTE_FOOTPRINT_ALIGN_MODE: "${HASTE_FOOTPRINT_ALIGN_MODE:-local}"
+      # Longest side (px) of the decimated mask the valid area is traced from.
+      HASTE_AOI_MASK_MAX_DIM: "${HASTE_AOI_MASK_MAX_DIM:-8192}"
+      # Shared download cache for task inputs (one TIF download per assessment).
+      HASTE_TASK_CACHE_MAX_AGE_HOURS: "${HASTE_TASK_CACHE_MAX_AGE_HOURS:-24}"
       RUNNER_TYPE: "local"
-      POSTGRES_HOST: "postgis"
-      POSTGRES_PORT: "5432"
-      POSTGRES_DATABASE: "haste"
-      POSTGRES_USER: "haste"
-      POSTGRES_PASSWORD: "haste-dev-only"  # pragma: allowlist secret # gitleaks:allow
-      # The local postgis image has no TLS; hastegeo defaults to
-      # sslmode=require for production safety, so dev opts out here.
-      POSTGRES_SSLMODE: "disable"
       AZURE_STORAGE_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;QueueEndpoint=http://azurite:10001/devstoreaccount1;"  # pragma: allowlist secret # gitleaks:allow
       AZURE_STORAGE_USE_EMULATOR: "true"
       AZURE_STORAGE_EMULATOR_HOST: "azurite:10000"
@@ -308,16 +281,17 @@ services:
       # LocalRunner (see the passthrough list in runners/local.py).
       HASTE_USER_FOOTPRINTS_MAX_BYTES: "${HASTE_USER_FOOTPRINTS_MAX_BYTES:-4294967296}"
       HASTE_OUTPUT_DIR: "/shared/azurite"
-      # CPU by default. GPU is switched on by an overlay, never here, because
-      # it must match how haste-training was built (TORCH_VARIANT):
-      #   docker-compose.hostcuda.yml  torch only, CUDA from the host (build.sh
-      #                                picks this when it finds a GPU)
-      #   docker-compose.gpu.yml       CUDA baked into the image
-      HASTE_ENABLE_GPU: "${HASTE_ENABLE_GPU:-0}"
+      # GPU for model inference tasks only (HASTE_GPU_IMAGES; imagery prep
+      # and zipping stay on CPU). Must match how haste-training was built
+      # (HASTE_TORCH_VARIANT below): build.sh sets both. If the daemon cannot
+      # attach a GPU, LocalRunner runs the task on CPU instead.
+      HASTE_ENABLE_GPU: "${HASTE_ENABLE_GPU:-1}"
       HASTE_GPU_DEVICES: "${HASTE_GPU_DEVICES:-all}"
+      HASTE_GPU_IMAGES: "${HASTE_GPU_IMAGES:-haste-training}"
+      # Host folder (pip site-packages/nvidia) with the CUDA 12 runtime
+      # libraries, mounted read-only into GPU tasks. Set by build.sh.
+      HASTE_HOST_CUDA_DIR: "${HASTE_HOST_CUDA_DIR:-}"
       HASTE_DATALOADER_WORKERS: "8"
-      TITILER_ENDPOINT: "http://titiler:8000/"
-      TITILER_PUBLIC_ENDPOINT: "http://${HOST_IP:-localhost}:7071/api/titiler/"
       # Network and volume the spawned task containers join. Both are given
       # fixed names at the bottom of this file, so these can't drift.
       HASTE_DOCKER_NETWORK: "haste_default"
@@ -325,9 +299,6 @@ services:
       # Memory limits for spawned task containers (increase for large VMs)
       HASTE_DOCKER_SHM_SIZE: "${HASTE_DOCKER_SHM_SIZE:-64g}"
       HASTE_DOCKER_MEM_LIMIT: "${HASTE_DOCKER_MEM_LIMIT:-256g}"
-      # Pre-downloaded DamageTriageFormer checkpoint paths (skip HuggingFace download)
-      DTF_CHECKPOINT_PATH: "/app/models/damage_triage/best_model.pth"
-      DTF_CHECKPOINT_CONFIG_PATH: "/app/models/damage_triage/config.json"
     volumes:
       - ../data:/app/data
       - azurite-data:/shared/azurite  # Mount azurite blob storage for LocalRunner access
@@ -386,13 +357,14 @@ services:
       context: ..
       dockerfile: ./docker/training/Dockerfile
       args:
-        # CPU torch here; the GPU overlays override it (see HASTE_ENABLE_GPU
-        # above). Azure Batch / ACR builds (build_and_push_images.sh) don't
-        # pass this arg and keep the Dockerfile's cu124 default.
-        TORCH_VARIANT: ${HASTE_TORCH_VARIANT:-cpu}
-        # CPU-only base (~0.5 GB): the Dockerfile's default CUDA 12.4 base
-        # (~5.3 GB) is useless without a GPU. docker-compose.gpu.yml puts the
-        # CUDA base back.
+        # host: the CUDA build of torch/torchvision with no CUDA libraries
+        # inside; they come from the host at run time (HASTE_HOST_CUDA_DIR).
+        # cpu: CPU torch (build.sh --cpu). A direct `docker build` of the
+        # Dockerfile (Azure Batch / ACR) keeps its own self-contained cu124
+        # default.
+        TORCH_VARIANT: ${HASTE_TORCH_VARIANT:-host}
+        # CPU-only base (~0.5 GB): no CUDA toolkit is downloaded in either
+        # mode. The Dockerfile's own default is the ~5.3 GB CUDA 12.4 base.
         BASE_IMAGE: ${HASTE_TRAINING_BASE_IMAGE:-mcr.microsoft.com/azureml/minimal-py312-inference:20261103.v1}
     image: haste-training
 

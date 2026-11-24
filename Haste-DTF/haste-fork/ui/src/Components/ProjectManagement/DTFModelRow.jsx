@@ -64,10 +64,9 @@ const DTFModelRow = ({
   const [showAssessmentReport, setShowAssessmentReport] = useState(false);
 
   const hasPredictions = !!model.gpkgUrl;
-  // AOI-scoped runs (modelType "dtf-aoi") never produce a whole-mosaic
-  // predictedDamageLayerUrl — by design they PATCH hg_buildings rows instead
-  // of rasterizing a full layer (see processors/damage_triage_aoi.py). The
-  // Visualizer renders them from GetHgBuildingsGeoJSON (scoped to the image
+  // Legacy AOI-scoped records (modelType "dtf-aoi") never have a whole-mosaic
+  // predictedDamageLayerUrl — they wrote hg_buildings rows instead of
+  // rasterizing a full layer. The Visualizer renders them from GetHgBuildingsGeoJSON (scoped to the image
   // layer, not the model) via loadDtfAoiPredictionsLayer, so "View on Map"
   // is valid for them as soon as the run has predictions.
   const hasMapLayer =

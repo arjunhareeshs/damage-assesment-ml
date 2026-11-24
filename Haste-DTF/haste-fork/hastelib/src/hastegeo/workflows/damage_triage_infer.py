@@ -1,55 +1,27 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 
-"""DamageTriageFormer inference workflow for the DTF sub-model (Option B).
+"""Shared DamageTriageFormer model library.
 
-Ported to the same HASTE workflow contract ``embed_buildings.py`` uses:
+Not a runnable workflow any more. The whole-layer tile pipeline
+and the per-building AOI workflow were removed; this module keeps the pieces
+the large-AOI workflow imports:
 
-* Driven by a single ``--config`` JSON file (written by
-  ``DTFInferencePreprocessor`` / ``DTFInferencePostprocessor``,
-  ``core/processors/damage_triage.py``).
-* Reads the post-event mosaic COG and the cached building-footprints
-  GeoPackage (both downloaded into the task working dir by the runner).
-* Unlike the per-building-crop MOSAIKS embedding workflow, DamageTriageFormer
-  (DINOv3 ViT-L/16 backbone + mask-pooled instance heads, see
-  ``Damage-TriageFormer/src/model/net.py``) consumes a full 1024x1024 tile
-  plus a batch of per-building binary instance masks at tile resolution — the
-  model downsamples masks to its feature-map stride internally
-  (``SeverityHead.forward``, ``Damage-TriageFormer/src/model/heads.py``).
-  So this workflow tiles the mosaic into non-overlapping ``IM_SIZE`` windows,
-  and for each tile rasterizes one binary mask per intersecting footprint.
-* A building that straddles a tile boundary is scored once per tile it
-  appears in; we keep the highest-confidence prediction across tiles.
-* Writes outputs to ``outputs/``: a per-building predictions GeoPackage
-  (layer ``"predictions"``), a manifest, and two map-ready rasters —
-  ``*_predictions.tif`` (single-band, per-pixel ``dtf_class + 1``, 0 =
-  nodata) and ``*_visualizer.tif`` (RGBA, footprints painted by damage
-  class) — mirroring the embedding sub-model's ``output2visualizer.py`` /
-  ``run_workflow.py`` COG pipeline so ``GetVisualizerResults`` and the
-  existing Visualizer map (``predictedDamageLayer`` / ``predictionsLayer``)
-  work for DTF models unchanged. Row-order/id convention matches
-  ``embed_buildings.py`` and ``PutBuildingPredictions``: exactly one row per
-  input footprint, ``id = 0..N-1`` in the footprints file's native order —
-  ``GetValidationReport`` / ``GetAssessmentReport`` join by that row index.
+* ``build_dtf_model`` / ``GatedDinoCrop`` / checkpoint discovery
+* ``score_window`` / ``score_crop`` / ``score_crops`` and the decoders
+* ``read_tile``, ``crop_box_from_mask``, device / batch-size helpers
 
-CRITICAL — row-order invariant: buildings with no overlap to any tile (or
-zero valid mask pixels) keep their ``id`` slot with ``dtf_class = -1``
-("Unclassified") rather than being dropped or reordered.
+Used by ``damage_triage_region_infer.py``.
 """
 
-import argparse
 import json
 import os
-import subprocess
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-import geopandas as gpd
 import numpy as np
 import rasterio
-import rasterio.enums
 import rasterio.features
 import rasterio.windows
 import torch
@@ -59,11 +31,14 @@ from hastegeo.core.utils.dtf_constants import (  # noqa: F401 (re-exported)
     DTF_IM_SIZE,
     UNCLASSIFIED,
     compute_model_digest,
-    compute_tile_windows,
 )
-from hastegeo.core.utils.dtf_preprocess import normalize_tile
+from hastegeo.core.utils.dtf_preprocess import (
+    DEFAULT_SPEC,
+    PreprocessingSpec,
+    load_preprocessing_spec,
+    resolve_normalization,
+)
 from hastegeo.core.utils.logs import Logger as HasteLogger
-from rasterio.features import geometry_mask
 from shapely.geometry import box
 
 def _find_local_checkpoint():
@@ -210,12 +185,76 @@ def score_crop(model, crop: np.ndarray, device: torch.device) -> np.ndarray:
     """(1, 5) class probabilities for one ``(3, H, W)`` uint8 building crop."""
     import cv2
 
+    spec = model_spec(model)
     resized = cv2.resize(
-        np.transpose(crop, (1, 2, 0)), (224, 224), interpolation=cv2.INTER_AREA
+        np.transpose(crop, (1, 2, 0)),
+        (spec.input_size, spec.input_size),
+        interpolation=cv2.INTER_AREA,
     )
-    x = np.transpose(normalize_tile(resized, mode="imagenet"), (2, 0, 1))
+    x = np.transpose(spec.normalize(resized), (2, 0, 1))
     with torch.inference_mode():
         return model(torch.from_numpy(x).unsqueeze(0).to(device)).cpu().numpy()
+
+
+def model_spec(model) -> PreprocessingSpec:
+    """The preprocessing contract a loaded model carries (ImageNet default)."""
+    spec = getattr(model, "preprocessing", None)
+    return spec if isinstance(spec, PreprocessingSpec) else DEFAULT_SPEC
+
+
+def read_checkpoint_config(config_path: str) -> dict:
+    """Normalise the checkpoint config into one schema.
+
+    Two formats exist for the same model and this is the only place that
+    understands them:
+
+    * model card (``architecture`` block): crop-mode when
+      ``architecture.mask_pooling`` is false.
+    * training argparse dump (``use_gated_head`` ...): a mask-pooling run.
+
+    Returns ``{"schema", "crop_mode", "class_names", "train"}``. ``crop_mode``
+    is ``None`` when the file does not say. Raises on unreadable or
+    unrecognised files rather than guessing.
+    """
+    with open(config_path, encoding="utf-8") as f:
+        cfg = json.load(f)
+    if not isinstance(cfg, dict):
+        raise ValueError(f"{config_path}: expected a JSON object.")
+    arch = cfg.get("architecture")
+    if isinstance(arch, dict):
+        mask_pooling = arch.get("mask_pooling")
+        crop_mode = None if mask_pooling is None else (not bool(mask_pooling))
+        return {
+            "schema": "model_card",
+            "crop_mode": crop_mode,
+            "class_names": list(arch.get("class_names") or []),
+            "train": {},
+        }
+    if "use_gated_head" in cfg or "sfp_stride" in cfg or "no_multiscale" in cfg:
+        return {"schema": "training_dump", "crop_mode": False, "class_names": [], "train": cfg}
+    raise ValueError(
+        f"{config_path}: neither a model card ('architecture') nor a training "
+        "config ('use_gated_head'); refusing to guess the architecture."
+    )
+
+
+def _load_state_dict(checkpoint_path: str, device: torch.device) -> dict:
+    """Tensors only: ``weights_only=True`` never unpickles arbitrary code."""
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Cannot safely load checkpoint {checkpoint_path}: {exc}. Only "
+            "plain tensor state_dicts are accepted."
+        ) from exc
+    state_dict = (
+        checkpoint["model_state_dict"]
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint
+        else checkpoint
+    )
+    if not isinstance(state_dict, dict) or not state_dict:
+        raise RuntimeError(f"{checkpoint_path}: no state_dict found.")
+    return state_dict
 
 
 def build_dtf_model(
@@ -224,130 +263,163 @@ def build_dtf_model(
     device: torch.device,
     strict_region_check: bool = False,
     allow_crop_mode: bool = False,
+    expected_digest: Optional[str] = None,
+    selftest: bool = False,
 ):
-    """Load Damage-TriageFormer's Model class and checkpoint weights.
+    """Load the DamageTriageFormer checkpoint and return ``(model, use_gated)``.
 
-    IMPORTANT: the released checkpoint (Ymx1025/DamageTriageFormer-model,
-    ``best_model.pth`` + ``config.json``) was trained with
-    ``use_gated_head=True, use_sfp=True, sfp_stride=8, no_multiscale=True,
-    no_attention_pool=True, use_aux_severity=True`` — NOT the plain 5-way
-    ``SeverityHead`` (confirmed by inspecting the shipped ``config.json``'s
-    training args). The gated head is a binary damaged/undamaged **gate**
-    plus a conditional 4-way **leaf** classifier over the damage
-    sub-types — see ``decode_gated_predictions`` for how this becomes a
-    5-class prediction. Loading with the wrong head shape would silently
-    drop most of the damage-head weights under ``strict=False``.
+    The single loading path. It
+      * loads tensors only (``weights_only=True``);
+      * reads the config through ``read_checkpoint_config`` and checks it
+        against the weights: a model card that says crop-mode with
+        mask-pooling weights (or the reverse) is an error;
+      * checks the file's sha256 against ``expected_digest`` and the model
+        card's ``weights_sha256``;
+      * loads a crop-mode model with ``strict=True`` and a mask-pooling model
+        refusing any missing ``backbone.*``/``damage_head.*`` weight;
+      * attaches the checkpoint's ``PreprocessingSpec`` as
+        ``model.preprocessing`` so every scorer normalises identically;
+      * with ``selftest=True`` pushes one blank crop through and verifies a
+        finite 5-class probability row.
 
-    Mirrors main.py's checkpoint-loading branch (Damage-TriageFormer/main.py):
-    a saved ``last_checkpoint.pth`` is a dict with a ``model_state_dict`` key;
-    a bare ``best_model.pth`` (what the HF repo ships) is a raw state_dict.
-
-    Raises if any ``backbone.*`` or ``damage_head.*`` weight is missing from
-    the checkpoint: ``strict=False`` would otherwise leave them randomly
-    initialised and every prediction would be noise.
-
-    A crop-mode checkpoint (``GatedDinoCrop``) has neither of those prefixes.
-    It is only returned to callers that pass ``allow_crop_mode``, since it
-    cannot score the instance masks the tile-based workflows feed it.
+    Crop-mode models are returned only when ``allow_crop_mode`` is set (the
+    tile/mask scorers cannot use them).
     """
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    state_dict = (
-        checkpoint["model_state_dict"]
-        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint
-        else checkpoint
-    )
-    if "gate.weight" in state_dict:
+    state_dict = _load_state_dict(checkpoint_path, device)
+    is_crop_weights = "gate.weight" in state_dict
+    info = read_checkpoint_config(config_path) if os.path.isfile(config_path) else None
+
+    if info is not None and info["crop_mode"] is not None:
+        if info["crop_mode"] != is_crop_weights:
+            raise RuntimeError(
+                f"Checkpoint/config mismatch: {config_path} ({info['schema']}) "
+                f"describes a {'crop' if info['crop_mode'] else 'mask-pooling'} "
+                f"model but {checkpoint_path} holds "
+                f"{'crop' if is_crop_weights else 'mask-pooling'} weights."
+            )
+
+    if info is not None and info["class_names"]:
+        names = info["class_names"]
+        if len(names) != len(DTF_CATEGORIES):
+            raise RuntimeError(
+                f"{config_path} lists {len(names)} classes; the pipeline has "
+                f"{len(DTF_CATEGORIES)}."
+            )
+        if names != DTF_CATEGORIES:
+            logger.warning(
+                "Checkpoint class names differ from DTF_CATEGORIES (index order "
+                "is what counts): %s vs %s",
+                names,
+                DTF_CATEGORIES,
+            )
+
+    if expected_digest or (info is not None and info["schema"] == "model_card"):
+        actual = compute_model_digest(checkpoint_path)
+        if expected_digest and actual != expected_digest:
+            raise RuntimeError(
+                f"Checkpoint digest {actual} != expected {expected_digest}."
+            )
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                card_sha = json.load(f).get("weights_sha256")
+        except (OSError, ValueError):
+            card_sha = None
+        if card_sha and card_sha != actual:
+            raise RuntimeError(
+                f"{checkpoint_path} sha256 {actual} does not match the model "
+                f"card's weights_sha256 {card_sha}: wrong or corrupt weights."
+            )
+
+    spec = load_preprocessing_spec(config_path)
+
+    if is_crop_weights:
         if not allow_crop_mode:
             raise RuntimeError(
-                f"{checkpoint_path} is a crop-mode checkpoint; this tile-based "
-                "workflow needs a mask-pooling one. Use the per-building path "
-                "(damage_triage_aoi_infer)."
+                f"{checkpoint_path} is a crop-mode checkpoint; this caller "
+                "needs a mask-pooling one."
             )
         model = GatedDinoCrop()
         model.load_state_dict(state_dict, strict=True)
         model.to(device)
         model.eval()
-        return model, True
+        model.preprocessing = spec
+        use_gated = True
+    else:
+        if info is None:
+            raise RuntimeError(
+                f"{config_path} not found: a mask-pooling checkpoint needs its "
+                "training config to rebuild the architecture."
+            )
+        if DTF_REPO_ROOT not in sys.path:
+            sys.path.insert(0, DTF_REPO_ROOT)
+        from src.model.net import Model as DTFModel  # noqa: E402 (see sys.path above)
 
-    if DTF_REPO_ROOT not in sys.path:
-        sys.path.insert(0, DTF_REPO_ROOT)
-    from src.model.net import Model as DTFModel  # noqa: E402 (see sys.path above)
+        train_cfg = info["train"]
+        if not train_cfg:
+            raise RuntimeError(
+                f"{config_path} is a model card; building a mask-pooling model "
+                "needs the training config."
+            )
+        model = DTFModel(
+            im_size=DTF_IM_SIZE,
+            num_classes=len(DTF_CATEGORIES),
+            use_hierarchical=bool(train_cfg.get("use_hierarchical", False)),
+            use_gated_head=bool(train_cfg.get("use_gated_head", False)),
+            use_aux_severity=bool(train_cfg.get("use_aux_severity", False)),
+            use_sfp=bool(train_cfg.get("use_sfp", False)),
+            sfp_stride=int(train_cfg.get("sfp_stride", 4)),
+            use_multiscale=not train_cfg.get("no_multiscale", False),
+            use_attention=not train_cfg.get("no_attention_pool", False),
+            drop_path_rate=float(train_cfg.get("drop_path", 0.0)),
+        )
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing or unexpected:
+            logger.warning(
+                "Checkpoint load: %d missing, %d unexpected keys (architecture "
+                "from %s)", len(missing), len(unexpected), config_path,
+            )
+        critical = [
+            k for k in missing if k.startswith(("backbone.", "damage_head."))
+        ]
+        if critical:
+            raise RuntimeError(
+                f"Checkpoint failed validation: {len(critical)} essential "
+                "backbone./damage_head. weights missing (e.g. "
+                f"{critical[:3]}); predictions would be noise."
+            )
+        model.to(device)
+        model.eval()
+        model.preprocessing = spec
+        use_gated = model.use_gated_head
 
-    with open(config_path) as f:
-        train_cfg = json.load(f)
-
-    model = DTFModel(
-        im_size=DTF_IM_SIZE,
-        num_classes=len(DTF_CATEGORIES),
-        use_hierarchical=bool(train_cfg.get("use_hierarchical", False)),
-        use_gated_head=bool(train_cfg.get("use_gated_head", False)),
-        use_aux_severity=bool(train_cfg.get("use_aux_severity", False)),
-        use_sfp=bool(train_cfg.get("use_sfp", False)),
-        sfp_stride=int(train_cfg.get("sfp_stride", 4)),
-        use_multiscale=not train_cfg.get("no_multiscale", False),
-        use_attention=not train_cfg.get("no_attention_pool", False),
-        drop_path_rate=float(train_cfg.get("drop_path", 0.0)),
+    logger.info(
+        "Loaded DTF %s model; preprocessing %s (%s)",
+        "crop" if is_crop_weights else "mask-pooling",
+        spec.fingerprint,
+        spec.source,
     )
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    if missing or unexpected:
-        logger.warning(
-            f"Checkpoint load: {len(missing)} missing, "
-            f"{len(unexpected)} unexpected keys "
-            f"(architecture derived from {config_path})"
-        )
-    critical_missing = [
-        k for k in missing
-        if k.startswith("backbone.") or k.startswith("damage_head.")
-    ]
-    if critical_missing:
-        raise RuntimeError(
-            f"Checkpoint failed critical validation: missing "
-            f"{len(critical_missing)} essential weights starting with "
-            "backbone./damage_head."
-        )
-
-    model.to(device)
-    model.eval()
-    return model, model.use_gated_head
+    if selftest:
+        selftest_model(model, device)
+    return model, use_gated
 
 
+def selftest_model(model, device: torch.device) -> None:
+    """One blank crop through a crop-mode model; fail loudly on a broken load.
 
-
-
-
-def rasterize_instance_masks(
-    footprints: gpd.GeoDataFrame,
-    tile_window: rasterio.windows.Window,
-    tile_transform: rasterio.Affine,
-    tile_size: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Rasterize every footprint that intersects this tile into its own
-    binary mask at (tile_size, tile_size), zero-padded to full tile size
-    (edge tiles read fewer source pixels than ``tile_size``).
-
-    Returns ``(row_indices, masks)`` where ``masks`` has shape
-    ``(N_intersecting, tile_size, tile_size)``.
+    Checks the output is ``(1, 5)``, finite, non-negative and sums to 1. Only
+    crop mode: a mask-pooling model needs a full 1024 px tile, too heavy for
+    a startup probe.
     """
-    tile_bounds_geom = box(
-        *rasterio.windows.bounds(tile_window, tile_transform)
-    )
-    hits = footprints[footprints.geometry.intersects(tile_bounds_geom)]
-    if hits.empty:
-        return np.empty(0, dtype=np.int64), np.empty(
-            (0, tile_size, tile_size), dtype=np.float32
-        )
-
-    row_indices = hits.index.to_numpy()
-    masks = np.zeros((len(hits), tile_size, tile_size), dtype=np.float32)
-    for i, geom in enumerate(hits.geometry):
-        masks[i] = geometry_mask(
-            [geom],
-            out_shape=(tile_size, tile_size),
-            transform=tile_transform,
-            all_touched=True,
-            invert=True,
-        ).astype(np.float32)
-    return row_indices, masks
+    if getattr(model, "crop_mode", False) is not True:
+        return
+    size = model_spec(model).input_size
+    probs = score_crop(model, np.zeros((3, size, size), dtype=np.uint8), device)
+    if probs.shape != (1, len(DTF_CATEGORIES)):
+        raise RuntimeError(f"Model self-test: output shape {probs.shape}.")
+    if not np.isfinite(probs).all() or (probs < 0).any():
+        raise RuntimeError("Model self-test: non-finite or negative probabilities.")
+    if abs(float(probs.sum()) - 1.0) > 1e-3:
+        raise RuntimeError(f"Model self-test: probabilities sum to {probs.sum():.4f}.")
 
 
 def decode_gated_predictions(damage_out) -> np.ndarray:
@@ -392,9 +464,15 @@ def decode_severity_predictions(damage_out) -> np.ndarray:
     return F.softmax(logits, dim=-1).cpu().numpy()
 
 
+from hastegeo.core.utils.raster_bands import (  # noqa: E402  re-exported
+    rgb_band_indexes,
+    valid_pixel_mask,
+)
+
+
 def read_tile(raster, window: rasterio.windows.Window, tile_size: int) -> np.ndarray:
     """Read an RGB tile, zero-padding edge tiles up to (3, tile_size, tile_size)."""
-    data = raster.read([1, 2, 3], window=window)
+    data = raster.read(rgb_band_indexes(raster), window=window)
     _, h, w = data.shape
     if h == tile_size and w == tile_size:
         return data
@@ -409,7 +487,7 @@ def score_window(
     tile: np.ndarray,
     masks: np.ndarray,
     device: torch.device,
-    normalization: str = "unit",
+    normalization: str = "imagenet",
     masks_per_forward: Optional[int] = None,
 ) -> np.ndarray:
     """Score building masks on a single tile window with DamageTriageFormer.
@@ -420,7 +498,7 @@ def score_window(
         tile: (3, H, W) numpy array, uint8 [0..255] or float32.
         masks: (N, H, W) numpy array of binary float masks.
         device: torch.device ('cuda' or 'cpu').
-        normalization: 'unit' (/255.0) or 'imagenet' (standard mean/std).
+        normalization: must be 'imagenet' (kept for config compatibility).
         masks_per_forward: Optional maximum masks per forward pass.
 
     Returns:
@@ -429,23 +507,12 @@ def score_window(
     if len(masks) == 0:
         return np.empty((0, len(DTF_CATEGORIES)), dtype=np.float32)
 
-    # Normalize tile
-    if normalization == "imagenet":
-        if tile.dtype == np.uint8:
-            tile_norm = normalize_tile(tile, mode="imagenet")
-        else:
-            t_uint8 = np.clip(
-                tile * 255.0 if tile.max() <= 1.0 else tile, 0, 255
-            ).astype(np.uint8)
-            tile_norm = normalize_tile(t_uint8, mode="imagenet")
-    else:
-        # 'unit' normalization (/255.0)
-        if tile.dtype == np.uint8:
-            tile_norm = tile.astype(np.float32) / 255.0
-        else:
-            tile_norm = tile.astype(np.float32)
-            if tile_norm.max() > 1.0:
-                tile_norm = tile_norm / 255.0
+    resolve_normalization(normalization)  # only 'imagenet' is valid
+    if tile.dtype != np.uint8:
+        tile = np.clip(
+            tile * 255.0 if tile.max() <= 1.0 else tile, 0, 255
+        ).astype(np.uint8)
+    tile_norm = model_spec(model).normalize(tile)
 
     tile_t = torch.from_numpy(tile_norm).unsqueeze(0).to(device)
 
@@ -508,9 +575,10 @@ def score_window(
     )
 
 
-# Crop-mode input contract (the released checkpoint's config.json,
+# Crop-mode input contract defaults (the released checkpoint's model card,
 # "preprocessing"): footprint bbox + 32 px margin clipped to the tile, resized
-# to 224, ImageNet-normalised; footprints under 30 px are not scored.
+# to 224, ImageNet-normalised; footprints under 30 px are not scored. The
+# loaded model's PreprocessingSpec overrides these when its config says so.
 CROP_MARGIN_PX = 32
 CROP_INPUT_SIZE = 224
 MIN_CROP_FOOTPRINT_PX = 30
@@ -587,17 +655,17 @@ def score_crops(
         tile = np.clip(
             tile * 255.0 if tile.max() <= 1.0 else tile, 0, 255
         ).astype(np.uint8)
+    spec = model_spec(model)
+    size = spec.input_size
     hwc = np.transpose(tile, (1, 2, 0))
-    batch = np.empty(
-        (len(boxes), 3, CROP_INPUT_SIZE, CROP_INPUT_SIZE), dtype=np.float32
-    )
+    batch = np.empty((len(boxes), 3, size, size), dtype=np.float32)
     for i, (x0, y0, x1, y1) in enumerate(boxes):
         crop = cv2.resize(
             np.ascontiguousarray(hwc[y0:y1, x0:x1]),
-            (CROP_INPUT_SIZE, CROP_INPUT_SIZE),
+            (size, size),
             interpolation=cv2.INTER_AREA,
         )
-        batch[i] = np.transpose(normalize_tile(crop, mode="imagenet"), (2, 0, 1))
+        batch[i] = np.transpose(spec.normalize(crop), (2, 0, 1))
 
     chunk = crops_per_forward if crops_per_forward and crops_per_forward > 0 else len(batch)
     out = []
@@ -628,323 +696,3 @@ def score_crops(
             finally:
                 model.to(orig_device)
     return np.vstack(out)
-
-
-def write_visualizer_rasters(
-    work: gpd.GeoDataFrame,
-    best_class: np.ndarray,
-    raster_profile: dict,
-    output_prefix: str,
-) -> tuple[str, str]:
-    """Paint per-building ``dtf_class`` onto the mosaic's pixel grid and
-    write the two map-ready rasters the Visualizer consumes: a single-band
-    ``*_predictions.tif`` (raw ``dtf_class + 1``, 0 = nodata/unclassified —
-    served as the hidden ``predictionsLayer`` via a TiTiler colormap query
-    param) and an RGBA ``*_visualizer.tif`` COG (footprints pre-colored by
-    ``DTF_IDX_TO_COLOR`` — the always-visible ``predictedDamageLayer``).
-
-    Mirrors the embedding sub-model's ``output2visualizer.py`` +
-    ``run_workflow.py`` gdal_translate COG step so both sub-models produce
-    map layers ``GetVisualizerResults`` can serve identically.
-
-    ``work`` must already be in the raster's CRS (see ``run_damage_triage``,
-    which reprojects footprints into ``raster.crs`` before scoring).
-    """
-    height, width = raster_profile["height"], raster_profile["width"]
-    transform = raster_profile["transform"]
-
-    # dtf_class in [-1 (unclassified), 0..4] -> raster index in [0..5].
-    shape_vals = [
-        (geom, int(cls) + 1)
-        for geom, cls in zip(work.geometry, best_class)
-        if geom is not None and not geom.is_empty
-    ]
-    class_idx = rasterio.features.rasterize(
-        shape_vals,
-        out_shape=(height, width),
-        transform=transform,
-        fill=0,
-    ).astype(np.uint8)
-
-    predictions_fn = f"{output_prefix}_predictions.tif"
-    pred_profile = raster_profile.copy()
-    pred_profile.update(
-        driver="GTiff",
-        count=1,
-        dtype="uint8",
-        compress="lzw",
-        predictor=2,
-        nodata=0,
-        blockxsize=512,
-        blockysize=512,
-        tiled=True,
-        interleave="pixel",
-    )
-    with rasterio.open(predictions_fn, "w", **pred_profile) as f:
-        f.write(class_idx, 1)
-
-    colors = DTF_IDX_TO_COLOR[class_idx].transpose(2, 0, 1)
-    temp_vis_fn = f"{output_prefix}_temp_vis.tif"
-    vis_profile = raster_profile.copy()
-    vis_profile.update(count=4, nodata=0)
-    with rasterio.open(temp_vis_fn, "w", **vis_profile) as f:
-        f.colorinterp = [
-            rasterio.enums.ColorInterp.red,
-            rasterio.enums.ColorInterp.green,
-            rasterio.enums.ColorInterp.blue,
-            rasterio.enums.ColorInterp.alpha,
-        ]
-        f.write(colors)
-
-    visualizer_fn = f"{output_prefix}_visualizer.tif"
-    subprocess.run(
-        ["gdal_translate", "-of", "COG", temp_vis_fn, visualizer_fn],
-        check=True,
-    )
-    os.remove(temp_vis_fn)
-
-    return predictions_fn, visualizer_fn
-
-
-def run_damage_triage(
-    image_path: str,
-    footprints_path: str,
-    checkpoint_path: str,
-    checkpoint_config_path: str,
-    *,
-    tile_size: int = DTF_IM_SIZE,
-    visualizer_output_prefix: str = None,
-) -> tuple[gpd.GeoDataFrame, tuple]:
-    """Run DamageTriageFormer over every tile and return a row-aligned
-    GeoDataFrame with exactly one row per input footprint (see module
-    docstring for the row-order invariant)."""
-    log_progress(f"Reading footprints from {footprints_path}")
-    footprints = gpd.read_file(footprints_path)
-    if footprints.empty:
-        raise ValueError("Footprints file is empty.")
-    if footprints.crs is None:
-        raise ValueError("Footprints have no CRS.")
-    footprints = footprints.reset_index(drop=True)
-    n_total = len(footprints)
-    log_progress(f"{n_total} footprints loaded (CRS: {footprints.crs})")
-
-    device = resolve_device()
-    log_progress(f"Loading DamageTriageFormer checkpoint on {device}...")
-    model, use_gated = build_dtf_model(
-        checkpoint_path, checkpoint_config_path, device
-    )
-    log_progress(
-        f"Model architecture: {'gated head' if use_gated else 'severity head'}"
-    )
-
-    raster = rasterio.open(image_path)
-    if footprints.crs != raster.crs:
-        log_progress(f"Reprojecting footprints {footprints.crs} -> {raster.crs}")
-        work = footprints.copy()
-        work["geometry"] = footprints.to_crs(raster.crs).geometry
-    else:
-        work = footprints
-
-    windows = compute_tile_windows(raster.width, raster.height, tile_size)
-    log_progress(
-        f"Image: {raster.width}x{raster.height}, tiling into "
-        f"{len(windows)} {tile_size}x{tile_size} windows"
-    )
-
-    best_class = np.full(n_total, UNCLASSIFIED, dtype=np.int64)
-    best_conf = np.zeros(n_total, dtype=np.float32)
-    best_probs = np.zeros((n_total, len(DTF_CATEGORIES)), dtype=np.float32)
-    seen = np.zeros(n_total, dtype=bool)
-
-    for t_idx, window in enumerate(windows):
-        tile_transform = rasterio.windows.transform(window, raster.transform)
-        row_indices, masks = rasterize_instance_masks(
-            work, window, tile_transform, tile_size
-        )
-        if len(row_indices) == 0:
-            continue
-
-        tile = read_tile(raster, window, tile_size)
-        probs = score_window(
-            model=model,
-            use_gated=use_gated,
-            tile=tile,
-            masks=masks,
-            device=device,
-            normalization="unit",
-        )
-
-        classes = probs.argmax(axis=1)
-        confs = probs.max(axis=1)
-        for k, row_idx in enumerate(row_indices):
-            seen[row_idx] = True
-            if confs[k] > best_conf[row_idx]:
-                best_conf[row_idx] = confs[k]
-                best_class[row_idx] = int(classes[k])
-                best_probs[row_idx] = probs[k]
-
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-        log_progress(f"Scored tile {t_idx + 1}/{len(windows)}")
-
-    raster_profile = raster.profile.copy()
-    raster.close()
-
-    n_unclassified = int((~seen).sum())
-    log_progress(
-        f"Classified {n_total - n_unclassified}/{n_total} buildings "
-        f"({n_unclassified} outside raster extent kept as Unclassified)"
-    )
-
-    out = footprints.copy()
-    out.insert(0, "id", range(n_total))
-    out["dtf_class"] = best_class
-    out["dtf_class_name"] = [
-        DTF_CATEGORIES[c] if c != UNCLASSIFIED else "Unclassified"
-        for c in best_class
-    ]
-    out["dtf_confidence"] = best_conf
-    for i, name in enumerate(DTF_CATEGORIES):
-        out[f"dtf_prob_{i}"] = best_probs[:, i]
-    # Backward-compatible columns so the existing Validation/Assessment
-    # reports (which read `damaged`/`damage_pct_0m`/`unknown_pct`, written by
-    # PutBuildingPredictions for the embedding sub-model) keep working
-    # unchanged for a DTF model row.
-    out["damaged"] = (best_class > 0).astype(int)
-    out["damage_pct_0m"] = out["damaged"].astype(float)
-    out["unknown_pct"] = [
-        0.0 if s else 1.0 for s in seen
-    ]
-    try:
-        out["area"] = footprints.geometry.to_crs(epsg=6933).area
-    except Exception:
-        out["area"] = None
-    out = gpd.GeoDataFrame(out, geometry=footprints.geometry.name, crs=footprints.crs)
-
-    raster_fns = None
-    if visualizer_output_prefix:
-        log_progress("Rendering map visualizer layers")
-        raster_fns = write_visualizer_rasters(
-            work, best_class, raster_profile, visualizer_output_prefix
-        )
-
-    return out.to_crs(epsg=4326), raster_fns
-
-
-def log_progress(message):
-    """Append a friendly progress line consumed by DTFInferencePostprocessor."""
-    logger.info(message)
-    log_file = os.path.join(LOG_DIR, "damage_triage_friendly.log")
-    with open(log_file, "a") as f:
-        f.write(f"{datetime.now(timezone.utc).isoformat()}|{message}\n")
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--config", type=str, required=True, help="Path to config JSON file"
-    )
-    args = parser.parse_args()
-
-    if not os.path.exists(args.config):
-        logger.error("No config file found at location %s", args.config)
-        sys.exit(1)
-
-    with open(args.config) as f:
-        config = json.load(f)
-    if not config:
-        logger.error("Config file is empty")
-        sys.exit(1)
-
-    output_dir = os.path.join(WORKDIR, config.get("output_dir", "outputs"))
-    os.makedirs(output_dir, exist_ok=True)
-
-    files = config.get("files", {})
-    checkpoint_cache = config.get("checkpoint_cache", {})
-    pipeline = config.get("pipeline", {})
-    image_path = files.get("imagery")
-    footprints_path = files.get("footprints")
-    checkpoint_path = (
-        checkpoint_cache.get("local_checkpoint")
-        or files.get("checkpoint")
-        or os.getenv("DTF_CHECKPOINT_PATH", "/opt/dtf-checkpoint/best_model.pth")
-    )
-    # The training-run config.json shipped alongside best_model.pth on
-    # Hugging Face — NOT hastegeo's job config (args.config). Required to
-    # reconstruct the checkpoint's actual head architecture (gated vs
-    # plain severity) before loading weights; see build_dtf_model.
-    checkpoint_config_path = (
-        checkpoint_cache.get("local_config")
-        or files.get("checkpoint_config")
-        or os.getenv("DTF_CHECKPOINT_CONFIG_PATH", "/opt/dtf-checkpoint/config.json")
-    )
-    gpkg_name = files.get(
-        "predictions_gpkg", f"dtf_predictions_{config.get('model_id')}.gpkg"
-    )
-
-    try:
-        if not image_path or not os.path.exists(image_path):
-            raise FileNotFoundError(f"Imagery not found: {image_path}")
-        if not footprints_path or not os.path.exists(footprints_path):
-            raise FileNotFoundError(f"Footprints not found: {footprints_path}")
-        if not os.path.exists(checkpoint_path) or not os.path.exists(checkpoint_config_path):
-            local_ckpt, local_cfg = _find_local_checkpoint()
-            if local_ckpt and local_cfg:
-                checkpoint_path, checkpoint_config_path = local_ckpt, local_cfg
-                logger.info(f"Resolved existing local DamageTriageFormer checkpoint: {checkpoint_path}")
-
-        if not os.path.exists(checkpoint_path):
-            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-        if not os.path.exists(checkpoint_config_path):
-            raise FileNotFoundError(
-                f"Checkpoint config not found: {checkpoint_config_path}"
-            )
-
-        log_progress("Running DamageTriageFormer inference")
-        image_stem = os.path.splitext(os.path.basename(image_path))[0]
-        visualizer_prefix = os.path.join(output_dir, image_stem)
-        gdf, raster_fns = run_damage_triage(
-            image_path,
-            footprints_path,
-            checkpoint_path,
-            checkpoint_config_path,
-            tile_size=int(pipeline.get("tile_size", DTF_IM_SIZE)),
-            visualizer_output_prefix=visualizer_prefix,
-        )
-
-        gpkg_path = os.path.join(output_dir, os.path.basename(gpkg_name))
-        log_progress(f"Writing {len(gdf)} buildings -> {gpkg_path}")
-        gdf.to_file(gpkg_path, layer="predictions", driver="GPKG")
-
-        manifest = {
-            "predictions_gpkg_filename": os.path.basename(gpkg_path),
-            "num_buildings": int(len(gdf)),
-            "num_classified": int((gdf["dtf_class"] != UNCLASSIFIED).sum()),
-            "categories": DTF_CATEGORIES,
-        }
-        if raster_fns:
-            predictions_tif_fn, visualizer_tif_fn = raster_fns
-            manifest["predictions_tif_filename"] = os.path.basename(
-                predictions_tif_fn
-            )
-            manifest["visualizer_tif_filename"] = os.path.basename(
-                visualizer_tif_fn
-            )
-        log_progress("Finalizing outputs")
-        with open(
-            os.path.join(output_dir, "damage_triage_manifest.json"), "w"
-        ) as f:
-            json.dump(manifest, f, indent=4)
-        logger.info("DamageTriageFormer inference completed successfully.")
-    except Exception as e:
-        logger.error("Error during DamageTriageFormer inference", exc_info=True)
-        log_progress(f"Error during DamageTriageFormer inference: {e}")
-        raise
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        logger.error(f"Error during main execution: {e}", exc_info=True)
-        sys.exit(1)
